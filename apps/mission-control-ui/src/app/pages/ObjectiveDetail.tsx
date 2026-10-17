@@ -71,7 +71,7 @@ export function ObjectiveDetail() {
      stale response can never overwrite a fresher one. */
   const [polSt, setPolSt] = useState<
     | { kind: "loading" }
-    | { kind: "ready"; data: AutoPolicyStatus; forId: string }
+    | { kind: "ready"; data: AutoPolicyStatus; forId: string; atMs: number }
     | { kind: "error"; err: ApiError }
   >({ kind: "loading" });
   const [polTick, setPolTick] = useState(0);
@@ -83,7 +83,7 @@ export function ObjectiveDetail() {
   const [drvSt, setDrvSt] = useState<EpRead<AutoDriverStatus>>({ kind: "missing" });
   const [nowMs, setNowMs] = useState(() => Date.now());
   const cptAt = useRef<number | null>(null);
-  const lastApplied = useRef({ sch: 0, drv: 0 });
+  const lastApplied = useRef({ sch: 0, drv: 0, pol: 0 });
   /* Exact-body retry store: the submitted mutation body is kept
      verbatim (action, policy_version, limits, halt params,
      idempotency key) keyed by operation signature. An ambiguous
@@ -114,7 +114,7 @@ export function ObjectiveDetail() {
     setSchSt({ kind: "missing" });
     setDrvSt({ kind: "missing" });
     cptAt.current = null;
-    lastApplied.current = { sch: 0, drv: 0 };
+    lastApplied.current = { sch: 0, drv: 0, pol: 0 };
     pendingOps.current = {};
     pendingCfg.current = null;
     opSeq.current++;
@@ -155,11 +155,17 @@ export function ObjectiveDetail() {
         /* Fail-closed identity: a status whose canonical identity is
            not THIS objective/business can never authorize controls —
            render as a typed failure, same contract as the cockpit. */
+        const atMs = Date.now();
         const ap = r.auto_policy;
         if (String(ap.objective_id) !== id || String(ap.business_id) !== biz) {
           setPolSt({ kind: "error", err: new ApiError(0, "IDENTITY_MISMATCH", "auto-policy response identity does not match this objective/business — controls stay blocked.") });
         } else {
-          setPolSt({ kind: "ready", data: ap, forId: id });
+          /* R1-F7 — record the real observation instant; the render
+             clock never refreshes endpoint freshness, and an older or
+             aborted- late response can never overwrite a newer one. */
+          if (!shouldApplyResponse(lastApplied.current.pol, atMs)) return;
+          lastApplied.current.pol = atMs;
+          setPolSt({ kind: "ready", data: ap, forId: id, atMs });
         }
       })
       .catch((e: unknown) => {
@@ -385,7 +391,7 @@ export function ObjectiveDetail() {
       cockpit: epReady(st.data, cptAt.current ?? nowMs),
       policy:
         polSt.kind === "ready" && polSt.forId === id
-          ? epReady(polSt.data, nowMs)
+          ? epReady(polSt.data, polSt.atMs)
           : polSt.kind === "error"
             ? epError(polSt.err.status, polSt.err.code)
             : epMissing(),

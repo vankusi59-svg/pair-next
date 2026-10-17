@@ -226,8 +226,8 @@ export interface AutoPolicyStatus {
 
 /* Autonomous-loop observability reads (owner-scoped GETs):
    GET /api/vnext/objectives/:id/auto-scheduler and /auto-driver.
-   next_due is epoch milliseconds; admission.at is ISO; lease.expires_at
-   may be null. Fields arrive as-observed — never fabricated. */
+   next_due and lease.expires_at are epoch milliseconds or null;
+   admission.at is ISO. Fields arrive as-observed — never fabricated. */
 export interface AutoSchedulerStatus {
   objective_id: string;
   scheduler_mode: string;
@@ -252,7 +252,8 @@ export interface AutoSchedulerStatus {
   retry_count: number;
   blocked_reason: string | null;
   owner_action_required: boolean;
-  lease: { state: string; fence: number | null; expires_at: string | null } | null;
+  /* R1-F6 — backend lease expiry is epoch milliseconds or null. */
+  lease: { state: string; fence: number | null; expires_at: number | null } | null;
   catchup_state: string | null;
 }
 
@@ -271,5 +272,5 @@ export interface AutoDriverStatus {
   last_fence: number | null;
   admissions: AutoDriverAdmission[];
   denials: Array<Record<string, unknown>>;
-  lease: { state: string; fence: number | null; expires_at: string | null } | null;
+  lease: { state: string; fence: number | null; expires_at: number | null } | null;
 }

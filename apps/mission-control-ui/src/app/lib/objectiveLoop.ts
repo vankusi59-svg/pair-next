@@ -255,19 +255,29 @@ function deriveWake(i: LoopInputs): LoopNodeState {
     ev("source_refs", d.source_refs?.join(", ") || "none", "auto-scheduler"),
     ev("coalesced_count", d.coalesced_count, "auto-scheduler"),
   ];
-  const pending = (d.pending_reasons ?? []).length > 0;
-  const pendNew =
-    d.pending_generation !== null &&
-    d.pending_generation !== undefined &&
-    (d.claimed_generation === null ||
-      d.claimed_generation === undefined ||
-      d.pending_generation > d.claimed_generation);
-  if (pending || pendNew)
-    return mk("wake", "DURABLE WAKE", "active", "wake pending", e, false,
-      "A durable wake observation is pending consumption.");
-  if (d.claimed_generation !== null && d.claimed_generation !== undefined)
+  /* R1-F3 — a pending wake is proven ONLY by generation semantics:
+     pending_generation ahead of claimed_generation = unconsumed work.
+     pending_reasons are descriptive metadata that can persist after
+     the generation was claimed — never independent proof of a live
+     wake. */
+  const pendGen = d.pending_generation ?? null;
+  const claimGen = d.claimed_generation ?? null;
+  const unconsumed =
+    pendGen !== null && (claimGen === null || pendGen > claimGen);
+  const blocked =
+    (d.queue_state ?? "").startsWith("BLOCKED") || d.queue_state === "QUARANTINED";
+  if (unconsumed && blocked)
+    return mk("wake", "DURABLE WAKE", "waiting", `gen ${pendGen} pending — queue blocked`, e, false,
+      "Unconsumed wake generation exists but the queue is blocked — not healthy execution.");
+  if (unconsumed)
+    return mk("wake", "DURABLE WAKE", "active", `wake pending · gen ${pendGen}`, e, false,
+      "A durable wake generation is pending consumption.");
+  if (claimGen !== null && claimGen > 0)
     return mk("wake", "DURABLE WAKE", "proven", "consumed", e, false,
-      "A wake generation was claimed earlier — historical, not a live wake.");
+      "The recorded wake generation was already claimed — reasons below are historical, not a live wake.");
+  if ((d.pending_reasons ?? []).length > 0)
+    return mk("wake", "DURABLE WAKE", "unknown", "unverified wake", e, false,
+      "Wake reasons exist without generation authority — descriptive only, no actionable wake proven.");
   return mk("wake", "DURABLE WAKE", "upcoming", "none observed", e);
 }
 
@@ -297,13 +307,46 @@ function deriveScheduler(i: LoopInputs): LoopNodeState {
   if (d.scheduler_ready === false)
     return mk("scheduler", "SCHEDULER", "failed", "not ready", e);
   const q = d.queue_state ?? "";
-  if (q.startsWith("BLOCKED"))
-    return mk("scheduler", "SCHEDULER", "blocked", q, e, false, d.blocked_reason ?? undefined);
+  /* R1-F4 — presentation must reconcile queue AND lease: a queue
+     WAITING_CONSUMER while a lease is held means the queue awaits the
+     next consumer cycle, not that nothing is claimed. */
+  const leaseHeld = leaseActive(d.lease) && !leaseExpiredObserved(d.lease, i.nowMs);
+  if (q === "UNREGISTERED")
+    return mk("scheduler", "SCHEDULER", "upcoming", "unregistered", e);
+  if (q.startsWith("BLOCKED") || q === "QUARANTINED")
+    return mk("scheduler", "SCHEDULER", "blocked", q, e, false,
+      d.blocked_reason ?? (q === "QUARANTINED" ? "quarantined" : undefined));
   if (q === "CLAIMED" || q === "EXECUTING" || q === "IN_PROGRESS")
     return mk("scheduler", "SCHEDULER", "active", q, e);
-  if (q === "WAITING_CONSUMER" || q === "WAITING" || q === "IDLE")
+  if (q === "WAITING_CONSUMER" && leaseHeld)
+    return mk("scheduler", "SCHEDULER", "waiting",
+      `WAITING_CONSUMER · lease held fence ${d.lease!.fence}`, e, false,
+      "Queue waits for the next consumer while a claim is in flight — distinct states, both observed.");
+  if (q === "WAITING_CONSUMER" || q === "WAITING" || q === "WAITING_EVIDENCE" || q === "IDLE")
     return mk("scheduler", "SCHEDULER", "waiting", q, e);
   return mk("scheduler", "SCHEDULER", "waiting", q || UNKNOWN_STATUS, e);
+}
+
+/* R1-F6 — lease expiry arrives as server epoch ms (or null); compare
+   numerically. The check is observational — the browser clock only
+   reports what it saw, never authority. */
+type LeaseShape = {
+  state: string;
+  fence: number | null;
+  expires_at: number | string | null;
+} | null;
+
+function leaseActive(l: LeaseShape): boolean {
+  return !!l && (l.state === "ACTIVE" || l.state === "CLAIMED" || l.state === "HELD");
+}
+
+function leaseExpiredObserved(l: LeaseShape, nowMs: number): boolean {
+  if (!l || l.expires_at === null || l.expires_at === undefined) return false;
+  const ms =
+    typeof l.expires_at === "number"
+      ? l.expires_at
+      : Date.parse(String(l.expires_at));
+  return Number.isFinite(ms) && ms <= nowMs;
 }
 
 function deriveClaim(i: LoopInputs): LoopNodeState {
@@ -320,30 +363,84 @@ function deriveClaim(i: LoopInputs): LoopNodeState {
     ev("fence", l.fence, "auto-scheduler"),
     ev("expires_at", fmtTs(l.expires_at), "auto-scheduler"),
   ];
-  if (l.state === "CLAIMED" || l.state === "HELD" || l.state === "ACTIVE")
+  if (leaseActive(l) && leaseExpiredObserved(l, i.nowMs))
+    return mk("claim", "CLAIM / LEASE", "waiting", "lease expiry observed", e, false,
+      "Server lease expiry precedes the observation clock — current ownership unconfirmed (observational check).");
+  if (leaseActive(l))
     return mk("claim", "CLAIM / LEASE", "active", `claimed · fence ${l.fence ?? "?"}`, e, false,
       "Active scheduler claim — this alone does NOT prove driver admission (rule B).");
-  if (l.state === "EXPIRED")
-    return mk("claim", "CLAIM / LEASE", "waiting", "lease expired", e);
+  if (l.state === "EXPIRED" || l.state === "INVALIDATED")
+    return mk("claim", "CLAIM / LEASE", "waiting", `lease ${l.state.toLowerCase()}`, e);
+  if (l.state === "SETTLED")
+    return mk("claim", "CLAIM / LEASE", "upcoming", `settled · fence ${l.fence ?? "—"}`, e, false,
+      "Settled lease — the claim cycle is over; not an active claim.");
   return mk("claim", "CLAIM / LEASE", "upcoming", `${String(l.state).toLowerCase()} · fence ${l.fence ?? "—"}`, e);
 }
 
-/* Rule B core: find an admission that correlates with the current
-   claim — same fence, and when generations exist, same generation. */
-export function matchingAdmission(
-  driver: AutoDriverStatus | null,
-  lease: { fence: number | null } | null,
+/* R1-F1 — admission/claim correlation. An admission is "correlated"
+   ONLY when the scheduler lease is currently held (and not observed
+   expired) AND the admission carries the same fence AND the same
+   generation as the scheduler's claimed generation. A generation that
+   contradicts the claimed generation means the record belongs to an
+   earlier cycle — it is historical, never a fence-only fallback. */
+export type AdmissionVerdict =
+  | "correlated"   // exact fence+generation under a live claim
+  | "historical"   // admission exists but the claim cycle is over
+  | "contradicted" // fence matches, generation does not
+  | "unverifiable" // correlation inputs missing — not confirmable
+  | "none";        // no admission record for this fence
+
+export interface AdmissionCorrelation {
+  verdict: AdmissionVerdict;
+  admission: AutoDriverStatus["admissions"][number] | null;
+  reason: string;
+}
+
+export function correlateAdmission(
+  driver: AutoDriverStatus,
+  lease: LeaseShape,
   claimedGeneration: number | null,
-): AutoDriverStatus["admissions"][number] | null {
-  if (!driver || !lease || lease.fence === null || lease.fence === undefined)
-    return null;
-  const sameFence = driver.admissions.filter((a) => a.fence === lease.fence);
-  if (!sameFence.length) return null;
-  if (claimedGeneration !== null && claimedGeneration !== undefined) {
-    const g = sameFence.find((a) => a.generation === claimedGeneration);
-    if (g) return g;
+  nowMs: number,
+): AdmissionCorrelation {
+  if (!lease || lease.fence === null || lease.fence === undefined)
+    return { verdict: "none", admission: null, reason: "no claim fence to correlate" };
+  const sameFence = (driver.admissions ?? []).filter((a) => a.fence === lease.fence);
+  if (!leaseActive(lease))
+    return {
+      verdict: sameFence.length ? "historical" : "none",
+      admission: sameFence[sameFence.length - 1] ?? null,
+      reason: `lease ${lease.state} — matching records are a previous cycle, not current work`,
+    };
+  if (leaseExpiredObserved(lease, nowMs))
+    return {
+      verdict: "unverifiable",
+      admission: sameFence[sameFence.length - 1] ?? null,
+      reason: "lease expiry precedes the observation clock — current ownership unconfirmed",
+    };
+  const hasGen = claimedGeneration !== null && claimedGeneration !== undefined;
+  if (hasGen) {
+    const exact = sameFence.find((a) => a.generation === claimedGeneration);
+    if (exact)
+      return {
+        verdict: "correlated",
+        admission: exact,
+        reason: `exact correlation — fence ${lease.fence} · generation ${claimedGeneration}`,
+      };
+    if (sameFence.length)
+      return {
+        verdict: "contradicted",
+        admission: sameFence[sameFence.length - 1],
+        reason: `fence ${lease.fence} records carry different generation(s) — earlier cycle, not current`,
+      };
+    return { verdict: "none", admission: null, reason: "claim held — no admission record for this fence" };
   }
-  return sameFence[0];
+  if (sameFence.length)
+    return {
+      verdict: "unverifiable",
+      admission: sameFence[sameFence.length - 1],
+      reason: "admission record exists but generation correlation inputs are missing",
+    };
+  return { verdict: "none", admission: null, reason: "claim held — no admission record for this fence" };
 }
 
 function deriveAdmission(i: LoopInputs): LoopNodeState {
@@ -359,21 +456,28 @@ function deriveAdmission(i: LoopInputs): LoopNodeState {
   const schedLease = i.scheduler.kind === "ready" ? i.scheduler.data.lease : null;
   const claimedGen = i.scheduler.kind === "ready" ? i.scheduler.data.claimed_generation : null;
   const lease = dd.lease ?? schedLease;
-  const match = matchingAdmission(dd, schedLease, claimedGen);
+  const corr = correlateAdmission(dd, schedLease, claimedGen, i.nowMs);
   const last = dd.admissions?.length ? dd.admissions[dd.admissions.length - 1] : null;
   const e: LoopEvidence[] = [
     ev("driver enabled", dd.enabled, "auto-driver"),
     ev("admissions", dd.admissions?.length ?? 0, "auto-driver"),
     ev("last_fence", dd.last_fence, "auto-driver"),
-    ev("matched admission", match ? `fence ${match.fence} · gen ${match.generation}` : NA, "auto-driver", "derived"),
+    ev("correlation", corr.verdict, "auto-driver", "derived"),
+    ev("matched admission",
+      corr.admission ? `fence ${corr.admission.fence} · gen ${corr.admission.generation}` : NA,
+      "auto-driver", "derived"),
     ev("lease", lease ? `${lease.state} · fence ${lease.fence}` : NA, "auto-driver"),
   ];
   if (dd.enabled === false)
     return mk("admission", "DRIVER ADMISSION", "upcoming", "driver disabled", e);
-  if (match)
+  if (corr.verdict === "correlated")
     return mk("admission", "DRIVER ADMISSION", "active",
-      `admitted · fence ${match.fence}`, e, false,
-      `Admission correlates with the current claim (fence ${match.fence}).`);
+      `admitted · fence ${corr.admission!.fence}`, e, false, corr.reason);
+  if (corr.verdict === "unverifiable")
+    return mk("admission", "DRIVER ADMISSION", "unknown", "unverified", e, false, corr.reason);
+  if (corr.verdict === "contradicted" || corr.verdict === "historical")
+    return mk("admission", "DRIVER ADMISSION", "proven",
+      `historical · fence ${corr.admission?.fence ?? "—"}`, e, false, corr.reason);
   if (last)
     return mk("admission", "DRIVER ADMISSION", "proven",
       `last fence ${last.fence}`, e, false,
@@ -389,16 +493,19 @@ function derivePass(i: LoopInputs): LoopNodeState {
   const dd = d.data;
   const schedLease = i.scheduler.kind === "ready" ? i.scheduler.data.lease : null;
   const claimedGen = i.scheduler.kind === "ready" ? i.scheduler.data.claimed_generation : null;
-  const match = matchingAdmission(dd, schedLease, claimedGen);
+  const corr = correlateAdmission(dd, schedLease, claimedGen, i.nowMs);
   const e: LoopEvidence[] = [
     ev("last_outcome", dd.last_outcome, "auto-driver"),
     ev("last_result.fault", dd.last_result?.fault, "auto-driver"),
     ev("last_fence", dd.last_fence, "auto-driver"),
     ev("denials", dd.denials?.length ?? 0, "auto-driver"),
+    ev("correlation", corr.verdict, "auto-driver", "derived"),
   ];
-  if (match)
-    return mk("pass", "OPERATING PASS", "active", "in progress", e, false,
-      `Pass admitted at ${fmtTs(match.at)} — usage counters are admission-time snapshots.`);
+  /* R1-F1 — an admission record alone cannot prove a pass is running;
+     admit and execute are distinct phases. */
+  if (corr.verdict === "correlated")
+    return mk("pass", "OPERATING PASS", "waiting", "ADMITTED / PASS STATUS UNKNOWN", e, false,
+      `Admission correlated at ${fmtTs(corr.admission!.at)} — pass execution itself is not observable through these reads.`);
   if (dd.last_fence !== null && dd.last_fence !== undefined)
     return mk("pass", "OPERATING PASS", "proven", `last fence ${dd.last_fence}`, e, false,
       "A driver pass was recorded earlier — not evidence of a current pass (rule A).");
@@ -614,37 +721,40 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
   const s = i.scheduler;
   const d = i.driver;
   const c = i.cockpit;
+  /* R1-F5 — every conditional node carries branch=true so the
+     hide-inactive-branches toggle can reliably filter them. */
+  const B = true;
 
   // BLOCKED — queue-level block or authority blocker
   let brBlocked: LoopNodeState;
-  if (s.kind === "ready" && ((s.data.queue_state ?? "").startsWith("BLOCKED") || s.data.blocked_reason))
+  if (s.kind === "ready" && ((s.data.queue_state ?? "").startsWith("BLOCKED") || s.data.queue_state === "QUARANTINED" || s.data.blocked_reason))
     brBlocked = mk("br_blocked", "BLOCKED", "blocked", s.data.blocked_reason ?? s.data.queue_state,
       [ev("queue_state", s.data.queue_state, "auto-scheduler"),
-       ev("blocked_reason", s.data.blocked_reason, "auto-scheduler")]);
+       ev("blocked_reason", s.data.blocked_reason, "auto-scheduler")], B);
   else
     brBlocked = mk("br_blocked", "BLOCKED", "upcoming", "not blocked",
-      [absent("block evidence", "auto-scheduler")]);
+      [absent("block evidence", "auto-scheduler")], B);
 
   // WAITING — consumer wait / due checkpoint pending
   let brWaiting: LoopNodeState;
-  if (s.kind === "ready" && (s.data.queue_state === "WAITING_CONSUMER" || s.data.wait_kind))
+  if (s.kind === "ready" && (s.data.queue_state === "WAITING_CONSUMER" || s.data.queue_state === "WAITING_EVIDENCE" || s.data.wait_kind))
     brWaiting = mk("br_waiting", "WAITING", "waiting", s.data.wait_kind ?? s.data.queue_state,
       [ev("wait_kind", s.data.wait_kind, "auto-scheduler"),
        ev("queue_state", s.data.queue_state, "auto-scheduler"),
-       ev("next_due", fmtDue(s.data.next_due, i.nowMs), "auto-scheduler")]);
+       ev("next_due", fmtDue(s.data.next_due, i.nowMs), "auto-scheduler")], B);
   else
     brWaiting = mk("br_waiting", "WAITING", "upcoming", "not waiting",
-      [absent("wait evidence", "auto-scheduler")]);
+      [absent("wait evidence", "auto-scheduler")], B);
 
   // RETRY / BACKOFF
   let brRetry: LoopNodeState;
   if (s.kind === "ready" && (s.data.retry_count ?? 0) > 0)
     brRetry = mk("br_retry", "RETRY / BACKOFF", "waiting", `retry ${s.data.retry_count}`,
       [ev("retry_count", s.data.retry_count, "auto-scheduler"),
-       ev("next_due", fmtDue(s.data.next_due, i.nowMs), "auto-scheduler")]);
+       ev("next_due", fmtDue(s.data.next_due, i.nowMs), "auto-scheduler")], B);
   else
     brRetry = mk("br_retry", "RETRY / BACKOFF", "upcoming", "no retries",
-      [absent("retry evidence", "auto-scheduler")]);
+      [absent("retry evidence", "auto-scheduler")], B);
 
   // DENIED / FAULT — rule E: fault, denials and outcome are distinct
   let brFault: LoopNodeState;
@@ -655,11 +765,11 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
       ev("last_outcome", d.data.last_outcome, "auto-driver"),
     ];
     brFault = mk("br_fault", "DENIED / FAULT", "failed",
-      d.data.last_result?.fault ?? `${d.data.denials.length} denial(s)`, e, false,
+      d.data.last_result?.fault ?? `${d.data.denials.length} denial(s)`, e, B,
       "A fresh fault may coexist with an older successful last_outcome (rule E).");
   } else
     brFault = mk("br_fault", "DENIED / FAULT", "upcoming", "no fault",
-      [absent("fault evidence", "auto-driver")]);
+      [absent("fault evidence", "auto-driver")], B);
 
   // OWNER ACTION REQUIRED — either source may flag it
   const ownerSched = s.kind === "ready" && s.data.owner_action_required === true;
@@ -668,10 +778,10 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
     ? mk("br_owner", "OWNER ACTION", "waiting", "action required", [
         ev("scheduler flag", ownerSched, "auto-scheduler"),
         ev("cockpit flag", ownerCockpit, "cockpit"),
-      ])
+      ], B)
     : mk("br_owner", "OWNER ACTION", "upcoming", "none", [
         absent("owner-action evidence", "auto-scheduler"),
-      ]);
+      ], B);
 
   return [brBlocked, brWaiting, brRetry, brFault, brOwner];
 }
@@ -695,6 +805,12 @@ const SPINE: LoopNodeId[] = [
   "alloc", "planner", "mission", "exec", "evidence", "review", "settle",
   "continuation",
 ];
+
+/* Nodes whose positive/progress claims derive from the cockpit read —
+   all of them fall under observation-integrity gating (R1-F2). */
+const COCKPIT_CLAIM_NODES = new Set<LoopNodeId>([
+  "alloc", "planner", "mission", "exec", "evidence", "review",
+]);
 
 const BRANCH_ATTACH: Record<string, LoopNodeId> = {
   br_blocked: "scheduler",
@@ -741,6 +857,30 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
     ...deriveBranches(j),
   ];
 
+  /* R1-F2 — cockpit observation-integrity gating. When the canonical
+     observation reports an integrity error, EVERY cockpit-derived
+     positive/progress claim is downgraded to unverified — not just
+     artifacts. Scheduler/driver/policy observations come from their
+     own endpoints and remain independently valid. The raw claims stay
+     in each node's evidence as explicitly unverified cockpit data. */
+  const obsErr = ck.kind === "ready" ? ck.data.observation_error : null;
+  const obsBad = obsErr !== null && obsErr !== undefined;
+  if (obsBad) {
+    for (const n of nodes) {
+      if (!COCKPIT_CLAIM_NODES.has(n.id)) continue;
+      if (n.visual === "proven" || n.visual === "active" || n.visual === "waiting") {
+        n.visual = "unknown";
+        n.status = "unverified";
+        n.detail =
+          "Cockpit observation integrity failed — this claim is shown as unverified, never as evidence.";
+        n.evidence = [
+          ev("observation_error", obsErr, "cockpit", "absent"),
+          ...n.evidence,
+        ];
+      }
+    }
+  }
+
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const at = (id: LoopNodeId) => byId.get(id)!;
   const edges: LoopEdge[] = [];
@@ -769,25 +909,27 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
     });
   }
 
-  /* headline — most significant observed condition wins. */
+  /* headline — most significant observed condition wins; an integrity
+     failure is surfaced alongside whatever the independent endpoints
+     still prove, never used to claim verified execution. */
   const activeN = nodes.filter((n) => n.visual === "active").length;
   const badN = nodes.filter((n) => n.visual === "blocked" || n.visual === "failed");
   const unknownN = nodes.filter((n) => n.visual === "unknown").length;
   const waitingN = nodes.filter((n) => n.visual === "waiting").length;
-  const obsErr = ck.kind === "ready" ? ck.data.observation_error : null;
+  const obsNote = obsBad ? " · cockpit claims unverified" : "";
   let headline: LoopSnapshot["headline"];
   if (badN.length)
     headline = {
       visual: badN.some((n) => n.visual === "blocked") ? "blocked" : "failed",
       label: badN[0].status,
-      detail: badN[0].title,
+      detail: badN[0].title + obsNote,
     };
   else if (activeN)
     headline = { visual: "active", label: `${activeN} node(s) active`, detail: at(
-      (nodes.find((n) => n.visual === "active"))!.id).status };
+      (nodes.find((n) => n.visual === "active"))!.id).status + obsNote };
   else if (waitingN)
     headline = { visual: "waiting", label: "waiting", detail:
-      nodes.find((n) => n.visual === "waiting")?.status };
+      (nodes.find((n) => n.visual === "waiting")?.status ?? "") + obsNote };
   else if (unknownN >= SPINE.length - 2)
     headline = { visual: "unknown", label: "observation unavailable" };
   else

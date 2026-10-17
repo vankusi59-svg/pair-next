@@ -133,3 +133,33 @@ test("objective switch does not leak the previous objective's loop", async ({ pa
      identity; graph is rebuilt for the current route */
   await expect(page.locator(".chead")).toContainText(oid2);
 });
+
+test("branches toggle hides only inactive side branches and restores them", async ({ page }) => {
+  const biz = await mkBusiness(page);
+  const oid = await mkObjective(page, biz);
+  await gotoObjective(page, biz, oid);
+  const loop = page.locator("section.aloop");
+
+  const brCount = async () => await loop.locator(".aloop-node.br").count();
+  const edgeCount = async () => await loop.locator(".aloop-edge").count();
+  const spineCount = async () => await loop.locator(".aloop-node:not(.br)").count();
+
+  const brBefore = await brCount();
+  const edgesBefore = await edgeCount();
+  const spineBefore = await spineCount();
+  expect(brBefore).toBe(5);
+  expect(spineBefore).toBe(15);
+
+  await loop.getByRole("button", { name: "branches" }).click();
+  const brHidden = await brCount();
+  expect(brHidden).toBeLessThanOrEqual(brBefore);
+  /* inactive branches hide; spine never hides */
+  expect(await spineCount()).toBe(spineBefore);
+  /* hidden branch edges are removed with their nodes */
+  expect(await edgeCount()).toBeLessThanOrEqual(edgesBefore);
+
+  /* toggle back restores graph state */
+  await loop.getByRole("button", { name: "branches" }).click();
+  expect(await brCount()).toBe(brBefore);
+  expect(await edgeCount()).toBe(edgesBefore);
+});

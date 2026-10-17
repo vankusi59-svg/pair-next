@@ -1,20 +1,30 @@
 {
-  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI",
-  "title": "Objective Autonomous Loop live flowchart dashboard (frontend-only observability; zero backend/runtime changes)",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R1",
+  "title": "R1 audit remediation: fail-closed admission/lease correlation, cockpit observation-integrity gating, wake generation semantics, branch toggle, epoch lease expiry, real freshness",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
     "src/__tests__/ui-objective-autonomous-loop.test.ts",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease without correlated admission",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#INTEGRITY_FAULT coexists",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#settlement never claims completion",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#cross-objective response",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#active edges are observed-only"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#SETTLED lease + matching historical admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#RELEASED lease + matching historical admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#same fence + different generation",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission RUNNING",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + allocated workstreams",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + latest review",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#pending reasons + consumed generation",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#pending_generation > claimed_generation",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#WAITING_CONSUMER + held lease",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#BLOCKED_RETRY_EXHAUSTED + released lease",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#active lease without admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#all five conditional nodes carry branch=true",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease expiry",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#freshness carries each endpoint",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#ordering: stale response rejected"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 07f22db. Adds a read-only Autonomous Loop observability section to the existing Objective Detail page: a real node-and-edge SVG flowchart (15-node spine OBJECTIVE/POLICY → DURABLE WAKE → SCHEDULER → CLAIM/LEASE → DRIVER ADMISSION → OPERATING PASS → CEO → WORKSTREAM ALLOCATION → PLANNER → MISSION OPEN → EXECUTION → ARTIFACTS/EVIDENCE → REVIEW → SCHEDULER SETTLEMENT → CONTINUATION, plus a continuation→wake loop edge and five evidence-gated side branches BLOCKED/WAITING/RETRY/DENIED-FAULT/OWNER-ACTION), zoom/pan/fit, click-to-inspect evidence panel, per-endpoint freshness, and read-only scheduler/driver/missions detail panels. Pure deterministic derive layer (deriveLoopSnapshot et al.) implements authority rules A–G: lease proves claim not admission (fence/generation correlation), history never presented as current-cycle progress, no per-cycle settlement fabrication, INTEGRITY_FAULT coexisting with older success, separate next_due/lease/policy time concepts. Live data: two new typed GET reads (auto-scheduler, auto-driver) polled on the existing 5s visible-page cadence with abort + atMs staleness guards and the same fail-closed objective-identity contract as the canonical auto-policy read. 22-scenario vitest file proves the derivation contract; Playwright spec proves real-stack rendering, inspector, honest endpoint failure, and no cross-objective leakage. NOTE: the test file lives at src/__tests__/ because the harness executes `npx vitest run <selector>` under the root vitest config (include: src/__tests__/**) — the tested module has zero runtime imports and stays inside apps/mission-control-ui. Zero production-runtime changes: UI surface only, no new endpoints, no mutations, no dependency changes, no lockfile changes.",
+  "description": "R1 remediation on audited HEAD e633e09 (correction BASE), still vs integration BASE 07f22db. F1: matchingAdmission requires exact fence+generation when both present, never fence-only fallback; SETTLED/RELEASED/EXPIRED/expired-epoch leases never yield ACTIVE admission/pass; admission alone proves ADMITTED/PASS STATUS UNKNOWN not PASS RUNNING. F2: cockpit observation_error downgrades all cockpit-derived claims (allocation, planner, mission, execution, evidence, review) while scheduler/driver observations stay authoritative. F3: wake pending derives from pending_generation vs claimed_generation, not stale pending_reasons. F4: scheduler wording distinguishes queue state from held lease; claimed never presented as admitted. F5: all five conditional nodes carry branch=true so collapse hides only inactive branches and their edges, restoring cleanly. F6: lease expires_at typed number|null epoch-ms with safe conversion (invalid != expired). F7: policy freshness records actual response atMs; render ticks never refresh; stale/out-of-order responses rejected via shouldApplyResponse. 47-scenario vitest (25 new R1 regressions) + 6th Playwright spec exercising the real branches toggle interaction. Test file remains at src/__tests__/ under the root-vitest-only tooling exception; production scope unchanged: apps/mission-control-ui/** only, zero backend/authority changes.",
   "risk_override": "MEDIUM"
 }
