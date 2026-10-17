@@ -6,16 +6,18 @@
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#literal extraction",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailer projection",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#preserves parentheses, brackets",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#strips prose punctuation",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#partial claim cannot starve",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#preservation broadcast",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction bounds fail closed",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction-bound failure rolls back",
     "src/__tests__/pair-p15-2w-source-terms.test.ts#commits enriched goals",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#starve a sibling",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#digest, replay and amend",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#bounds, odd literals"
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#digest, replay and amend"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 44e4bc5. Production defect: the CEO LLM paraphrases workstream goals and drops statement literals (URLs, /api routes, filenames, quoted keys) — delegated children inherit the paraphrased goal verbatim, so agents see 'the specified API' and fail closed or guess. Fix: deterministic src/pair/objective-source-terms.ts extracts literals (URL/Win-path/route/filename/quoted/storage-key; statement order, deduped, <=24 x <=160 chars) and appendMissingSourceTerms() projects them onto P14 child specs inside decomposeObjective before commit: clause-match >=2 token overlap attributes literals, unclaimed go to EVERY workstream, a workstream claiming nothing gets the FULL set (F1: no confident-but-wrong sibling starvation), verbatim literals never duplicate, goal+trailer > 2048 fails closed atomically. normalized_proposal_digest covers the RAW proposal (replay/amend unchanged); the P14 WDEC proposal_digest covers the ENRICHED goal. Files: src/pair/objective-source-terms.ts (new), objective-workstream.ts (+11/-1), index.ts (+1), src/__tests__/pair-p15-2w-source-terms.test.ts (new, 21 tests: extraction/order/dedupe/prose-safety/caps, clause match + fallbacks (F1), no-dup, 2048 fail-closed + zero-residue rollback, |]/newline safety, raw-vs-enriched digests (F2), amend cannot alter committed graph (F2), 3-URL + 'same as X' e2e, replay convergence, DC->DL propagation (F3)). Executed: 21/21 pass; pair-p15-2 31/31 pass; tsc clean. Enrichment only restores owner-typed text; no merge claimed.",
+  "description": "BASE 44e4bc5, R2 (audit R1 corrections). src/pair/objective-source-terms.ts preserves statement literals the CEO paraphrases out of delegated goals: deterministic extraction (URL/Win-path/route+query/filename/quoted/storage-key, statement order, deduped) + appendMissingSourceTerms() commit-time projection before P14 decomposeWorkItem. R2-F1: token-overlap attribution REMOVED — no heuristic can prove literal ownership; every workstream now receives every literal its goal lacks (preservation broadcast). R2-F2: balanced tail-stripping keeps ()[]{}?&= inside URLs/routes while dropping prose wrappers (Function_(mathematics), ids[]=1, /api/x?city=Hanoi&units=metric survive verbatim). R2-F3: bounds fail closed — >24 unique literals or a matched literal >160 chars throws FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS inside the atomic txn (zero residue); goal+trailer >2048 still fails closed. Invariants kept: normalized_proposal_digest covers RAW proposal, WDEC proposal_digest covers ENRICHED goal, exactly-once replay/amend, atomic commit, goal cap 2048. Files: objective-source-terms.ts (rewritten), patch-claim.json, test file (25 tests). Executed: 25/25 pass; P15.2 31/31 + P15.4 37/37 pass; tsc clean. No merge claimed.",
   "risk_override": "MEDIUM"
 }

@@ -144,6 +144,28 @@ describe("P15.2W A — literal extraction", () => {
     expect(extractStatementLiterals("")).toEqual([]);
     expect(extractStatementLiterals("Grow sales through better marketing.")).toEqual([]);
   });
+
+  // R2-F2 — URL/endpoint corruption: legal URL characters must survive.
+  it("preserves parentheses, brackets and query strings verbatim", () => {
+    expect(extractStatementLiterals(
+      "See https://en.wikipedia.org/wiki/Function_(mathematics) for details."))
+      .toEqual(["https://en.wikipedia.org/wiki/Function_(mathematics)"]);
+    expect(extractStatementLiterals(
+      "GET https://api.example/items?ids[]=1 then stop."))
+      .toEqual(["https://api.example/items?ids[]=1"]);
+    expect(extractStatementLiterals(
+      "Call /api/weather?city=Hanoi&units=metric now."))
+      .toEqual(["/api/weather?city=Hanoi&units=metric"]);
+  });
+
+  it("strips prose punctuation the literal never owned", () => {
+    // trailing ')' closes the prose paren, not the URL
+    expect(extractStatementLiterals("(see https://x.example/a)"))
+      .toEqual(["https://x.example/a"]);
+    // sentence-end period, comma, colon are not literal data
+    expect(extractStatementLiterals("fetch https://x.example/a, then /api/v1."))
+      .toEqual(["https://x.example/a", "/api/v1"]);
+  });
 });
 
 /* ============================ B — projection ============================ */
@@ -151,7 +173,10 @@ describe("P15.2W A — literal extraction", () => {
 const child = (title: string, goal: string) => ({ title, goal, depends_on_indices: [] });
 
 describe("P15.2W B — trailer projection", () => {
-  it("clause-matched workstream receives only its clause's literals", () => {
+  it("every workstream receives every missing literal (preservation broadcast)", () => {
+    // R2-F1 — token-overlap attribution was abandoned: no heuristic can
+    // prove which workstream owns a literal, so preservation beats
+    // attribution precision. Both goals get both sources.
     const statement = [
       "Deliverable 1 — NEW file weather.html using https://wttr.in/Hanoi?format=j1 .",
       "Deliverable 2 — NEW file news.html using https://vnexpress.net/rss/tin-moi-nhat.rss .",
@@ -160,11 +185,26 @@ describe("P15.2W B — trailer projection", () => {
       [child("Weather page", "Build the weather deliverable page"),
        child("News page", "Build the news deliverable page")],
       statement);
+    for (const ws of out) {
+      expect(ws.goal).toContain("https://wttr.in/Hanoi?format=j1");
+      expect(ws.goal).toContain("https://vnexpress.net/rss/tin-moi-nhat.rss");
+      expect(ws.goal).toContain("[source terms:");
+    }
+  });
+
+  it("R2-F1 repro — partial claim cannot starve the real literal", () => {
+    // The weather workstream claims dashboard.css via overlap yet must
+    // still receive the weather URL it actually needs.
+    const statement = [
+      "Deliverable 1 — NEW file weather.html using https://wttr.in/Hanoi?format=j1 .",
+      "Deliverable 2 — NEW file dashboard.css using https://assets.example/app.css .",
+    ].join("\n");
+    const out = appendMissingSourceTerms(
+      [child("Weather widget", "Build weather widget with dashboard.css styling")],
+      statement);
     expect(out[0]!.goal).toContain("https://wttr.in/Hanoi?format=j1");
-    expect(out[0]!.goal).not.toContain("vnexpress");
-    expect(out[1]!.goal).toContain("https://vnexpress.net/rss/tin-moi-nhat.rss");
-    expect(out[1]!.goal).not.toContain("wttr.in");
-    expect(out[0]!.goal).toContain("[source terms:");
+    expect(out[0]!.goal).not.toContain("dashboard.css |"); // already verbatim
+    expect(out[0]!.goal).toContain("https://assets.example/app.css");
   });
 
   it("unmatched workstream falls back to the full literal set", () => {
@@ -390,15 +430,54 @@ describe("P15.2W F2 — digest, replay and amend integrity", () => {
 });
 
 describe("P15.2W F3 — bounds, odd literals and DL propagation", () => {
-  it("extraction is bounded: >24 literals cap, >160-char literals dropped", () => {
+  it("extraction bounds fail closed — no silent literal truncation", () => {
+    // >24 unique literals: preservation impossible → typed error, never
+    // a silently shortened set reported as success.
     const urls = Array.from({ length: 30 }, (_, i) => `https://s${i}.example/f`);
-    const lits = extractStatementLiterals(urls.join(" and "));
-    expect(lits.length).toBe(24);
-    expect(lits[0]).toBe("https://s0.example/f");
-    expect(lits[23]).toBe("https://s23.example/f");
-    const long = `"${"x".repeat(200)}"`;
-    expect(extractStatementLiterals(`use ${long} here`)).toEqual([]);
-    expect(extractStatementLiterals(`fetch https://${"y".repeat(200)}`)).toEqual([]);
+    try {
+      extractStatementLiterals(urls.join(" and "));
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+    // a matched literal exceeding the 160-char bound likewise fails.
+    try {
+      extractStatementLiterals(`fetch https://${"y".repeat(200)}`);
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+    // at the bound everything still works.
+    expect(extractStatementLiterals(
+      Array.from({ length: 24 }, (_, i) => `https://s${i}.example/f`).join(" ")
+    ).length).toBe(24);
+  });
+
+  it("extraction-bound failure rolls back the whole commit atomically", () => {
+    const { store, objectives, svc } = freshStack("f3-extract-bound");
+    const bid = mkBusiness(store);
+    const urls = Array.from({ length: 30 }, (_, i) => `https://s${i}.example/f`);
+    const o = mkObjective(objectives, bid, urls.join("\n"));
+    const before = rowCount(store, "work_item") + rowCount(store, "work_decomposition");
+    try {
+      svc.decomposeObjective({
+        objective_id: String(o.objective_id),
+        ...pins(o),
+        workstreams: [
+          { workstream_key: "w", title: "w", goal: "do it", depends_on_keys: [] },
+        ],
+        actor: OP,
+      });
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+    expect(rowCount(store, "work_item") + rowCount(store, "work_decomposition"))
+      .toBe(before);
+    expect(svc.getBinding(String(o.objective_id))).toBeNull();
   });
 
   it("goal+trailer overflow fails closed with zero graph residue", () => {
