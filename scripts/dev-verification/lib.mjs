@@ -485,9 +485,13 @@ export const TOLERATED_FAILURES = [
     platform: "win32",
     note: "win32 artifact-materialization baseline (secureReadContained needs /proc/self/fd; dir fsync EPERM) — identical on BASE" },
   { file: `${T}pair-f2-r4-remediation.test.ts`,
-    pattern: /.+/, max: 8,
+    pattern: /^(?:A[1-7]|B1)\./, max: 8,
     platform: "win32",
-    note: "win32 shell baseline (dependency-fetch recipes exit 127 — unix-only spawn semantics) — measured BASE==HEAD identical on BASE 026d86f" },
+    note: "win32 shell baseline — all 8 tests spawn unix-only dependency-fetch " +
+      "recipes (measured: every failure is exit 127, BASE==HEAD on 02c5944). " +
+      "Selector is title-scoped (A1-A7, B1): any NEW test failing in this file " +
+      "is FAIL. Limitation: the matcher sees test titles only — the exit-127 " +
+      "cause was verified manually from run output, not by the matcher." },
   { file: `${T}pair-f3-r1-remediation.test.ts`,
     pattern: /.+/, max: 1,
     platform: "win32",

@@ -251,6 +251,47 @@ describe("F1-A local canonical artifact ingest", () => {
     expect(ctx.authority.forExecution(prod.eid)).toHaveLength(0);
   });
 
+  // R1-F1 — after `\`→`/` folding, POSIX `path.isAbsolute` can never
+  // see a drive-qualified spelling as absolute: `C:\x` becomes `C:/x`
+  // and would mint a literal `C:/x` canonical name on Linux. The
+  // rejection must come from the path-syntax check itself ("artifact
+  // path invalid"), not a downstream allowed_paths/missing accident —
+  // asserting the failure REASON is what makes this a regression lock
+  // on every OS, not only the host that happens to catch it later.
+  it("A1d Windows path forms rejected as invalid syntax on every OS", () => {
+    const bad: Array<[string, string]> = [
+      ["C:\\Users\\Public\\report.txt", "drive-abs-backslash"],
+      ["C:/Users/Public/report.txt", "drive-abs-slash"],
+      ["C:report.txt", "drive-relative"],
+      ["\\\\server\\share\\file.txt", "unc"],
+    ];
+    for (const [p, tag] of bad) {
+      const ctx = mkCtx(`a1d-${tag}`);
+      const prod = mkProducer(ctx, {
+        state: "COMPLETED",
+        result: {
+          status: "COMPLETED",
+          artifacts: [
+            {
+              path: p,
+              sha256: sha256Hex(Buffer.from("x")),
+              byte_size: 1,
+            },
+          ],
+        },
+      });
+      const v = new ArtifactProvenanceValidator().validate_execution(
+        ctx.service, prod.eid) as Record<string, unknown>;
+      expect(v.status).toBe("FAIL");
+      expect(v.failures as string[]).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("artifact path invalid"),
+        ]),
+      );
+      expect(ctx.authority.forExecution(prod.eid)).toHaveLength(0);
+    }
+  });
+
   it("A2 declared sha mismatch → FAIL, no artifact row", () => {
     const ctx = mkCtx("a2");
     const prod = mkProducer(ctx, {
