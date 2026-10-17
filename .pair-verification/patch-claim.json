@@ -1,23 +1,23 @@
 {
   "claim_id": "EXTERNAL_INPUT_LATEST_ACCEPTED",
-  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer (R1: exact-name precedence, ordering hardening, drift proofs)",
+  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer (R1: exact-name precedence + ordering; R2: commit-boundary TOCTOU re-proof)",
   "affected_surfaces": [
     "ARTIFACT",
     "PLANNER",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#consume binds the NEWEST accepted same-name source deterministically",
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#exact match wins over a NEWER outbox alias (never displaced)",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#aliases spanning >1 distinct logical_name → fail closed",
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#equal created_at → artifact_id tiebreak, input-order independent",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#invalid timestamp string is NOT lexical — ranks as unknown",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#newer source arriving later → replay re-proof FAILS, never re-pins",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands inside the planner window → commit fails closed, zero revisions",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands between PREPARED staging and commit → fail closed",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#durable PREPARED resume — drift at resume-commit → fail closed",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#no drift → PREPARED commits once, receipt + supersede land",
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#dispatch honors PINNED v2 even after v3 lands — never rebinds"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 43de5e4. LATEST_ACCEPTED (live repro: acceptance_verification failed AMBIGUOUS_SOURCE on journal.html v1/v2 across sibling missions) + R1 audit corrections. Winner selection now partitions matches: EXACT logical_name artifacts always outrank compat aliases (outbox/<basename>) — a newer alias can never silently displace the exact artifact the consume named; aliases bind only when all collapse to ONE logical_name, >1 distinct alias names → FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE. Ordering is a deterministic total order: parsed created_at epoch (missing/invalid ranks provably-oldest, never lexical) then artifact_id tiebreak — input array order is never authority. Fail-closed preserved: stamp pins artifact_id+sha256; a newer sibling landing between plan and commit shifts the recomputed winner → replayed ledger mismatch → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING; dispatch re-proves pinned identity against the live eligible set + CAS bytes (F2-C proves v2 stays bound after v3 lands). R1 tests: F1-A..D exact/alias partitions, F3-A..E ordering determinism (equal ts, shuffled input, missing/invalid ts), F2-A..C drift/no-repin proofs at bind, assert and dispatch seams.",
+  "description": "BASE 43de5e4. LATEST_ACCEPTED + R1 corrections + R2 commit-boundary TOCTOU closure. Winner selection: EXACT logical_name outranks outbox/<basename> aliases (alias binds only when all aliases collapse to ONE logical_name, else FAIL_CLOSED AMBIGUOUS_SOURCE); ordering = parsed created_at epoch (missing/invalid = provably-oldest) then artifact_id — total order, never insertion order. R2-F1: runPlanning now re-resolves the canonical eligible set inside store.immediate alongside assertPlanDataflow+commitPlan — the planner-call window can no longer commit a stale pin; drift/revocation → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING, check+write share the serialized writer. R2-F2: commitPreparedReplan re-fetches eligible sources inside its existing commit transaction and re-proves fresh.prepared_tasks (bind + assert) before commitPlan — resume-commit drift fails closed pre-revision, no supersede, no fake receipt; the already-committed replay branch never re-proves so valid post-commit drift can't retro-fail. Recovery state machine untouched: the throw lands in recoveryGuard→handleRecoveryApplyFailure → REPLAN infeasible → fresh decision under a new recovery_id, bounded, no infinite replay. R2 tests drive REAL runtime seams: bound-mission runPlanning, dispatch-failure→REPLANNING→staging→commit, durable PREPARED resume via ReplanAttemptLedger.record. R2-T1/T2/T3/T5 failing-first verified (stale pin committed pre-fix); T4/T6 positive controls prove no-drift initial+replan commits still land exactly once.",
   "risk_override": "HIGH"
 }

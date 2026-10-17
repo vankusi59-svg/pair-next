@@ -1331,24 +1331,42 @@ export class MissionRuntime {
       tasks as unknown as Array<Record<string, unknown>>,
       externalInputs,
     );
-    // Incident R1 — pinned plans must be data-flow sound at the commit
-    // boundary: every consumed artifact requires its producer edge. A
-    // planner path that bypassed the canonicalize seam still fails closed.
-    // R8 — the intent↔presence invariant and instruction hygiene are
-    // re-proven here with the provenance-bound operator request as the
-    // only delivery authority. Stamped external bindings re-prove the
-    // CURRENT eligible set NOW.
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
-      outputLanguage: detectOutputLanguage(operatorGoal),
-      external_input_artifacts: externalInputs,
-    });
-    this.deps.service.commitPlan({
-      mission_id: missionId,
-      tasks: tasks as unknown as Array<Record<string, unknown>>,
-      source: "AUTOMATON_PLANNER",
-      reason: "initial_plan",
-      proposal,
+    // R2-F1 — the planner call window can span new sibling artifact
+    // arrivals (or revocations): `externalInputs` was resolved BEFORE
+    // the planner ran and may already be stale. Re-resolve the canonical
+    // eligible set NOW and re-proof every stamped binding INSIDE the
+    // commit transaction — a moved latest-winner or a revoked source
+    // makes the recomputed ledger differ and fails closed
+    // (FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING) rather than committing
+    // a stale pin. Check + write in ONE immediate transaction: the
+    // eligibility read and the revision write share the serialized
+    // SQLite writer, so no artifact can land between them.
+    this.store.immediate(() => {
+      const commitInputs =
+        this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
+      bindPlanExternalInputs(
+        tasks as unknown as Array<Record<string, unknown>>,
+        commitInputs,
+      );
+      // Incident R1 — pinned plans must be data-flow sound at the commit
+      // boundary: every consumed artifact requires its producer edge. A
+      // planner path that bypassed the canonicalize seam still fails closed.
+      // R8 — the intent↔presence invariant and instruction hygiene are
+      // re-proven here with the provenance-bound operator request as the
+      // only delivery authority. Stamped external bindings re-prove the
+      // CURRENT eligible set NOW.
+      assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
+        telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+        outputLanguage: detectOutputLanguage(operatorGoal),
+        external_input_artifacts: commitInputs,
+      });
+      this.deps.service.commitPlan({
+        mission_id: missionId,
+        tasks: tasks as unknown as Array<Record<string, unknown>>,
+        source: "AUTOMATON_PLANNER",
+        reason: "initial_plan",
+        proposal,
+      });
     });
     this.transitionRuntime(missionId, "READY", "plan_committed");
   }
@@ -3753,10 +3771,31 @@ export class MissionRuntime {
       let bound =
         revisions().find((r) => revisionBoundToAttempt(r, fresh)) ?? null;
       if (!bound) {
+        // R2-F2 — the durable PREPARED candidate was bound+validated at
+        // staging time; eligibility may have moved since (crash-resume
+        // windows are unbounded: new same-name siblings land, sources
+        // get revoked). Re-resolve the canonical eligible set inside
+        // THIS commit transaction and re-proof every pinned external
+        // input — a moved latest-winner, revoked source or drifted
+        // identity fails closed (FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING)
+        // BEFORE any revision write: no new revision, no supersede, no
+        // receipt — and never a silent re-pin. Runs only when a real
+        // commit is about to land; the already-committed replay branch
+        // (bound !== null) never re-proves, so legitimate post-commit
+        // drift can't retroactively fail a valid commit.
+        const preparedTasks = (fresh.prepared_tasks ??
+          []) as Array<Record<string, unknown>>;
+        const commitInputs =
+          this.deps.service.artifactResolver.listEligibleExternalInputSources(
+            this.deps.service.getMission(missionId),
+          );
+        bindPlanExternalInputs(preparedTasks, commitInputs);
+        assertPlanDataflow(preparedTasks, {
+          external_input_artifacts: commitInputs,
+        });
         const res = this.deps.service.commitPlan({
           mission_id: missionId,
-          tasks: (fresh.prepared_tasks ??
-            []) as Array<Record<string, unknown>>,
+          tasks: preparedTasks,
           source: "AUTOMATON_PLANNER",
           reason: "replan",
           proposal:
