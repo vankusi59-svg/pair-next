@@ -861,6 +861,7 @@ export class ArtifactDependencyResolver {
         source_governed_task_id: String(row.governed_task_id),
         source_execution_id: String(row.execution_id),
         source_executor_id: String(row.producer_executor_id),
+        source_created_at: String(a.created_at ?? ""),
       });
     }
     return out;

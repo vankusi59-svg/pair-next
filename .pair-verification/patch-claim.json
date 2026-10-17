@@ -1,25 +1,23 @@
 {
-  "claim_id": "EXTERNAL_INPUT_AWARENESS",
-  "title": "Surface eligible sibling artifacts to the delegated planner prompt and pool canonicalizer",
+  "claim_id": "EXTERNAL_INPUT_LATEST_ACCEPTED",
+  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer (R1: exact-name precedence + ordering; R2: commit-boundary TOCTOU re-proof)",
   "affected_surfaces": [
     "ARTIFACT",
     "PLANNER",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#allocated-but-unopened work item sees the SAME sibling eligible set",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#work item without objective allocation → empty set (no scope)",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#plan-time stamp binds + reconcile/assert PASS — the pool path the fix enables",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#mission-scoped resolution on the same scope still returns the identical set",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#eligible artifacts render by exact logical name with provenance",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#consume rule restricts inputs to earlier producers or the listed set",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#absent/empty set renders no block — identical prior prompt shape",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#codex transport prompt renders the identical block — no transport drift",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#UNBOUND rejection guidance points at the listed set"
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#exact match wins over a NEWER outbox alias (never displaced)",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#equal created_at → artifact_id tiebreak, input-order independent",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands inside the planner window → commit fails closed, zero revisions",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands between PREPARED staging and commit → fail closed",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#durable PREPARED resume — drift at resume-commit → fail closed",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#no drift → PREPARED commits once, receipt + supersede land",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#dispatch honors PINNED v2 even after v3 lands — never rebinds"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 9825aba. Root cause of recurring PLAN_INVALID FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT on delegated opens (live: OBJ_dda4ac80 json_transfer planner attempts): (1) the canonical planner prompt never listed eligible cross-mission artifacts — the model guessed input names from goal text and picked the output name exports/journal-export.json instead of real sibling journal.html; (2) the delegated-open edge (planExpander→invokePlannerPool) passed externalInputArtifacts=undefined for initial planning, so the pool canonicalizer could not bind ANY cross-mission consume — 'modify existing file' was unplannable on the delegated path. Fix: (a) artifact-handoff gains listEligibleExternalInputSourcesForWorkItem — the SAME canonical sibling scope resolved before a consumer Mission/WOB exists (0 allocations → []; malformed → fail closed); (b) planExpander resolves it from expandCtx.work_item_id → pool canonicalizer + planFn; (c) buildPlannerUserPrompt/codexPlannerPlan render a bounded EXTERNAL INPUT ARTIFACTS block (logical name + provenance) with the rule that consumes name only an earlier in-plan producer or a listed artifact — never a desired output; UNBOUND rejection guidance points at the listed set. Authority unchanged: prompt is context only; pool stamps are re-proven byte-for-byte at mission commit; absent expandCtx → identical prior behavior. Tests: W1-W4 eligibility scope; E1-E5 prompt contract + codex parity.",
+  "description": "BASE 43de5e4. LATEST_ACCEPTED + R1 corrections + R2 commit-boundary TOCTOU closure. Winner selection: EXACT logical_name outranks outbox/<basename> aliases (alias binds only when all aliases collapse to ONE logical_name, else FAIL_CLOSED AMBIGUOUS_SOURCE); ordering = parsed created_at epoch (missing/invalid = provably-oldest) then artifact_id — total order, never insertion order. R2-F1: runPlanning now re-resolves the canonical eligible set inside store.immediate alongside assertPlanDataflow+commitPlan — the planner-call window can no longer commit a stale pin; drift/revocation → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING, check+write share the serialized writer. R2-F2: commitPreparedReplan re-fetches eligible sources inside its existing commit transaction and re-proves fresh.prepared_tasks (bind + assert) before commitPlan — resume-commit drift fails closed pre-revision, no supersede, no fake receipt; the already-committed replay branch never re-proves so valid post-commit drift can't retro-fail. Recovery state machine untouched: the throw lands in recoveryGuard→handleRecoveryApplyFailure → REPLAN infeasible → fresh decision under a new recovery_id, bounded, no infinite replay. R2 tests drive REAL runtime seams: bound-mission runPlanning, dispatch-failure→REPLANNING→staging→commit, durable PREPARED resume via ReplanAttemptLedger.record. R2-T1/T2/T3/T5 failing-first verified (stale pin committed pre-fix); T4/T6 positive controls prove no-drift initial+replan commits still land exactly once.",
   "risk_override": "HIGH"
 }
