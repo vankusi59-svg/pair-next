@@ -1,30 +1,31 @@
 {
-  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R1",
-  "title": "R1 audit remediation: fail-closed admission/lease correlation, cockpit observation-integrity gating, wake generation semantics, branch toggle, epoch lease expiry, real freshness",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R2",
+  "title": "R2 audit remediation: contradicted/inconsistent admission gating, owner-action + missions cockpit integrity, strict lease-expiry validation",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
     "src/__tests__/ui-objective-autonomous-loop.test.ts",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#SETTLED lease + matching historical admission",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#RELEASED lease + matching historical admission",
     "src/__tests__/ui-objective-autonomous-loop.test.ts#same fence + different generation",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission RUNNING",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + allocated workstreams",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + latest review",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#pending reasons + consumed generation",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#pending_generation > claimed_generation",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#WAITING_CONSUMER + held lease",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#BLOCKED_RETRY_EXHAUSTED + released lease",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#active lease without admission",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#all five conditional nodes carry branch=true",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease expiry",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#freshness carries each endpoint",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#ordering: stale response rejected"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#scheduler vs driver lease fence disagreement",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#differing lease snapshots mid-transition",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#contradicted admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#valid correlation still observed",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#SETTLED + matching admission stays historical",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit DIGEST_MISMATCH + owner flag",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit invalid + scheduler owner flag",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit valid + owner flag",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit invalid + mission RUNNING",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#integrity recovery",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#Infinity expiry",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#negative expiry",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#invalid expiry + exact fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#WAITING_CONSUMER + invalid lease expiry",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease expiry"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "R1 remediation on audited HEAD e633e09 (correction BASE), still vs integration BASE 07f22db. F1: matchingAdmission requires exact fence+generation when both present, never fence-only fallback; SETTLED/RELEASED/EXPIRED/expired-epoch leases never yield ACTIVE admission/pass; admission alone proves ADMITTED/PASS STATUS UNKNOWN not PASS RUNNING. F2: cockpit observation_error downgrades all cockpit-derived claims (allocation, planner, mission, execution, evidence, review) while scheduler/driver observations stay authoritative. F3: wake pending derives from pending_generation vs claimed_generation, not stale pending_reasons. F4: scheduler wording distinguishes queue state from held lease; claimed never presented as admitted. F5: all five conditional nodes carry branch=true so collapse hides only inactive branches and their edges, restoring cleanly. F6: lease expires_at typed number|null epoch-ms with safe conversion (invalid != expired). F7: policy freshness records actual response atMs; render ticks never refresh; stale/out-of-order responses rejected via shouldApplyResponse. 47-scenario vitest (25 new R1 regressions) + 6th Playwright spec exercising the real branches toggle interaction. Test file remains at src/__tests__/ under the root-vitest-only tooling exception; production scope unchanged: apps/mission-control-ui/** only, zero backend/authority changes.",
+  "description": "R2 remediation on audited R1 HEAD d3c5028 (correction BASE), still vs integration BASE 07f22db. R2-F1: AdmissionVerdict adds 'inconsistent'; scheduler-vs-driver lease reads are independent observations — material fence/state divergence while a scheduler lease is active-state yields OBSERVATION_INCONSISTENT (unknown, never a fault), with both raw leases retained as separate evidence; 'contradicted' now renders UNKNOWN / INCONSISTENT with conflicting fence/generation kept for diagnosis — only terminal-lease matches render 'historical/proven'; contradicted/inconsistent produce no active edge and no pass inference. R2-F2: OWNER ACTION branch gates the cockpit flag on cockpit observation integrity — scheduler-verified flags stay waiting; cockpit-only-unverified renders unknown/unverified with diagnostics; Missions panel gains an explicit per-panel UNVERIFIED label when observation_error is set (proved by a real Playwright route-interception spec). R2-F3: lease expiry validity is separated from lease state — confirmed-current claims require recognized active state AND a valid positive epoch-ms expires_at strictly after the observation time; null/NaN/Infinity/negative/past expiry on an active-state lease → unverified lease (unknown), applied consistently in deriveClaim, correlateAdmission, derivePass and the scheduler lease-held narrative. R1 regressions updated only where they encoded the defective null/NaN-is-active expectation. 62-scenario vitest (15 new R2 regressions) + 7 Playwright specs. Root test file remains the documented tooling exception; production scope stays apps/mission-control-ui/** — zero backend/authority changes.",
   "risk_override": "MEDIUM"
 }

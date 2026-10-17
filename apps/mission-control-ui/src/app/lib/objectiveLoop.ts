@@ -303,14 +303,20 @@ function deriveScheduler(i: LoopInputs): LoopNodeState {
     ev("retry_count", d.retry_count, "auto-scheduler"),
     ev("catchup_state", d.catchup_state, "auto-scheduler"),
     ev("next_due", fmtDue(d.next_due, i.nowMs), "auto-scheduler"),
+    ev("lease", d.lease ? `${d.lease.state} · fence ${d.lease.fence}` : "none",
+      "auto-scheduler"),
   ];
   if (d.scheduler_ready === false)
     return mk("scheduler", "SCHEDULER", "failed", "not ready", e);
   const q = d.queue_state ?? "";
-  /* R1-F4 — presentation must reconcile queue AND lease: a queue
-     WAITING_CONSUMER while a lease is held means the queue awaits the
-     next consumer cycle, not that nothing is claimed. */
-  const leaseHeld = leaseActive(d.lease) && !leaseExpiredObserved(d.lease, i.nowMs);
+  /* R1-F4 / R2-F3 — presentation must reconcile queue AND lease: a
+     queue WAITING_CONSUMER while a confirmed lease is held means the
+     queue awaits the next consumer cycle, not that nothing is claimed.
+     An active-state lease without a valid future expiry is explicitly
+     unverified — never narrated as "lease held". */
+  const leaseHeld = leaseConfirmedActive(d.lease, i.nowMs);
+  const leaseUnverified =
+    leaseActive(d.lease) && !leaseHeld ? leaseExpiryVerdict(d.lease, i.nowMs) : null;
   if (q === "UNREGISTERED")
     return mk("scheduler", "SCHEDULER", "upcoming", "unregistered", e);
   if (q.startsWith("BLOCKED") || q === "QUARANTINED")
@@ -322,14 +328,20 @@ function deriveScheduler(i: LoopInputs): LoopNodeState {
     return mk("scheduler", "SCHEDULER", "waiting",
       `WAITING_CONSUMER · lease held fence ${d.lease!.fence}`, e, false,
       "Queue waits for the next consumer while a claim is in flight — distinct states, both observed.");
+  if (q === "WAITING_CONSUMER" && leaseUnverified)
+    return mk("scheduler", "SCHEDULER", "waiting",
+      `WAITING_CONSUMER · lease unverified (${leaseUnverified === "expired" ? "expiry observed" : "expiry unconfirmed"})`, e, false,
+      "Queue waits for a consumer; the active-state lease lacks a valid future expiry — not presented as held.");
   if (q === "WAITING_CONSUMER" || q === "WAITING" || q === "WAITING_EVIDENCE" || q === "IDLE")
     return mk("scheduler", "SCHEDULER", "waiting", q, e);
   return mk("scheduler", "SCHEDULER", "waiting", q || UNKNOWN_STATUS, e);
 }
 
-/* R1-F6 — lease expiry arrives as server epoch ms (or null); compare
-   numerically. The check is observational — the browser clock only
-   reports what it saw, never authority. */
+/* R1-F6 / R2-F3 — lease expiry arrives as server epoch ms (or null);
+   compare numerically. The check is observational — the browser clock
+   only reports what it saw, never authority. R2-F3: an ACTIVE-state
+   lease WITHOUT a valid future expiry is never presented as a
+   confirmed current claim. */
 type LeaseShape = {
   state: string;
   fence: number | null;
@@ -340,13 +352,42 @@ function leaseActive(l: LeaseShape): boolean {
   return !!l && (l.state === "ACTIVE" || l.state === "CLAIMED" || l.state === "HELD");
 }
 
-function leaseExpiredObserved(l: LeaseShape, nowMs: number): boolean {
-  if (!l || l.expires_at === null || l.expires_at === undefined) return false;
+type LeaseExpiry = "none" | "invalid" | "future" | "expired";
+
+/* Classification of the expiry field alone, independent of lease
+   state: none = field absent; invalid = present but unparseable or
+   non-positive epoch ms (NaN, Infinity, <= 0); future/expired = valid
+   epoch compared against the observation clock. */
+function leaseExpiryVerdict(l: LeaseShape, nowMs: number): LeaseExpiry {
+  if (!l || l.expires_at === null || l.expires_at === undefined) return "none";
   const ms =
     typeof l.expires_at === "number"
       ? l.expires_at
       : Date.parse(String(l.expires_at));
-  return Number.isFinite(ms) && ms <= nowMs;
+  if (!Number.isFinite(ms) || ms <= 0) return "invalid";
+  return ms > nowMs ? "future" : "expired";
+}
+
+/* Confirmed-current claim requires ALL of: recognized active state,
+   valid finite epoch-ms expiry, expiry strictly after nowMs. */
+function leaseConfirmedActive(l: LeaseShape, nowMs: number): boolean {
+  return leaseActive(l) && leaseExpiryVerdict(l, nowMs) === "future";
+}
+
+/* R2-F1 — the scheduler lease and the driver lease are independent
+   reads, not one atomic snapshot. A material divergence (different
+   fence, or active-state vs terminal-state split) means current
+   admission cannot be verified — but it is an OBSERVATION_INCONSISTENT
+   condition (benign mid-transition reads included), not a canonical
+   integrity fault. */
+function leaseObservationConflict(a: LeaseShape, b: LeaseShape): string | null {
+  if (!a || !b) return null;
+  const bits: string[] = [];
+  if (a.fence !== null && b.fence !== null && a.fence !== b.fence)
+    bits.push(`fence ${a.fence} vs ${b.fence}`);
+  if (leaseActive(a) !== leaseActive(b))
+    bits.push(`state ${a.state} vs ${b.state}`);
+  return bits.length ? bits.join(" · ") : null;
 }
 
 function deriveClaim(i: LoopInputs): LoopNodeState {
@@ -363,12 +404,22 @@ function deriveClaim(i: LoopInputs): LoopNodeState {
     ev("fence", l.fence, "auto-scheduler"),
     ev("expires_at", fmtTs(l.expires_at), "auto-scheduler"),
   ];
-  if (leaseActive(l) && leaseExpiredObserved(l, i.nowMs))
-    return mk("claim", "CLAIM / LEASE", "waiting", "lease expiry observed", e, false,
-      "Server lease expiry precedes the observation clock — current ownership unconfirmed (observational check).");
-  if (leaseActive(l))
-    return mk("claim", "CLAIM / LEASE", "active", `claimed · fence ${l.fence ?? "?"}`, e, false,
-      "Active scheduler claim — this alone does NOT prove driver admission (rule B).");
+  /* R2-F3 — an active-state lease claims current ownership ONLY with a
+     valid future epoch expiry. Absent/invalid expiry → unverified, not
+     active. This is observational confidence, never server-side proof. */
+  if (leaseActive(l)) {
+    const x = leaseExpiryVerdict(l, i.nowMs);
+    if (x === "future")
+      return mk("claim", "CLAIM / LEASE", "active", `claimed · fence ${l.fence ?? "?"}`, e, false,
+        "Active scheduler claim — this alone does NOT prove driver admission (rule B).");
+    if (x === "expired")
+      return mk("claim", "CLAIM / LEASE", "waiting", "lease expiry observed", e, false,
+        "Server lease expiry precedes the observation clock — current ownership unconfirmed (observational check).");
+    return mk("claim", "CLAIM / LEASE", "unknown", "unverified lease", e, false,
+      x === "invalid"
+        ? "Lease state is active but expires_at is not a valid positive epoch-ms timestamp — current ownership unverified."
+        : "Lease state is active but carries no expiry — current ownership unverified (observational).");
+  }
   if (l.state === "EXPIRED" || l.state === "INVALIDATED")
     return mk("claim", "CLAIM / LEASE", "waiting", `lease ${l.state.toLowerCase()}`, e);
   if (l.state === "SETTLED")
@@ -387,6 +438,7 @@ export type AdmissionVerdict =
   | "correlated"   // exact fence+generation under a live claim
   | "historical"   // admission exists but the claim cycle is over
   | "contradicted" // fence matches, generation does not
+  | "inconsistent" // scheduler vs driver lease observations materially conflict
   | "unverifiable" // correlation inputs missing — not confirmable
   | "none";        // no admission record for this fence
 
@@ -402,20 +454,52 @@ export function correlateAdmission(
   claimedGeneration: number | null,
   nowMs: number,
 ): AdmissionCorrelation {
-  if (!lease || lease.fence === null || lease.fence === undefined)
+  if (!lease || lease.fence === null || lease.fence === undefined) {
+    /* R2-F1 — the driver read reporting its own lease while the
+       scheduler reports none is a material divergence of independent
+       observations: unverifiable, never silently "no admission". */
+    if (driver.lease && driver.lease.fence !== null && driver.lease.fence !== undefined)
+      return {
+        verdict: "inconsistent",
+        admission: null,
+        reason: "OBSERVATION_INCONSISTENT — driver reports a lease the scheduler does not; independent reads, not an integrity fault",
+      };
     return { verdict: "none", admission: null, reason: "no claim fence to correlate" };
+  }
   const sameFence = (driver.admissions ?? []).filter((a) => a.fence === lease.fence);
   if (!leaseActive(lease))
+    /* A terminal scheduler lease means no current claim can be
+       asserted regardless of what the (possibly lagging) driver read
+       reports — matching records stay historical. */
     return {
       verdict: sameFence.length ? "historical" : "none",
       admission: sameFence[sameFence.length - 1] ?? null,
       reason: `lease ${lease.state} — matching records are a previous cycle, not current work`,
     };
-  if (leaseExpiredObserved(lease, nowMs))
+  /* R2-F1 — the two lease observations are independent reads. While
+     the scheduler claims a live lease, a material divergence in the
+     driver read makes current admission unverifiable: reported as
+     OBSERVATION_INCONSISTENT (possibly a benign mid-transition pair of
+     reads), never as corruption. */
+  const conflict = leaseObservationConflict(lease, driver.lease ?? null);
+  if (conflict)
+    return {
+      verdict: "inconsistent",
+      admission: sameFence[sameFence.length - 1] ?? null,
+      reason: `OBSERVATION_INCONSISTENT — scheduler vs driver lease (${conflict}); independent reads, not an integrity fault`,
+    };
+  /* R2-F3 — an active-state lease still needs a valid future expiry
+     before any current-cycle admission can be correlated. */
+  const x = leaseExpiryVerdict(lease, nowMs);
+  if (x !== "future")
     return {
       verdict: "unverifiable",
       admission: sameFence[sameFence.length - 1] ?? null,
-      reason: "lease expiry precedes the observation clock — current ownership unconfirmed",
+      reason: x === "expired"
+        ? "lease expiry precedes the observation clock — current ownership unconfirmed"
+        : x === "invalid"
+          ? "lease expires_at is not a valid epoch-ms timestamp — current ownership unverified"
+          : "active-state lease carries no expiry — current ownership unverified",
     };
   const hasGen = claimedGeneration !== null && claimedGeneration !== undefined;
   if (hasGen) {
@@ -455,9 +539,10 @@ function deriveAdmission(i: LoopInputs): LoopNodeState {
   const dd = d.data;
   const schedLease = i.scheduler.kind === "ready" ? i.scheduler.data.lease : null;
   const claimedGen = i.scheduler.kind === "ready" ? i.scheduler.data.claimed_generation : null;
-  const lease = dd.lease ?? schedLease;
   const corr = correlateAdmission(dd, schedLease, claimedGen, i.nowMs);
   const last = dd.admissions?.length ? dd.admissions[dd.admissions.length - 1] : null;
+  /* R2-F1 — both lease observations are shown separately so a material
+     divergence stays diagnosable instead of being merged silently. */
   const e: LoopEvidence[] = [
     ev("driver enabled", dd.enabled, "auto-driver"),
     ev("admissions", dd.admissions?.length ?? 0, "auto-driver"),
@@ -466,7 +551,11 @@ function deriveAdmission(i: LoopInputs): LoopNodeState {
     ev("matched admission",
       corr.admission ? `fence ${corr.admission.fence} · gen ${corr.admission.generation}` : NA,
       "auto-driver", "derived"),
-    ev("lease", lease ? `${lease.state} · fence ${lease.fence}` : NA, "auto-driver"),
+    ev("claimed_generation", claimedGen, "auto-scheduler"),
+    ev("scheduler lease",
+      schedLease ? `${schedLease.state} · fence ${schedLease.fence}` : "none", "auto-scheduler"),
+    ev("driver lease",
+      dd.lease ? `${dd.lease.state} · fence ${dd.lease.fence}` : "none", "auto-driver"),
   ];
   if (dd.enabled === false)
     return mk("admission", "DRIVER ADMISSION", "upcoming", "driver disabled", e);
@@ -475,7 +564,13 @@ function deriveAdmission(i: LoopInputs): LoopNodeState {
       `admitted · fence ${corr.admission!.fence}`, e, false, corr.reason);
   if (corr.verdict === "unverifiable")
     return mk("admission", "DRIVER ADMISSION", "unknown", "unverified", e, false, corr.reason);
-  if (corr.verdict === "contradicted" || corr.verdict === "historical")
+  /* R2-F1 — contradicted and inconsistent are NOT verified history:
+     fence matched but generation/lease observations disagree. Render
+     UNKNOWN / INCONSISTENT with the conflicting values retained. */
+  if (corr.verdict === "contradicted" || corr.verdict === "inconsistent")
+    return mk("admission", "DRIVER ADMISSION", "unknown",
+      "UNKNOWN / INCONSISTENT", e, false, corr.reason);
+  if (corr.verdict === "historical")
     return mk("admission", "DRIVER ADMISSION", "proven",
       `historical · fence ${corr.admission?.fence ?? "—"}`, e, false, corr.reason);
   if (last)
@@ -502,10 +597,14 @@ function derivePass(i: LoopInputs): LoopNodeState {
     ev("correlation", corr.verdict, "auto-driver", "derived"),
   ];
   /* R1-F1 — an admission record alone cannot prove a pass is running;
-     admit and execute are distinct phases. */
+     admit and execute are distinct phases. R2-F1 — a contradicted or
+     inconsistent admission correlation produces NO pass inference at
+     all, not even a historical-looking one. */
   if (corr.verdict === "correlated")
     return mk("pass", "OPERATING PASS", "waiting", "ADMITTED / PASS STATUS UNKNOWN", e, false,
       `Admission correlated at ${fmtTs(corr.admission!.at)} — pass execution itself is not observable through these reads.`);
+  if (corr.verdict === "contradicted" || corr.verdict === "inconsistent")
+    return mk("pass", "OPERATING PASS", "unknown", "unverified", e, false, corr.reason);
   if (dd.last_fence !== null && dd.last_fence !== undefined)
     return mk("pass", "OPERATING PASS", "proven", `last fence ${dd.last_fence}`, e, false,
       "A driver pass was recorded earlier — not evidence of a current pass (rule A).");
@@ -771,17 +870,39 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
     brFault = mk("br_fault", "DENIED / FAULT", "upcoming", "no fault",
       [absent("fault evidence", "auto-driver")], B);
 
-  // OWNER ACTION REQUIRED — either source may flag it
+  // OWNER ACTION REQUIRED — either source may flag it. R2-F2: the
+  // cockpit flag is a cockpit-derived claim — when cockpit observation
+  // integrity failed it is unverified evidence, not a verified
+  // action-required condition. The scheduler flag is independently
+  // verified and is never downgraded by cockpit state.
+  const obsBad =
+    c.kind === "ready" && c.data.observation_error !== null && c.data.observation_error !== undefined;
   const ownerSched = s.kind === "ready" && s.data.owner_action_required === true;
-  const ownerCockpit = c.kind === "ready" && c.data.lifecycle?.owner_action_required === true;
-  const brOwner = ownerSched || ownerCockpit
-    ? mk("br_owner", "OWNER ACTION", "waiting", "action required", [
+  const ownerCockpitRaw = c.kind === "ready" && c.data.lifecycle?.owner_action_required === true;
+  const ownerCockpit = ownerCockpitRaw && !obsBad;
+  let brOwner: LoopNodeState;
+  if (ownerSched || ownerCockpit)
+    brOwner = mk("br_owner", "OWNER ACTION", "waiting",
+      `action required · ${[ownerSched ? "scheduler" : null, ownerCockpit ? "cockpit" : null].filter(Boolean).join(" + ")}`,
+      [
         ev("scheduler flag", ownerSched, "auto-scheduler"),
         ev("cockpit flag", ownerCockpit, "cockpit"),
-      ], B)
-    : mk("br_owner", "OWNER ACTION", "upcoming", "none", [
-        absent("owner-action evidence", "auto-scheduler"),
+        ...(ownerCockpitRaw && obsBad
+          ? [ev("cockpit flag (raw, unverified)", true, "cockpit", "absent"),
+             ev("observation_error", c.kind === "ready" ? c.data.observation_error : null, "cockpit", "absent")]
+          : []),
       ], B);
+  else if (ownerCockpitRaw && obsBad)
+    brOwner = mk("br_owner", "OWNER ACTION", "unknown", "unverified", [
+      ev("scheduler flag", ownerSched, "auto-scheduler"),
+      ev("cockpit flag (raw, unverified)", true, "cockpit", "absent"),
+      ev("observation_error", c.kind === "ready" ? c.data.observation_error : null, "cockpit", "absent"),
+    ], B,
+      "Cockpit reports owner action but its observation failed integrity — shown unverified, not action-required.");
+  else
+    brOwner = mk("br_owner", "OWNER ACTION", "upcoming", "none", [
+      absent("owner-action evidence", "auto-scheduler"),
+    ], B);
 
   return [brBlocked, brWaiting, brRetry, brFault, brOwner];
 }

@@ -163,3 +163,40 @@ test("branches toggle hides only inactive side branches and restores them", asyn
   expect(await brCount()).toBe(brBefore);
   expect(await edgeCount()).toBe(edgesBefore);
 });
+
+test("cockpit observation_error → Missions panel marked UNVERIFIED, no cockpit-derived claims verified", async ({ page }) => {
+  const biz = await mkBusiness(page);
+  const oid = await mkObjective(page, biz);
+  await seedSession(page);
+  await page.addInitScript((id: string) => {
+    localStorage.setItem("pair.business_id", id);
+  }, biz);
+  /* Inject an observation-integrity failure into the live cockpit
+     response — simulates the server-flagged unverified read. */
+  await page.route("**/vnext/objectives/*/cockpit*", async (route) => {
+    const res = await route.fetch();
+    const json = await res.json();
+    if (json?.cockpit) {
+      json.cockpit.observation_error = "DIGEST_MISMATCH";
+      json.cockpit.missions = [
+        { mission_id: "MSN_FAKE_RUN", status: "RUNNING", runtime_state: "RUNNING", bound_open_id: null },
+      ];
+      json.cockpit.lifecycle = { ...(json.cockpit.lifecycle ?? {}), owner_action_required: true };
+    }
+    await route.fulfill({ response: res, json });
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  const loop = page.locator("section.aloop");
+  await expect(loop).toBeVisible();
+
+  /* per-panel UNVERIFIED label on the Missions panel */
+  await expect(loop.locator(".aloop-msn-unverified")).toBeVisible();
+  await expect(loop.locator(".aloop-msn-unverified")).toContainText("UNVERIFIED");
+  /* raw mission row still visible but marked raw */
+  await expect(loop.locator(".aloop-msn-list")).toContainText("MSN_FAKE_RUN");
+
+  /* cockpit-derived nodes are not presented as verified/active */
+  await expect(loop.locator(".aloop-head")).toContainText("unverified cockpit observation");
+  /* headline never claims verified execution */
+  await expect(loop.locator(".aloop-head")).not.toContainText("executing");
+});

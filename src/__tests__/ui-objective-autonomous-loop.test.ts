@@ -208,7 +208,8 @@ describe("autonomous loop derive — scenarios", () => {
         queue_state: "CLAIMED",
         lease: { state: "CLAIMED", fence: 9, expires_at: NOW + 300_000 },
       }), AT),
-      driver: epReady(driver({ admissions: [] }), AT),
+      driver: epReady(driver({ admissions: [],
+        lease: { state: "CLAIMED", fence: 9, expires_at: NOW + 300_000 } }), AT),
     });
     const s = deriveLoopSnapshot(i);
     expect(s.nodes.find((n) => n.id === "claim")!.visual).toBe("active");
@@ -226,6 +227,7 @@ describe("autonomous loop derive — scenarios", () => {
       driver: epReady(driver({
         admissions: [{ at: "2026-01-01T11:59:00Z", fence: 9, generation: 7,
           usage: { ceo_calls: 0, microusd: 0, missions: 0 } }],
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
       }), AT),
     });
     const s = deriveLoopSnapshot(i);
@@ -234,20 +236,25 @@ describe("autonomous loop derive — scenarios", () => {
     const pass = s.nodes.find((n) => n.id === "pass")!;
     expect(pass.visual).toBe("waiting");
     expect(pass.status).toBe("ADMITTED / PASS STATUS UNKNOWN");
-    /* correlateAdmission — exact semantics */
+    /* correlateAdmission — exact semantics (R2-F3: confirmed-current
+       claims require a valid future epoch expiry) */
+    const liveLease = { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 };
     expect(correlateAdmission(
-      driver({ admissions: [{ at: "x", fence: 9, generation: 7, usage: null }] }),
-      { state: "ACTIVE", fence: 9, expires_at: null }, 7, NOW,
+      driver({ admissions: [{ at: "x", fence: 9, generation: 7, usage: null }],
+        lease: { ...liveLease } }),
+      liveLease, 7, NOW,
     ).verdict).toBe("correlated");
     /* same fence + different generation → contradicted (never fallback) */
     expect(correlateAdmission(
-      driver({ admissions: [{ at: "x", fence: 9, generation: 3, usage: null }] }),
-      { state: "ACTIVE", fence: 9, expires_at: null }, 7, NOW,
+      driver({ admissions: [{ at: "x", fence: 9, generation: 3, usage: null }],
+        lease: { ...liveLease } }),
+      liveLease, 7, NOW,
     ).verdict).toBe("contradicted");
     /* wrong fence → none */
     expect(correlateAdmission(
-      driver({ admissions: [{ at: "x", fence: 3, generation: 7, usage: null }] }),
-      { state: "ACTIVE", fence: 9, expires_at: null }, 7, NOW,
+      driver({ admissions: [{ at: "x", fence: 3, generation: 7, usage: null }],
+        lease: { ...liveLease } }),
+      liveLease, 7, NOW,
     ).verdict).toBe("none");
   });
 
@@ -520,6 +527,9 @@ describe("R1-F1 — no false active admission/pass from history", () => {
       last_outcome: "WAITING",
       admissions: [{ at: "2026-01-01T11:00:00Z", fence, generation: gen,
         usage: { ceo_calls: 1, microusd: 1, missions: 0 } }],
+      /* driver lease mirrors the scheduler observation — consistent
+         snapshot; divergence is exercised separately in R2-F1 */
+      lease: { state: leaseState, fence, expires_at: NOW + 60_000 },
     }), AT),
   });
 
@@ -547,14 +557,18 @@ describe("R1-F1 — no false active admission/pass from history", () => {
     const s = deriveLoopSnapshot(inputs({
       scheduler: epReady(scheduler({
         queue_state: "CLAIMED", claimed_generation: 7,
-        lease: { state: "ACTIVE", fence: 9, expires_at: null },
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
       }), AT),
       driver: epReady(driver({
         admissions: [{ at: "x", fence: 9, generation: 4, usage: null }],
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
       }), AT),
     }));
     const adm = s.nodes.find((n) => n.id === "admission")!;
     expect(adm.visual).not.toBe("active");
+    /* R2-F1 — contradicted is UNKNOWN / INCONSISTENT, not proven */
+    expect(adm.visual).toBe("unknown");
+    expect(adm.status).toBe("UNKNOWN / INCONSISTENT");
     expect(adm.detail).toContain("earlier cycle");
   });
 
@@ -562,10 +576,11 @@ describe("R1-F1 — no false active admission/pass from history", () => {
     const s = deriveLoopSnapshot(inputs({
       scheduler: epReady(scheduler({
         queue_state: "CLAIMED", claimed_generation: null,
-        lease: { state: "ACTIVE", fence: 9, expires_at: null },
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
       }), AT),
       driver: epReady(driver({
         admissions: [{ at: "x", fence: 9, generation: 7, usage: null }],
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
       }), AT),
     }));
     const adm = s.nodes.find((n) => n.id === "admission")!;
@@ -581,6 +596,7 @@ describe("R1-F1 — no false active admission/pass from history", () => {
       }), AT),
       driver: epReady(driver({
         admissions: [{ at: "x", fence: 9, generation: 7, usage: null }],
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW - 5_000 },
       }), AT),
     }));
     expect(s.nodes.find((n) => n.id === "claim")!.visual).toBe("waiting");
@@ -785,32 +801,35 @@ describe("R1-F5/F6 — branch metadata + epoch lease expiry", () => {
     expect(s.nodes.filter((n) => !n.branch)).toHaveLength(15);
   });
 
-  it("lease expiry — valid epoch / null / expired / invalid / future", () => {
+  it("lease expiry — valid epoch / null / expired / invalid / future (R2-F3 corrected)", () => {
     /* future expiry → lease held */
     expect(node(inputs({
       scheduler: epReady(scheduler({
         lease: { state: "ACTIVE", fence: 1, expires_at: NOW + 30_000 },
       }), AT),
     }), "claim").visual).toBe("active");
-    /* null expiry → no expiry evidence */
-    expect(node(inputs({
+    /* null expiry on an ACTIVE-state lease → UNKNOWN, never ACTIVE */
+    const nullC = node(inputs({
       scheduler: epReady(scheduler({
         lease: { state: "ACTIVE", fence: 1, expires_at: null },
       }), AT),
-    }), "claim").visual).toBe("active");
+    }), "claim");
+    expect(nullC.visual).toBe("unknown");
+    expect(nullC.status).toBe("unverified lease");
     /* past expiry → observed-expired, not active */
     expect(node(inputs({
       scheduler: epReady(scheduler({
         lease: { state: "ACTIVE", fence: 1, expires_at: NOW - 1 },
       }), AT),
     }), "claim").visual).toBe("waiting");
-    /* invalid expiry → unparseable → not treated as expired */
+    /* invalid expiry → unparseable → unverified, not active */
     const c = node(inputs({
       scheduler: epReady(scheduler({
         lease: { state: "ACTIVE", fence: 1, expires_at: NaN },
       }), AT),
     }), "claim");
-    expect(c.visual).toBe("active");
+    expect(c.visual).toBe("unknown");
+    expect(c.status).toBe("unverified lease");
     expect(c.evidence.some((e) => e.value === "invalid timestamp")).toBe(true);
   });
 });
@@ -834,5 +853,195 @@ describe("R1-F7 — freshness accuracy", () => {
     expect(shouldApplyResponse(5000, 4000)).toBe(false); // older loses
     expect(shouldApplyResponse(4000, 5000)).toBe(true);  // newer wins
     expect(shouldApplyResponse(0, 1000)).toBe(true);     // first apply
+  });
+});
+
+/* ---------------- R2 audit remediation regressions ---------------- */
+
+describe("R2-F1 — contradicted/inconsistent admission never proven", () => {
+  const corrInputs = (schedLease: object | null, drvLease: object | null,
+    gen: number | null, adm: { fence: number; generation: number }[]) =>
+    inputs({
+      scheduler: epReady(scheduler({
+        queue_state: "CLAIMED", claimed_generation: gen,
+        lease: schedLease as never,
+      }), AT),
+      driver: epReady(driver({
+        admissions: adm.map((a) => ({ at: "x", ...a, usage: null })),
+        lease: drvLease as never,
+      }), AT),
+    });
+  const LEASE = { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 };
+
+  it("same fence + different generation → UNKNOWN / INCONSISTENT, conflict kept", () => {
+    const s = deriveLoopSnapshot(corrInputs(LEASE, { ...LEASE }, 7,
+      [{ fence: 9, generation: 4 }]));
+    const adm = s.nodes.find((n) => n.id === "admission")!;
+    expect(adm.visual).toBe("unknown");
+    expect(adm.status).toBe("UNKNOWN / INCONSISTENT");
+    /* conflicting values retained for diagnosis */
+    expect(adm.evidence.some((e) => e.label === "matched admission" && e.value === "fence 9 · gen 4")).toBe(true);
+    expect(adm.evidence.some((e) => e.label === "claimed_generation" && e.value === "7")).toBe(true);
+  });
+
+  it("scheduler vs driver lease fence disagreement → no verified admission", () => {
+    const s = deriveLoopSnapshot(corrInputs(LEASE,
+      { state: "ACTIVE", fence: 10, expires_at: NOW + 60_000 }, 7,
+      [{ fence: 9, generation: 7 }]));
+    const adm = s.nodes.find((n) => n.id === "admission")!;
+    expect(adm.visual).toBe("unknown");
+    expect(adm.status).toBe("UNKNOWN / INCONSISTENT");
+    expect(adm.detail).toContain("OBSERVATION_INCONSISTENT");
+    /* both raw lease observations retained separately */
+    expect(adm.evidence.some((e) => e.label === "scheduler lease" && e.value === "ACTIVE · fence 9")).toBe(true);
+    expect(adm.evidence.some((e) => e.label === "driver lease" && e.value === "ACTIVE · fence 10")).toBe(true);
+  });
+
+  it("differing lease snapshots mid-transition → inconsistent, NOT a fault", () => {
+    const s = deriveLoopSnapshot(corrInputs(LEASE,
+      { state: "SETTLED", fence: 9, expires_at: null }, 7,
+      [{ fence: 9, generation: 7 }]));
+    const adm = s.nodes.find((n) => n.id === "admission")!;
+    expect(adm.visual).toBe("unknown");       // never fault/blocked for benign divergence
+    expect(adm.status).toBe("UNKNOWN / INCONSISTENT");
+    expect(s.nodes.filter((n) => n.visual === "failed")).toHaveLength(0);
+  });
+
+  it("contradicted admission → no active admission/pass edge", () => {
+    const s = deriveLoopSnapshot(corrInputs(LEASE, { ...LEASE }, 7,
+      [{ fence: 9, generation: 4 }]));
+    expect(s.nodes.find((n) => n.id === "admission")!.visual).toBe("unknown");
+    expect(s.nodes.find((n) => n.id === "pass")!.visual).toBe("unknown");
+    expect(s.edges.filter((e) => e.active && (e.to === "admission" || e.to === "pass"))).toHaveLength(0);
+  });
+
+  it("valid correlation still observed when leases agree", () => {
+    const s = deriveLoopSnapshot(corrInputs(LEASE, { ...LEASE }, 7,
+      [{ fence: 9, generation: 7 }]));
+    expect(s.nodes.find((n) => n.id === "admission")!.visual).toBe("active");
+    expect(s.nodes.find((n) => n.id === "pass")!.status).toBe("ADMITTED / PASS STATUS UNKNOWN");
+  });
+
+  it("SETTLED + matching admission stays historical even if driver lease lags", () => {
+    const s = deriveLoopSnapshot(corrInputs(
+      { state: "SETTLED", fence: 9, expires_at: null },
+      { state: "RELEASED", fence: 4, expires_at: null }, 7,
+      [{ fence: 9, generation: 7 }]));
+    const adm = s.nodes.find((n) => n.id === "admission")!;
+    expect(adm.visual).toBe("proven");
+    expect(adm.status).toContain("historical");
+  });
+});
+
+describe("R2-F2 — owner action + missions under observation failure", () => {
+  const obsBad = (over: Parameters<typeof cockpit>[0] = {}) => inputs({
+    cockpit: epReady(cockpit({ observation_error: "DIGEST_MISMATCH", ...over }), AT),
+  });
+
+  it("cockpit DIGEST_MISMATCH + owner flag, scheduler=false → OWNER ACTION unverified", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      lifecycle: { ...cockpit().lifecycle, owner_action_required: true },
+    }));
+    const o = s.nodes.find((n) => n.id === "br_owner")!;
+    expect(o.visual).toBe("unknown");
+    expect(o.status).toBe("unverified");
+    expect(o.evidence.some((e) => e.label === "observation_error")).toBe(true);
+    /* no branch edge activated by unverified cockpit data */
+    expect(s.edges.find((e) => e.to === "br_owner")!.active).toBe(false);
+  });
+
+  it("cockpit invalid + scheduler owner flag → independent scheduler claim stays", () => {
+    const s = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        observation_error: "DIGEST_MISMATCH",
+        lifecycle: { ...cockpit().lifecycle, owner_action_required: true },
+      }), AT),
+      scheduler: epReady(scheduler({ owner_action_required: true }), AT),
+    }));
+    const o = s.nodes.find((n) => n.id === "br_owner")!;
+    expect(o.visual).toBe("waiting");
+    expect(o.status).toContain("scheduler");
+    /* both claims distinguished in evidence */
+    expect(o.evidence.some((e) => e.label === "scheduler flag" && e.value === "true")).toBe(true);
+    expect(o.evidence.some((e) => e.label === "cockpit flag (raw, unverified)")).toBe(true);
+  });
+
+  it("cockpit valid + owner flag → normal OWNER ACTION behavior", () => {
+    const s = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        lifecycle: { ...cockpit().lifecycle, owner_action_required: true },
+      }), AT),
+    }));
+    const o = s.nodes.find((n) => n.id === "br_owner")!;
+    expect(o.visual).toBe("waiting");
+    expect(o.status).toContain("action required");
+  });
+
+  it("cockpit invalid + mission RUNNING → mission/exec unverified, no active cockpit edge", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "RUNNING", runtime_state: "RUNNING", bound_open_id: null }],
+    }));
+    expect(s.nodes.find((n) => n.id === "mission")!.visual).toBe("unknown");
+    expect(s.nodes.find((n) => n.id === "exec")!.visual).toBe("unknown");
+    expect(s.observationVerified).toBe(false);
+    expect(s.edges.filter((e) => e.active &&
+      ["mission", "exec", "evidence", "review", "alloc", "planner", "br_owner"]
+        .includes(e.to))).toHaveLength(0);
+  });
+
+  it("integrity recovery → owner action + mission claims return", () => {
+    const s = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        lifecycle: { ...cockpit().lifecycle, owner_action_required: true },
+        missions: [{ mission_id: "M1", status: "RUNNING", runtime_state: "RUNNING", bound_open_id: null }],
+      }), AT),
+    }));
+    expect(s.nodes.find((n) => n.id === "br_owner")!.visual).toBe("waiting");
+    expect(s.nodes.find((n) => n.id === "exec")!.visual).toBe("active");
+    expect(s.observationVerified).toBe(true);
+  });
+});
+
+describe("R2-F3 — lease expiry validity gates active claims", () => {
+  const at = (lease: { state: string; fence: number | null; expires_at: number | null },
+    over: Parameters<typeof inputs>[0] = {}) =>
+    deriveLoopSnapshot(inputs({
+      scheduler: epReady(scheduler({ lease, queue_state: "WAITING_CONSUMER" }), AT),
+      ...over,
+    }));
+
+  it("ACTIVE + Infinity expiry → UNKNOWN, not active", () => {
+    const c = at({ state: "ACTIVE", fence: 1, expires_at: Infinity }).nodes.find((n) => n.id === "claim")!;
+    expect(c.visual).toBe("unknown");
+    expect(c.status).toBe("unverified lease");
+  });
+
+  it("ACTIVE + negative expiry → UNKNOWN, not active", () => {
+    const c = at({ state: "ACTIVE", fence: 1, expires_at: -500 }).nodes.find((n) => n.id === "claim")!;
+    expect(c.visual).toBe("unknown");
+  });
+
+  it("invalid expiry + exact fence/generation → admission never current", () => {
+    const lease = { state: "ACTIVE", fence: 9, expires_at: NaN };
+    const s = at(lease as never, {
+      scheduler: epReady(scheduler({
+        queue_state: "CLAIMED", claimed_generation: 7, lease: lease as never,
+      }), AT),
+      driver: epReady(driver({
+        admissions: [{ at: "x", fence: 9, generation: 7, usage: null }],
+        lease: lease as never,
+      }), AT),
+    });
+    expect(s.nodes.find((n) => n.id === "admission")!.visual).toBe("unknown");
+    expect(s.nodes.find((n) => n.id === "admission")!.status).toBe("unverified");
+    expect(s.nodes.find((n) => n.id === "pass")!.visual).not.toBe("active");
+  });
+
+  it("WAITING_CONSUMER + invalid lease expiry → no lease-held narrative", () => {
+    const s = at({ state: "ACTIVE", fence: 9, expires_at: NaN });
+    const sched = s.nodes.find((n) => n.id === "scheduler")!;
+    expect(sched.visual).toBe("waiting");
+    expect(sched.status).not.toContain("lease held");
+    expect(sched.status).toContain("unverified");
   });
 });

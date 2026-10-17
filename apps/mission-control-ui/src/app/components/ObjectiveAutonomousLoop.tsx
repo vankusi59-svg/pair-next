@@ -505,6 +505,15 @@ function LoopPanels(props: { inputs: LoopInputs }) {
       </Panel>
 
       <Panel title="Missions">
+        {/* R2-F2 — cockpit observation integrity failure: mission
+            statuses stay visible as raw rows but are explicitly marked
+            UNVERIFIED; no operational claim is made from them. */}
+        {inputs.cockpit.kind === "ready" && inputs.cockpit.data.observation_error ? (
+          <p className="aloop-err aloop-msn-unverified">
+            <StatusBadge tone="warn" label="UNVERIFIED" />
+            {" "}cockpit observation failed — mission data below is raw, not confirmed
+          </p>
+        ) : null}
         {inputs.cockpit.kind === "ready" && inputs.cockpit.data.missions?.length ? (
           <ul className="aloop-msn-list">
             {inputs.cockpit.data.missions.slice(0, 6).map((m) => (
