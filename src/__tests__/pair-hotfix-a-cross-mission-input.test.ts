@@ -1528,3 +1528,103 @@ describe("HOTFIX-A cross-mission canonical artifact input binding", () => {
     expect(String(artifact.mission_id)).toBe(prod.missionId);
   });
 });
+
+describe("EXTERNAL_INPUT_AWARENESS — work-item-scoped eligibility (plan-time)", () => {
+  /** Consumer work item allocated (real WAL) but NOT yet opened — the
+   *  exact shape at delegated plan-generation time: no WOB, no mission. */
+  function planTimeFixture() {
+    const ctx = mkCtx("wiscope");
+    const scope = mkScope(ctx, "W", ["w_src", "w_dst"]);
+    const producer = openBoundMission(ctx, scope, "w_src");
+    const art = mkAcceptedArtifact(
+      ctx,
+      producer.missionId,
+      "xau-delta-brief.md",
+      Buffer.from("# delta brief — canonical bytes"),
+    );
+    ctx.alloc.allocateWorkstream({
+      objective_id: scope.objectiveId,
+      workstream_key: "w_dst",
+      actor: OP,
+    });
+    const wal = ctx.store
+      .list("workforce_allocation")
+      .find(
+        (r) =>
+          String(r.objective_id) === scope.objectiveId &&
+          String(r.workstream_key ?? "") === "w_dst",
+      )!;
+    const consumerWorkItemId = String(wal.delegated_child_work_item_id);
+    // Plan-time invariant: no binding, no mission for the consumer yet.
+    expect(
+      ctx.store
+        .list("work_open_binding")
+        .filter((b) => String(b.work_item_id) === consumerWorkItemId),
+    ).toHaveLength(0);
+    return { ctx, scope, art, producer, consumerWorkItemId };
+  }
+
+  it("W1: allocated-but-unopened work item sees the SAME sibling eligible set", () => {
+    const { ctx, art, consumerWorkItemId } = planTimeFixture();
+    const list =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumerWorkItemId,
+      );
+    expect(list).toHaveLength(1);
+    expect(list[0]!.artifact_id).toBe(art.artifactId);
+    expect(list[0]!.logical_name).toBe("xau-delta-brief.md");
+  });
+
+  it("W2: work item without objective allocation → empty set (no scope)", () => {
+    const { ctx, scope } = planTimeFixture();
+    const wi = ctx.biz.createWorkItem({
+      business_id: scope.businessId,
+      title: "plain item",
+      goal: "unscoped work",
+      operator_id: OP,
+    });
+    const list =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        String(wi.work_item_id),
+      );
+    expect(list).toHaveLength(0);
+    // And a nonexistent id resolves the same — never a forged scope.
+    expect(
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        "WI_NONEXISTENT",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("W3: plan-time stamp binds + reconcile/assert PASS — the pool path the fix enables", () => {
+    const { ctx, consumerWorkItemId } = planTimeFixture();
+    const sources =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumerWorkItemId,
+      );
+    const tasks = [consumerTask("xau-delta-brief.md")];
+    const out = reconcilePlanDataflow(tasks, {
+      external_input_artifacts: sources,
+    }).tasks;
+    const stamps = (out[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]!.contract).toBe(EXTERNAL_INPUT_CONTRACT);
+    assertPlanDataflow(out, { external_input_artifacts: sources });
+  });
+
+  it("W4: mission-scoped resolution on the same scope still returns the identical set", () => {
+    const { ctx, scope, art } = planTimeFixture();
+    const consumer = openBoundMission(ctx, scope, "w_dst");
+    const missionList = eligible(ctx, ctx.store.get("mission", consumer.missionId));
+    const wiList =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumer.workItemId,
+      );
+    expect(missionList.map((s) => s.artifact_id)).toEqual(
+      wiList.map((s) => s.artifact_id),
+    );
+    expect(wiList[0]!.artifact_id).toBe(art.artifactId);
+  });
+});

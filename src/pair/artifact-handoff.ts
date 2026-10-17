@@ -665,7 +665,6 @@ export class ArtifactDependencyResolver {
   listEligibleExternalInputSources(
     mission: Record<string, unknown>,
   ): ExternalInputArtifactSource[] {
-    const CAP = 64;
     const lineageFail = (detail: string): never => {
       throw new IntegrityError(
         "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
@@ -687,6 +686,56 @@ export class ArtifactDependencyResolver {
     if (!own.ok || !own.binding) lineageFail(`consumer_binding:${own.reason}`);
     const binding = own.binding as Record<string, unknown>;
     const workItemId = String(binding.work_item_id ?? "");
+    return this.eligibleSourcesForWorkItemScope({
+      workItemId,
+      businessId: String(binding.business_id ?? ""),
+      consumerMissionId,
+      allowUndelegated: false,
+    });
+  }
+
+  /** EXTERNAL_INPUT_AWARENESS — the SAME canonical sibling scope resolved
+   *  before a consumer Mission exists: delegated-open planning happens
+   *  while the work item still has no work_open_binding, so the eligible
+   *  set derives from the work item's allocation directly. A work item
+   *  with no objective allocation simply has no authorized scope
+   *  (mirrors the unbound-mission early return); a malformed one fails
+   *  closed on the identical lineage checks. */
+  listEligibleExternalInputSourcesForWorkItem(
+    workItemId: string,
+  ): ExternalInputArtifactSource[] {
+    const wi = this.store.tryGet("work_item", String(workItemId)) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!wi) return [];
+    return this.eligibleSourcesForWorkItemScope({
+      workItemId: String(workItemId),
+      businessId: String(wi.business_id ?? ""),
+      consumerMissionId: "",
+      allowUndelegated: true,
+    });
+  }
+
+  /** Shared scope resolver: work item → allocation receipt → objective →
+   *  sibling work items → bound missions → ACCEPTED artifacts. */
+  private eligibleSourcesForWorkItemScope(opts: {
+    workItemId: string;
+    businessId: string;
+    consumerMissionId: string;
+    /** true = zero allocations is a legitimate "no scope" (plan-time,
+     *  pre-binding); false = canonical strictness (consumer already
+     *  bound — exactly one allocation is mandatory). */
+    allowUndelegated: boolean;
+  }): ExternalInputArtifactSource[] {
+    const CAP = 64;
+    const { workItemId, businessId, consumerMissionId } = opts;
+    const lineageFail = (detail: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        detail,
+      );
+    };
     // F1 — the work item's objective pin must be the canonical P15.4
     // receipt: exactly one allocation, full provenance proof, and the
     // same business as the binding.
@@ -697,6 +746,7 @@ export class ArtifactDependencyResolver {
         String((r as Record<string, unknown>).delegated_child_work_item_id ?? "") ===
         workItemId,
     );
+    if (!allocs.length && opts.allowUndelegated) return [];
     if (allocs.length !== 1) {
       lineageFail(`work_item_allocation_count:${allocs.length}`);
     }
@@ -715,10 +765,7 @@ export class ArtifactDependencyResolver {
       );
     }
     const alloc = allocs[0] as Record<string, unknown>;
-    if (
-      String(alloc.business_id ?? "") !==
-      String((binding as Record<string, unknown>).business_id ?? "")
-    ) {
+    if (String(alloc.business_id ?? "") !== businessId) {
       lineageFail("allocation_business_mismatch");
     }
     const objectiveId = String(alloc.objective_id ?? "");
@@ -728,10 +775,7 @@ export class ArtifactDependencyResolver {
       | undefined;
     if (!objective) lineageFail("objective_missing");
     const obj = objective as Record<string, unknown>;
-    if (
-      String(obj.business_id ?? "") !==
-      String(binding.business_id ?? "")
-    ) {
+    if (String(obj.business_id ?? "") !== businessId) {
       lineageFail("objective_business_mismatch");
     }
     // F1 — sibling scope: every allocation of the objective must itself

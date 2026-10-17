@@ -573,6 +573,16 @@ export interface LlmPlannerConfig {
    *  mission text the model reads (envelope context included); absent
    *  → `goal` itself is the operator request. */
   authorityGoal?: string;
+  /** EXTERNAL_INPUT_AWARENESS — the eligible cross-mission input set the
+   *  canonicalizer will bind against, rendered verbatim into the prompt
+   *  so the model can consume a real sibling artifact by exact logical
+   *  name instead of guessing a filename from the goal text. Context
+   *  only — the binding authority stays the canonicalizer's re-proof. */
+  externalInputArtifacts?: ReadonlyArray<{
+    logical_name: string;
+    source_mission_id?: string;
+    source_task_id?: string;
+  }>;
 }
 
 export interface LlmPlanResult {
@@ -1019,6 +1029,13 @@ export function buildPlannerUserPrompt(
      *  block still renders `goal` verbatim so appended context stays
      *  informational. */
     authorityGoal?: string;
+    /** EXTERNAL_INPUT_AWARENESS — eligible sibling-mission artifacts,
+     *  same shape as LlmPlannerConfig.externalInputArtifacts. */
+    externalInputArtifacts?: ReadonlyArray<{
+      logical_name: string;
+      source_mission_id?: string;
+      source_task_id?: string;
+    }>;
   },
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -1049,6 +1066,29 @@ export function buildPlannerUserPrompt(
     (cfg.capabilitySets?.length
       ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
       : "") +
+    (cfg.externalInputArtifacts?.length
+      ? `EXTERNAL INPUT ARTIFACTS — files already produced and ACCEPTED by ` +
+        `authorized sibling work under the same objective; a task may consume ` +
+        `one ONLY by its exact logical name:\n` +
+        cfg.externalInputArtifacts
+          .slice(0, 24)
+          .map(
+            (a) =>
+              `- ${a.logical_name}` +
+              (a.source_mission_id
+                ? ` (produced by mission ${a.source_mission_id}` +
+                  (a.source_task_id ? `, task ${a.source_task_id}` : "") +
+                  `)`
+                : ""),
+          )
+          .join("\n") +
+        (cfg.externalInputArtifacts.length > 24
+          ? `\n- … ${cfg.externalInputArtifacts.length - 24} more`
+          : "") +
+        `\nA task's consumes may name ONLY a file produced by an earlier task ` +
+        `in this plan or listed above — never a file merely because it is a ` +
+        `desired output of this mission.\n`
+      : "") +
     (cfg.replanContext
       ? `\nREPLAN CONTEXT — this is a recovery replan after a governed failure:\n` +
         `failure_class: ${cfg.replanContext.failure_class}\n` +
@@ -1076,7 +1116,7 @@ export function buildPlannerUserPrompt(
           : "") +
         (cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT" ||
          cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_ORDER"
-          ? `Specific fix: a task consumes an artifact with no earlier producer — use ONE consistent path per artifact, declare the producing task earlier, and never restate the same file under a different path form or verb; preserve the artifact/dependency relationship.\n`
+          ? `Specific fix: a task consumes an artifact with no earlier producer — use ONE consistent path per artifact, declare the producing task earlier (or consume a file listed under EXTERNAL INPUT ARTIFACTS by its exact logical name — never a desired output name), and never restate the same file under a different path form or verb; preserve the artifact/dependency relationship.\n`
           : "") +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +

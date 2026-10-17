@@ -122,6 +122,10 @@ export interface CodexPlannerInvokeConfig {
    *  mission text the model reads (envelope context included); absent
    *  → `goal` itself is the operator request. */
   authorityGoal?: string;
+  /** EXTERNAL_INPUT_AWARENESS — eligible sibling-mission artifacts
+   *  rendered into the SAME canonical prompt builder every transport
+   *  uses (drift between transports is a contract violation). */
+  externalInputArtifacts?: LlmPlannerConfig["externalInputArtifacts"];
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -292,6 +296,7 @@ export function buildCodexPlannerPrompt(
     | "replanContext"
     | "rejectionContext"
     | "authorityGoal"
+    | "externalInputArtifacts"
   >,
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -302,6 +307,7 @@ export function buildCodexPlannerPrompt(
     replanContext: cfg.replanContext,
     rejectionContext: cfg.rejectionContext,
     authorityGoal,
+    externalInputArtifacts: cfg.externalInputArtifacts,
   })}`;
 }
 
