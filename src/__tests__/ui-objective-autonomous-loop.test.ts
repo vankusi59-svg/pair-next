@@ -282,8 +282,12 @@ describe("autonomous loop derive — scenarios", () => {
     const s = deriveLoopSnapshot(i);
     expect(s.nodes.find((n) => n.id === "evidence")!.visual).toBe("proven");
     expect(s.nodes.find((n) => n.id === "evidence")!.detail).toContain("rule A");
-    expect(s.nodes.find((n) => n.id === "br_fault")!.visual).toBe("failed");
-    expect(s.headline.visual).not.toBe("active"); // fault dominates headline
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");
+    /* R3-F2 — fault has no live claim → historical: stays red on the
+       node but cannot drive the headline as a current failure */
+    expect(f.historical).toBe(true);
+    expect(s.headline.visual).not.toBe("failed");
   });
 
   it("7. INTEGRITY_FAULT coexists with older successful last_outcome (rule E)", () => {
@@ -296,7 +300,11 @@ describe("autonomous loop derive — scenarios", () => {
     const s = deriveLoopSnapshot(i);
     const fault = s.nodes.find((n) => n.id === "br_fault")!;
     expect(fault.visual).toBe("failed");
-    expect(fault.status).toBe("INTEGRITY_FAULT");
+    /* R3-F2 — exact typed fault code preserved; with no live claim the
+       fault is explicitly labeled prior-cycle, not a current failure */
+    expect(fault.status).toContain("INTEGRITY_FAULT");
+    expect(fault.status).toContain("prior cycle");
+    expect(fault.historical).toBe(true);
     /* older success is still shown on the pass node — as history */
     const pass = s.nodes.find((n) => n.id === "pass")!;
     expect(pass.evidence.some((e) => e.value === "CEO_PASS_COMMITTED")).toBe(true);
@@ -326,12 +334,19 @@ describe("autonomous loop derive — scenarios", () => {
     expect(new Date(iso).getTime()).toBe(NOW + 90_000);
   });
 
-  it("10. driver denials → DENIED/FAULT branch lit with count", () => {
+  it("10. driver denials → historical diagnostic, never current FAILED (R3-F2)", () => {
     const i = inputs({
       driver: epReady(driver({ denials: [{ reason: "BUDGET" }, { reason: "X" }] }), AT),
     });
-    expect(node(i, "br_fault").visual).toBe("failed");
-    expect(node(i, "br_fault").status).toContain("2 denial");
+    const f = node(i, "br_fault");
+    expect(f.visual).not.toBe("failed");
+    expect(f.visual).toBe("upcoming");
+    expect(f.status).toContain("2 past denial(s)");
+    expect(f.status).toContain("historical");
+    expect(f.historical).toBe(true);
+    /* denials alone must not drive the headline as a failure */
+    const s = deriveLoopSnapshot(i);
+    expect(s.headline.visual).not.toBe("failed");
   });
 
   it("11. all reads missing → spine unknown, honest headline", () => {
@@ -1043,5 +1058,235 @@ describe("R2-F3 — lease expiry validity gates active claims", () => {
     expect(sched.visual).toBe("waiting");
     expect(sched.status).not.toContain("lease held");
     expect(sched.status).toContain("unverified");
+  });
+});
+
+/* ---------------- R3 audit remediation regressions ---------------- */
+
+describe("R3-F1 — cockpit integrity failure cannot claim FAILED", () => {
+  const obsBad = (over: Parameters<typeof cockpit>[0]) => inputs({
+    cockpit: epReady(cockpit({ observation_error: "DIGEST_MISMATCH", ...over }), AT),
+  });
+
+  it("observation_error + mission FAILED → mission UNKNOWN/UNVERIFIED, headline never FAILED", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+    }));
+    const m = s.nodes.find((n) => n.id === "mission")!;
+    expect(m.visual).toBe("unknown");
+    expect(m.status).toBe("unverified");
+    expect(m.evidence.some((e) => e.label === "observation_error")).toBe(true);
+    /* headline must not assert the unverified failure */
+    expect(s.headline.visual).not.toBe("failed");
+    expect(s.headline.label).not.toContain("failed");
+  });
+
+  it("observation_error + mission CANCELLED → no authoritative failed node", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "CANCELLED", runtime_state: null, bound_open_id: null }],
+    }));
+    expect(s.nodes.find((n) => n.id === "mission")!.visual).toBe("unknown");
+    expect(s.nodes.filter((n) => !n.historical &&
+      n.visual === "failed" && n.id === "mission")).toHaveLength(0);
+  });
+
+  it("clean cockpit + mission FAILED → failed presentation preserved as mission observation", () => {
+    const s = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+      }), AT),
+    }));
+    const m = s.nodes.find((n) => n.id === "mission")!;
+    expect(m.visual).toBe("failed");
+    expect(m.detail).toContain("cockpit observation");
+  });
+
+  it("invalid cockpit + independently blocked scheduler → block stays authoritative", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+    }));
+    /* override scheduler to blocked */
+    const s2 = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        observation_error: "DIGEST_MISMATCH",
+        missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+      }), AT),
+      scheduler: epReady(scheduler({
+        queue_state: "BLOCKED_RETRY_EXHAUSTED", blocked_reason: "RETRY_LIMIT_REACHED",
+      }), AT),
+    }));
+    expect(s2.nodes.find((n) => n.id === "scheduler")!.visual).toBe("blocked");
+    expect(s2.headline.visual).toBe("blocked");
+    expect(s2.nodes.find((n) => n.id === "mission")!.visual).toBe("unknown");
+    void s;
+  });
+
+  it("recovery: valid cockpit restores mission states", () => {
+    const bad = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+    }));
+    expect(bad.nodes.find((n) => n.id === "mission")!.visual).toBe("unknown");
+    const good = deriveLoopSnapshot(inputs({
+      cockpit: epReady(cockpit({
+        missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+      }), AT),
+    }));
+    expect(good.nodes.find((n) => n.id === "mission")!.visual).toBe("failed");
+    expect(good.observationVerified).toBe(true);
+  });
+
+  it("no edge animates toward a cockpit node whose authority is unverified", () => {
+    const s = deriveLoopSnapshot(obsBad({
+      missions: [{ mission_id: "M1", status: "FAILED", runtime_state: "FAILED", bound_open_id: null }],
+    }));
+    for (const id of ["alloc", "planner", "mission", "exec", "evidence", "review"])
+      expect(s.edges.filter((e) => e.to === id && e.active)).toHaveLength(0);
+  });
+});
+
+describe("R3-F2 — historical denials/faults never drive current FAILED", () => {
+  const drv = (over: Parameters<typeof driver>[0]) => epReady(driver(over), AT);
+  const sch = (over: Parameters<typeof scheduler>[0]) => epReady(scheduler(over), AT);
+
+  it("old denial + newer successful admission + settled → no current FAILED headline", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "SETTLED",
+        lease: { state: "SETTLED", fence: 9, expires_at: null },
+        claimed_generation: 7,
+      }),
+      driver: drv({
+        last_outcome: "CEO_PASS_COMMITTED",
+        last_result: { fault: null },
+        last_fence: 9,
+        admissions: [
+          { at: "2026-01-01T11:00:00Z", fence: 8, generation: 6, usage: null },
+          { at: "2026-01-01T11:50:00Z", fence: 9, generation: 7, usage: null },
+        ],
+        denials: [{ at: "2026-01-01T10:00:00Z", fence: 8, reason: "BUDGET" }],
+        lease: { state: "SETTLED", fence: 9, expires_at: null },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).not.toBe("failed");
+    expect(f.historical).toBe(true);
+    expect(s.headline.visual).not.toBe("failed");
+    expect(s.headline.label).not.toContain("denial");
+  });
+
+  it("old denial only, no fault → historical diagnostic, not failure", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ denials: [{ reason: "BUDGET", at: "2026-01-01T09:00:00Z", fence: 3 }] }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("upcoming");
+    expect(f.status).toContain("past denial");
+    expect(f.historical).toBe(true);
+    expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
+  });
+
+  it("last_result.fault stays prominent + exact code, distinct from last_outcome", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({
+        last_outcome: "CEO_PASS_COMMITTED",
+        last_result: { fault: "INTEGRITY_FAULT" },
+        last_fence: 4,
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");
+    expect(f.status).toContain("INTEGRITY_FAULT");
+    /* no live claim → latest recorded, not current-cycle */
+    expect(f.historical).toBe(true);
+    expect(f.detail).toContain("Latest recorded fault");
+    /* last_outcome preserved separately in pass evidence */
+    expect(s.nodes.find((n) => n.id === "pass")!.evidence
+      .some((e) => e.value === "CEO_PASS_COMMITTED")).toBe(true);
+  });
+
+  it("fault on the CURRENT claim fence → current failure, headline drives", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "EXECUTING", claimed_generation: 7,
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+      driver: drv({
+        last_result: { fault: "EXECUTION_FAILED" },
+        last_fence: 9,
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");
+    expect(f.historical).toBeFalsy();
+    expect(f.status).toBe("EXECUTION_FAILED");
+    expect(s.headline.visual).toBe("failed");
+  });
+
+  it("scheduler BLOCKED + historical denials → block dominates headline", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "BLOCKED_RETRY_EXHAUSTED", blocked_reason: "RETRY_LIMIT_REACHED",
+      }),
+      driver: drv({ denials: [{ reason: "BUDGET" }, { reason: "X" }] }),
+    }));
+    expect(s.headline.visual).toBe("blocked");
+    expect(s.nodes.find((n) => n.id === "br_fault")!.historical).toBe(true);
+  });
+
+  it("denial at previous fence + current active claim → claim not marked denied", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "CLAIMED", claimed_generation: 7,
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+      driver: drv({
+        denials: [{ at: "x", fence: 4, reason: "BUDGET" }],
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+    }));
+    expect(s.nodes.find((n) => n.id === "claim")!.visual).toBe("active");
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).not.toBe("failed");
+    expect(f.historical).toBe(true);
+  });
+
+  it("fault tied to prior fence + newer claim → not assigned to new cycle", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "CLAIMED", claimed_generation: 7,
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+      driver: drv({
+        last_result: { fault: "EXECUTION_FAILED" },
+        last_fence: 4,
+        lease: { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");         // stays visible as latest recorded
+    expect(f.historical).toBe(true);         // but NOT a current-cycle failure
+    expect(f.status).toContain("prior cycle");
+    expect(s.headline.visual).not.toBe("failed");
+    expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
+  });
+
+  it("malformed denial metadata → no fabricated ordering, stays historical", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ denials: [{ note: "unstructured" }, {}], last_result: { fault: null } }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("upcoming");
+    expect(f.status).toContain("past denial");
+    expect(s.headline.visual).not.toBe("failed");
+  });
+
+  it("no denials and no fault → branch inactive", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ denials: [], last_result: { fault: null } }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("upcoming");
+    expect(f.status).toBe("no fault");
   });
 });

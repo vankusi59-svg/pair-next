@@ -107,6 +107,10 @@ export interface LoopNodeState {
   detail?: string;
   evidence: LoopEvidence[];
   branch: boolean; // conditional side-branch node
+  /* R3-F2 — durable history, NOT a current-cycle condition. Historical
+     nodes may keep their diagnostic colour but never drive the
+     aggregate headline or an active edge. */
+  historical?: boolean;
 }
 
 export interface LoopEdge {
@@ -703,7 +707,8 @@ function deriveMission(i: LoopInputs): LoopNodeState {
   if (running.length)
     return mk("mission", "MISSION OPEN", "active", `${running.length} running`, e);
   if (failed.length && !completed.length)
-    return mk("mission", "MISSION OPEN", "failed", `${failed.length} failed`, e);
+    return mk("mission", "MISSION OPEN", "failed", `${failed.length} failed`, e, false,
+      "Recorded mission terminal status — a cockpit observation of mission records.");
   if (completed.length)
     return mk("mission", "MISSION OPEN", "proven", `${completed.length} completed`, e, false,
       "Completed missions are historical evidence — not proof a mission is open now (rule A).");
@@ -855,17 +860,50 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
     brRetry = mk("br_retry", "RETRY / BACKOFF", "upcoming", "no retries",
       [absent("retry evidence", "auto-scheduler")], B);
 
-  // DENIED / FAULT — rule E: fault, denials and outcome are distinct
+  // DENIED / FAULT — rule E + R3-F2: three distinct concepts —
+  //   (a) a fault correlated to the CURRENT claim fence → current
+  //       failure, prominent and headline-driving;
+  //   (b) a recorded fault without current-fence correlation →
+  //       "latest recorded fault", red but explicitly historical —
+  //       never drives the headline as a current failure;
+  //   (c) denials alone are bounded admission history → neutral
+  //       "past denials" diagnostic, never a current FAILED.
   let brFault: LoopNodeState;
-  if (d.kind === "ready" && (d.data.last_result?.fault || (d.data.denials?.length ?? 0) > 0)) {
+  const dd = d.kind === "ready" ? d.data : null;
+  const faultCode = dd?.last_result?.fault ?? null;
+  const denialCount = dd?.denials?.length ?? 0;
+  if (faultCode && dd) {
+    const schedLease = s.kind === "ready" ? s.data.lease : null;
+    const claimFence =
+      leaseConfirmedActive(schedLease, i.nowMs) ? schedLease!.fence : null;
+    /* Currency is provable only when a confirmed live claim exists AND
+       the faulted pass fence equals it. last_fence null, a different
+       fence, or no live claim → ambiguous → historical (never assume
+       the fault belongs to the current cycle). */
+    const current = claimFence !== null && dd.last_fence === claimFence;
     const e: LoopEvidence[] = [
-      ev("last_result.fault", d.data.last_result?.fault, "auto-driver"),
-      ev("denials", d.data.denials?.length ?? 0, "auto-driver"),
-      ev("last_outcome", d.data.last_outcome, "auto-driver"),
+      ev("last_result.fault", faultCode, "auto-driver"),
+      ev("last_fence", dd.last_fence, "auto-driver"),
+      ev("current claim fence", claimFence, "auto-scheduler"),
+      ev("denials", denialCount, "auto-driver"),
+      ev("last_outcome", dd.last_outcome, "auto-driver"),
     ];
     brFault = mk("br_fault", "DENIED / FAULT", "failed",
-      d.data.last_result?.fault ?? `${d.data.denials.length} denial(s)`, e, B,
-      "A fresh fault may coexist with an older successful last_outcome (rule E).");
+      current ? faultCode : `${faultCode} · prior cycle`, e, B,
+      current
+        ? "Fault recorded on the fence matching the current confirmed claim (rule E)."
+        : "Latest recorded fault — no current-cycle fence correlation; a fresh fault may coexist with an older successful last_outcome (rule E).");
+    if (!current) brFault.historical = true;
+  } else if (denialCount > 0) {
+    brFault = mk("br_fault", "DENIED / FAULT", "upcoming",
+      `${denialCount} past denial(s) · historical`,
+      [
+        ev("denials", denialCount, "auto-driver"),
+        ev("last_result.fault", null, "auto-driver"),
+        ev("last_outcome", dd?.last_outcome ?? null, "auto-driver"),
+      ], B,
+      "Denial records are bounded admission history — without a recorded fault they are a diagnostic, not a current failure (rule E).");
+    brFault.historical = true;
   } else
     brFault = mk("br_fault", "DENIED / FAULT", "upcoming", "no fault",
       [absent("fault evidence", "auto-driver")], B);
@@ -978,18 +1016,21 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
     ...deriveBranches(j),
   ];
 
-  /* R1-F2 — cockpit observation-integrity gating. When the canonical
-     observation reports an integrity error, EVERY cockpit-derived
-     positive/progress claim is downgraded to unverified — not just
-     artifacts. Scheduler/driver/policy observations come from their
-     own endpoints and remain independently valid. The raw claims stay
-     in each node's evidence as explicitly unverified cockpit data. */
+  /* R1-F2 / R3-F1 — cockpit observation-integrity gating. When the
+     canonical observation reports an integrity error, EVERY
+     cockpit-derived operational assertion is downgraded to
+     unverified — positive (proven/active/waiting) AND negative
+     (failed/blocked). An unverified read cannot claim the mission
+     FAILED any more than it can claim it RUNNING. Scheduler/driver/
+     policy observations come from their own endpoints and remain
+     independently valid. The raw claims stay in each node's evidence
+     as explicitly unverified cockpit data. */
   const obsErr = ck.kind === "ready" ? ck.data.observation_error : null;
   const obsBad = obsErr !== null && obsErr !== undefined;
   if (obsBad) {
     for (const n of nodes) {
       if (!COCKPIT_CLAIM_NODES.has(n.id)) continue;
-      if (n.visual === "proven" || n.visual === "active" || n.visual === "waiting") {
+      if (n.visual !== "upcoming" && n.visual !== "unknown") {
         n.visual = "unknown";
         n.status = "unverified";
         n.detail =
@@ -1026,15 +1067,20 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
       from: src,
       to: br as LoopNodeId,
       kind: "branch",
-      active: n.visual === "blocked" || n.visual === "waiting" || n.visual === "failed",
+      /* R3-F2 — historical diagnostic nodes never get an active edge */
+      active: !n.historical &&
+        (n.visual === "blocked" || n.visual === "waiting" || n.visual === "failed"),
     });
   }
 
   /* headline — most significant observed condition wins; an integrity
      failure is surfaced alongside whatever the independent endpoints
-     still prove, never used to claim verified execution. */
+     still prove, never used to claim verified execution. R3-F2:
+     historical nodes keep their diagnostic colour but never drive
+     the headline as a current failure. */
   const activeN = nodes.filter((n) => n.visual === "active").length;
-  const badN = nodes.filter((n) => n.visual === "blocked" || n.visual === "failed");
+  const badN = nodes.filter(
+    (n) => !n.historical && (n.visual === "blocked" || n.visual === "failed"));
   const unknownN = nodes.filter((n) => n.visual === "unknown").length;
   const waitingN = nodes.filter((n) => n.visual === "waiting").length;
   const obsNote = obsBad ? " · cockpit claims unverified" : "";

@@ -1,31 +1,30 @@
 {
-  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R2",
-  "title": "R2 audit remediation: contradicted/inconsistent admission gating, owner-action + missions cockpit integrity, strict lease-expiry validation",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R3",
+  "title": "R3 audit remediation: cockpit integrity gating covers failed/blocked visuals; historical denials/faults never drive current FAILED headline",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
     "src/__tests__/ui-objective-autonomous-loop.test.ts",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#same fence + different generation",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#scheduler vs driver lease fence disagreement",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#differing lease snapshots mid-transition",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#contradicted admission",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#valid correlation still observed",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#SETTLED + matching admission stays historical",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit DIGEST_MISMATCH + owner flag",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit invalid + scheduler owner flag",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit valid + owner flag",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#cockpit invalid + mission RUNNING",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#integrity recovery",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#Infinity expiry",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#negative expiry",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#invalid expiry + exact fence",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#WAITING_CONSUMER + invalid lease expiry",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease expiry"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission FAILED",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission CANCELLED",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#clean cockpit + mission FAILED",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#independently blocked scheduler",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#recovery: valid cockpit",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#no edge animates toward a cockpit node",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#old denial + newer successful admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#old denial only",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#last_result.fault stays prominent",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#fault on the CURRENT claim fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#scheduler BLOCKED + historical denials",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#denial at previous fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#fault tied to prior fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#malformed denial metadata",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#no denials and no fault"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "R2 remediation on audited R1 HEAD d3c5028 (correction BASE), still vs integration BASE 07f22db. R2-F1: AdmissionVerdict adds 'inconsistent'; scheduler-vs-driver lease reads are independent observations — material fence/state divergence while a scheduler lease is active-state yields OBSERVATION_INCONSISTENT (unknown, never a fault), with both raw leases retained as separate evidence; 'contradicted' now renders UNKNOWN / INCONSISTENT with conflicting fence/generation kept for diagnosis — only terminal-lease matches render 'historical/proven'; contradicted/inconsistent produce no active edge and no pass inference. R2-F2: OWNER ACTION branch gates the cockpit flag on cockpit observation integrity — scheduler-verified flags stay waiting; cockpit-only-unverified renders unknown/unverified with diagnostics; Missions panel gains an explicit per-panel UNVERIFIED label when observation_error is set (proved by a real Playwright route-interception spec). R2-F3: lease expiry validity is separated from lease state — confirmed-current claims require recognized active state AND a valid positive epoch-ms expires_at strictly after the observation time; null/NaN/Infinity/negative/past expiry on an active-state lease → unverified lease (unknown), applied consistently in deriveClaim, correlateAdmission, derivePass and the scheduler lease-held narrative. R1 regressions updated only where they encoded the defective null/NaN-is-active expectation. 62-scenario vitest (15 new R2 regressions) + 7 Playwright specs. Root test file remains the documented tooling exception; production scope stays apps/mission-control-ui/** — zero backend/authority changes.",
+  "description": "R3 remediation on audited R2 HEAD 28966e6 (correction BASE), vs integration BASE 07f22db. R3-F1: cockpit observation-integrity downgrade now covers EVERY operational visual — proven, active, waiting, failed, blocked — so an unverified cockpit read can no longer paint mission FAILED or drive a FAILED aggregate headline; raw claims remain as explicitly unverified evidence; scheduler/driver/policy failures stay independently authoritative. R3-F2: DENIED/FAULT branch now separates three concepts — (a) last_result.fault on the fence matching the confirmed live claim = current failure (failed, headline-driving); (b) last_result.fault without current-fence correlation = 'latest recorded fault', red but flagged historical ('prior cycle' suffix), excluded from headline badN and active edges; (c) denials alone = 'N past denial(s) · historical' neutral diagnostic, never current FAILED. last_outcome preserved separately; no ordering is inferred from array length or malformed denial metadata. 15 new R3 regressions; two R1-era assertions updated only where they encoded the defective denials=fault / fault-code-strict behavior. 77-scenario vitest total, 7 Playwright specs unchanged-and-green. Root test file remains the documented tooling exception; production scope apps/mission-control-ui/** only; zero backend/authority changes.",
   "risk_override": "MEDIUM"
 }
