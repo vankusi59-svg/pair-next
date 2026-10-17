@@ -1,20 +1,23 @@
 {
-  "claim_id": "P15_9_A2_UI_PRODUCTION_CUTOVER",
-  "title": "P15.9-A2 production default Company Cockpit cutover with explicit legacy rollback",
+  "claim_id": "WORKSTREAM_GOAL_SOURCE_TERMS",
+  "title": "Restore owner literals the CEO paraphrases out of delegated workstream goals",
   "affected_surfaces": [
-    "MISSION_CONTROL",
-    "UI",
+    "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
-    "src/__tests__/tools-security.test.ts",
-    "src/__tests__/dev-verification.test.ts"
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '+' inside a URL query value",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '=' inside a URL query value",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized double-quoted literal fails closed",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized single-quoted literal fails closed",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#preserves parentheses, brackets",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#strips prose punctuation",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#partial claim cannot starve",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction-bound failure rolls back"
   ],
   "invariants": [
-    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "BASE bdeae5aa651cbfb586ed23a1dd09ff448dda0730. P15.9-A2 UI cutover: production builds default legacy routes to /app, root to /app/company; Vite dev stays legacy-first. pair.legacy_redirect='app' forces new UI; 'legacy' is per-browser rollback on any build; absent/unknown key uses build default, never grants authority. Scope: src/main.tsx cutover seam (Navigate preserves id+query+hash), src/vite-env.d.ts typing, e2e specs: legacy-tree tests seed 'legacy' pref, b6-acceptance asserts production default + rollback + id/query/hash in one hop with no loop (R1-F3), objectives.spec tz fix. Zero src/pair/* or serve-script changes. Executed: tsc clean, vite build clean, Playwright on production dist (serve-mission-control.mjs — NOT Vite dev): b6 8/8, suite 193/217. Baseline contrast run on BASE worktree, same env/store/Chromium: all 10 representative failures reproduce identically on BASE — 22 mint-path tests fail closed FAIL_CLOSED_PLANNER_NO_ELIGIBLE (template planner removed c7c280f; no eligible codex-cli planner in e2e env; direct API evidence 409), system:107 transitively needs minted routing data, objectives:586 tz bug failed on BASE and is fixed here. Playwright env note: CHROME_BIN must point at local Chromium; PAIR_*_ROUTE/AGNES_API_KEY must be unset or the spawned server fails closed at boot. No deployment or merge claimed.",
-  "risk_override": "HIGH"
+  "description": "BASE 44e4bc5, R3 (audit R2 corrections) — extractor-only fixes in src/pair/objective-source-terms.ts. R3-F1: stripLiteralTail no longer strips '='/'+' at a literal tail — those are legal URL data (base64 signature tails, empty-valued query params); prose punctuation can never attach to a URL without whitespace, which already ends the match. R2 tail cases (parens/brackets/prose wrappers) preserved. R3-F2: the quoted keep-pattern is bounded at {1,160}, so an oversized quoted literal could never match and was silently ignored; a dedicated OVERSIZED_QUOTED_LITERAL pre-scan under identical boundary rules now throws FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS for ANY quoted run >160 chars, inside the atomic commit txn (zero residue proven). Unchanged: broadcast preservation, raw-proposal normalized digest, enriched WDEC digest, replay/amend, atomic commit, goal cap 2048, 24-literal/160-char bounds, DC→DL→operator_goal propagation. Files: objective-source-terms.ts, patch-claim.json, test file (29 tests). Executed: 4/4 new regressions failed on R2 HEAD a1050c0 then pass post-fix; focused 29/29; P15.2 31/31 + P15.4 37/37; tsc clean. PLAN_DATAFLOW_UNBOUND out of scope. No merge claimed.",
+  "risk_override": "MEDIUM"
 }
