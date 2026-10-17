@@ -63,6 +63,7 @@ import {
   type GraphAuthorityDeps,
 } from "./graph-authority.js";
 import { WORK_DECOMPOSE_CHILD_CAP } from "./work-graph.js";
+import { appendMissingSourceTerms } from "./objective-source-terms.js";
 import { TERMINAL_OBJECTIVE_STATUSES, type ObjectiveStatus } from "./objective-authority.js";
 
 type Row = Record<string, unknown> & { version: number };
@@ -600,13 +601,23 @@ export class ObjectiveWorkstreamService {
         work_item_id: rootId,
         operator_id: input.actor,
       });
+      // R3.F — deterministic source-term preservation: literals the CEO
+      // paraphrased out of a workstream goal (URLs, paths, filenames,
+      // quoted keys) are restored from the canonical statement as a
+      // bounded `[source terms: …]` trailer BEFORE the P14 children
+      // commit. The normalized proposal/digest never see the trailer —
+      // replay still converges on stored rows. Delegated children then
+      // inherit the enriched goal verbatim (work-graph copies
+      // parent.goal), so literals survive the whole delegation chain.
+      const committedChildren = appendMissingSourceTerms(
+        children, String(obj.statement ?? obj.title));
       // Existing P14 authority — children + WDEC + WGE + WDS + membership
       // materialize inside this same outer transaction.
       let childrenRows: Row[];
       try {
         const dec = this.workforce.decomposeWorkItem(rootId, {
           decomposition_id: decompositionId,
-          children,
+          children: committedChildren,
         }, input.actor);
         childrenRows = dec.children;
       } catch (err) {

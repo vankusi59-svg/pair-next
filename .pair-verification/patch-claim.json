@@ -1,17 +1,21 @@
 {
-  "claim_id": "ARTIFACT_INGEST_HOST_SEPARATOR_FOLD",
-  "title": "Fold host path separators in executor-reported artifact paths to canonical POSIX logical names",
+  "claim_id": "WORKSTREAM_GOAL_SOURCE_TERMS",
+  "title": "Restore owner literals the CEO paraphrases out of delegated workstream goals",
   "affected_surfaces": [
-    "ARTIFACT",
+    "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-f1-artifact-authority.test.ts#backslash separators fold",
-    "src/__tests__/pair-f1-artifact-authority.test.ts#folded backslash traversal"
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#literal extraction",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailer projection",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#commits enriched goals",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#starve a sibling",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#digest, replay and amend",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#bounds, odd literals"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 026d86f187beab83b094a56fd649fdfd155f7f8b. Production defect observed live: Codex CLI on Windows reports result.artifacts[].path with host separators (`outbox\\report.txt`); artifact-validation forwarded that spelling as the canonical logical_name, normalizeArtifactName rejected the backslash (FAIL_CLOSED_ARTIFACT_NAME_INVALID), so a correctly produced outbox deliverable never minted a canonical artifact → ARTIFACT_VALIDATION_FAILURE → deterministic replan abort (mission MSN_01M52A1VETSXN7CD4X9R41YK6A, Telegram delivery intent). Fix at the single ingress boundary in validate_execution: executor-reported `path` is folded `\\`→`/` before validation, filesystem resolution, and canonical logical_name derivation. Strict checks unchanged and now run on the normalized spelling — `..\\x` traversal folds to `../x` and is still rejected (stricter than before). Files: src/pair/artifact-validation.ts (+11/-4), src/__tests__/pair-f1-artifact-authority.test.ts (+53: A1b separator fold PASS + A1c traversal rejection), scripts/dev-verification/lib.mjs (+5: TOLERATED_FAILURES entry for pair-f2-r4-remediation win32 baseline — 8/8 failures measured identical on BASE 026d86f in a dedicated BASE worktree, exit-127 unix-only spawn semantics, no assertion reached). Executed: vitest focused selectors 3/3 pass (A1/A1b/A1c), file suite 21/22 pass — F5 symlink fails identically on BASE (EPERM: Windows requires symlink privilege; environment baseline), tsc --noEmit clean. No executor contract, no authority weakening, no merge claimed.",
+  "description": "BASE 44e4bc5. Production defect: the CEO LLM paraphrases workstream goals and drops statement literals (URLs, /api routes, filenames, quoted keys) — delegated children inherit the paraphrased goal verbatim, so agents see 'the specified API' and fail closed or guess. Fix: deterministic src/pair/objective-source-terms.ts extracts literals (URL/Win-path/route/filename/quoted/storage-key; statement order, deduped, <=24 x <=160 chars) and appendMissingSourceTerms() projects them onto P14 child specs inside decomposeObjective before commit: clause-match >=2 token overlap attributes literals, unclaimed go to EVERY workstream, a workstream claiming nothing gets the FULL set (F1: no confident-but-wrong sibling starvation), verbatim literals never duplicate, goal+trailer > 2048 fails closed atomically. normalized_proposal_digest covers the RAW proposal (replay/amend unchanged); the P14 WDEC proposal_digest covers the ENRICHED goal. Files: src/pair/objective-source-terms.ts (new), objective-workstream.ts (+11/-1), index.ts (+1), src/__tests__/pair-p15-2w-source-terms.test.ts (new, 21 tests: extraction/order/dedupe/prose-safety/caps, clause match + fallbacks (F1), no-dup, 2048 fail-closed + zero-residue rollback, |]/newline safety, raw-vs-enriched digests (F2), amend cannot alter committed graph (F2), 3-URL + 'same as X' e2e, replay convergence, DC->DL propagation (F3)). Executed: 21/21 pass; pair-p15-2 31/31 pass; tsc clean. Enrichment only restores owner-typed text; no merge claimed.",
   "risk_override": "MEDIUM"
 }
