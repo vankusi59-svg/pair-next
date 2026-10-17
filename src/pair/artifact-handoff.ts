@@ -431,6 +431,18 @@ export class ArtifactDependencyResolver {
     const isDepPredecessor = (t: Record<string, unknown>): boolean =>
       depRefs.has(String(t.task_key)) || depRefs.has(String(t.task_id));
 
+    // Self-produced consumes need no upstream handoff: the committed plan
+    // model (plan-dataflow requiredEdges) requires no producer edge when a
+    // task declares the same artifact in consumes AND produces — the task
+    // creates it itself. Dispatch must honor that committed model rather
+    // than invent a producer the validator never demanded.
+    const ownProduces = new Set(
+      [...producesOf(task)]
+        .map((p) => {
+          try { return normalizeArtifactName(p); } catch { return null; }
+        })
+        .filter((p): p is string => p !== null),
+    );
     const entries: DependencyArtifactEntry[] = [];
     let totalBytes = 0;
     for (const rawName of [...consumes].sort()) {
@@ -474,6 +486,10 @@ export class ArtifactDependencyResolver {
           entries.push(extEntry);
           continue;
         }
+        // A consume the task itself produces is self-shadowed: no
+        // predecessor edge is required by the committed plan model, so
+        // nothing materializes — the task writes its own artifact.
+        if (ownProduces.has(name)) continue;
         // Declared consume with no producing predecessor: under the
         // committed plan model this state should never exist — treat as
         // unresolvable rather than guessing a source.
