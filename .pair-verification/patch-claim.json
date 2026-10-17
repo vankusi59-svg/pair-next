@@ -6,18 +6,18 @@
     "DEV_INFRA"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '+' inside a URL query value",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '=' inside a URL query value",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized double-quoted literal fails closed",
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized single-quoted literal fails closed",
     "src/__tests__/pair-p15-2w-source-terms.test.ts#preserves parentheses, brackets",
     "src/__tests__/pair-p15-2w-source-terms.test.ts#strips prose punctuation",
     "src/__tests__/pair-p15-2w-source-terms.test.ts#partial claim cannot starve",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#preservation broadcast",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction bounds fail closed",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction-bound failure rolls back",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#commits enriched goals",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#digest, replay and amend"
+    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction-bound failure rolls back"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 44e4bc5, R2 (audit R1 corrections). src/pair/objective-source-terms.ts preserves statement literals the CEO paraphrases out of delegated goals: deterministic extraction (URL/Win-path/route+query/filename/quoted/storage-key, statement order, deduped) + appendMissingSourceTerms() commit-time projection before P14 decomposeWorkItem. R2-F1: token-overlap attribution REMOVED — no heuristic can prove literal ownership; every workstream now receives every literal its goal lacks (preservation broadcast). R2-F2: balanced tail-stripping keeps ()[]{}?&= inside URLs/routes while dropping prose wrappers (Function_(mathematics), ids[]=1, /api/x?city=Hanoi&units=metric survive verbatim). R2-F3: bounds fail closed — >24 unique literals or a matched literal >160 chars throws FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS inside the atomic txn (zero residue); goal+trailer >2048 still fails closed. Invariants kept: normalized_proposal_digest covers RAW proposal, WDEC proposal_digest covers ENRICHED goal, exactly-once replay/amend, atomic commit, goal cap 2048. Files: objective-source-terms.ts (rewritten), patch-claim.json, test file (25 tests). Executed: 25/25 pass; P15.2 31/31 + P15.4 37/37 pass; tsc clean. No merge claimed.",
+  "description": "BASE 44e4bc5, R3 (audit R2 corrections) — extractor-only fixes in src/pair/objective-source-terms.ts. R3-F1: stripLiteralTail no longer strips '='/'+' at a literal tail — those are legal URL data (base64 signature tails, empty-valued query params); prose punctuation can never attach to a URL without whitespace, which already ends the match. R2 tail cases (parens/brackets/prose wrappers) preserved. R3-F2: the quoted keep-pattern is bounded at {1,160}, so an oversized quoted literal could never match and was silently ignored; a dedicated OVERSIZED_QUOTED_LITERAL pre-scan under identical boundary rules now throws FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS for ANY quoted run >160 chars, inside the atomic commit txn (zero residue proven). Unchanged: broadcast preservation, raw-proposal normalized digest, enriched WDEC digest, replay/amend, atomic commit, goal cap 2048, 24-literal/160-char bounds, DC→DL→operator_goal propagation. Files: objective-source-terms.ts, patch-claim.json, test file (29 tests). Executed: 4/4 new regressions failed on R2 HEAD a1050c0 then pass post-fix; focused 29/29; P15.2 31/31 + P15.4 37/37; tsc clean. PLAN_DATAFLOW_UNBOUND out of scope. No merge claimed.",
   "risk_override": "MEDIUM"
 }

@@ -552,3 +552,70 @@ describe("P15.2W F3 — bounds, odd literals and DL propagation", () => {
     expect(String(dl.goal).match(/\[source terms:/g)!.length).toBe(1);
   });
 });
+
+/* ============ E — R3 audit regressions ============ */
+
+describe("P15.2W R3 — audit corrections", () => {
+  // R3-F1 — '+' and '=' at a URL tail can be real query data (base64
+  // signatures end in '+'/'='; empty-valued params end in '=').
+  // stripLiteralTail must not default-strip them.
+  it("R3-F1 — trailing '+' inside a URL query value is literal data", () => {
+    expect(extractStatementLiterals(
+      "Sign with https://api.example/token?signature=abc+ and call."))
+      .toEqual(["https://api.example/token?signature=abc+"]);
+  });
+
+  it("R3-F1 — trailing '=' inside a URL query value is literal data", () => {
+    expect(extractStatementLiterals(
+      "Search via https://api.example/search?q= next."))
+      .toEqual(["https://api.example/search?q="]);
+  });
+
+  // R3-F2 — the quoted-literal pattern is bounded at {1,160}, so a
+  // longer quoted run never matches and is silently ignored instead of
+  // reaching the LITERAL_CAP fail-closed check.
+  it("R3-F2 — oversized double-quoted literal fails closed, never ignored", () => {
+    const lit = `"${"x".repeat(161)}"`;
+    try {
+      extractStatementLiterals(`persist key ${lit} now`);
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+  });
+
+  it("R3-F2 — oversized single-quoted literal fails closed, rollback clean", () => {
+    const lit = `'${"y".repeat(190)}'`;
+    try {
+      extractStatementLiterals(`use flag ${lit} here`);
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+    // The same statement must abort decomposeObjective inside the
+    // atomic transaction — no root, children, WDEC or binding residue.
+    const { store, objectives, svc } = freshStack("r3-quoted-oversize");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid, `use flag ${lit} here`);
+    const before = rowCount(store, "work_item") + rowCount(store, "work_decomposition");
+    try {
+      svc.decomposeObjective({
+        objective_id: String(o.objective_id),
+        ...pins(o),
+        workstreams: [
+          { workstream_key: "w", title: "w", goal: "do it", depends_on_keys: [] },
+        ],
+        actor: OP,
+      });
+      throw new Error("unreachable");
+    } catch (e) {
+      expect((e as { code?: string }).code)
+        .toBe("FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS");
+    }
+    expect(rowCount(store, "work_item") + rowCount(store, "work_decomposition"))
+      .toBe(before);
+    expect(svc.getBinding(String(o.objective_id))).toBeNull();
+  });
+});

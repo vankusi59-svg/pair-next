@@ -28,6 +28,17 @@
  *  - Bounds fail closed, never silently truncate: >24 unique literals
  *    or a matched literal >160 chars aborts the commit inside the
  *    atomic transaction (R2-F3).
+ *
+ * R3 audit corrections:
+ *  - `+`/`=` at a URL tail are literal data (base64 signatures end in
+ *    `+`/`=`; empty-valued params end in `=`) — tail-stripping keeps
+ *    them; prose punctuation never attaches to a URL without a space
+ *    (R3-F1).
+ *  - The quoted keep-pattern is bounded at {1,160}; a longer quoted
+ *    run can never match it, so an oversized quoted literal would be
+ *    silently ignored instead of reaching the cap check. A dedicated
+ *    pre-scan under the same boundary rules fails closed on any
+ *    length (R3-F2).
  */
 
 import { IntegrityError } from "./errors.js";
@@ -66,6 +77,15 @@ const LITERAL_PATTERNS: RegExp[] = [
   /\b(?:local|session)Storage\s+key\s+(?:["'`][\w][\w.\-]*["'`]|[\w][\w.\-]*)/gi,
 ];
 
+/** R3-F2 — detector for quoted literals too long to ever match the
+ *  bounded keep-pattern above. Same boundary rules, so a run that
+ *  would have been a literal had it fit still reaches validation and
+ *  fails closed instead of silently vanishing. The quantifier is
+ *  deliberately open-ended: ANY oversized quoted run must fail,
+ *  bounded only by the statement's own length. */
+const OVERSIZED_QUOTED_LITERAL =
+  /(?<!\w)"[^"\n]{161,}"(?!\w)|(?<!\w)'[^'\n]{161,}'(?!\w)/g;
+
 /** Patterns whose match gets balanced tail-stripping — URLs, Windows
  *  paths, routes, filenames. Quoted/storage literals keep their exact
  *  spelling (quotes are data, not punctuation). */
@@ -77,14 +97,17 @@ const TAIL_STRIP_PATTERNS = 4;
  * and closers `)]}` that outnumber their openers inside the match —
  * `Function_(mathematics)` keeps its parens, `https://x/a)` drops the
  * prose paren. `'`/`"` are also stripped here because quoted literals
- * never reach this path.
+ * never reach this path. `=` and `+` are NEVER stripped: they are
+ * legal URL data (base64 signatures, empty-valued params) and cannot
+ * appear as prose attached to a literal — prose always separates them
+ * with whitespace, which already ended the match.
  */
 function stripLiteralTail(text: string): string {
   let s = text;
   for (;;) {
     if (!s) return s;
     const last = s[s.length - 1]!;
-    if (".,;:!?&=+'\"".includes(last) || last === "\\" || last === ">") {
+    if (".,;:!?&'\"".includes(last) || last === "\\" || last === ">") {
       s = s.slice(0, -1);
       continue;
     }
@@ -112,6 +135,10 @@ function stripLiteralTail(text: string): string {
  */
 export function extractStatementLiterals(statement: string): string[] {
   if (typeof statement !== "string" || !statement) return [];
+  OVERSIZED_QUOTED_LITERAL.lastIndex = 0;
+  if (OVERSIZED_QUOTED_LITERAL.test(statement)) {
+    literalsFail(`quoted literal exceeds ${LITERAL_CAP} chars`);
+  }
   const hits: Array<{ index: number; text: string }> = [];
   for (const [pi, re] of LITERAL_PATTERNS.entries()) {
     re.lastIndex = 0;
