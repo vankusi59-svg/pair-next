@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../../api";
 import { useSelectedBusiness } from "../AppShell";
 import type { CockpitPayload } from "../types";
-import type { AutoPolicyStatus } from "../../types";
+import type { AutoDriverStatus, AutoPolicyStatus, AutoSchedulerStatus } from "../../types";
+import { ObjectiveAutonomousLoop } from "../components/ObjectiveAutonomousLoop";
+import type { EpRead, LoopInputs } from "../lib/objectiveLoop";
+import { epError, epMissing, epReady, shouldApplyResponse } from "../lib/objectiveLoop";
 import { StatusBadge, ProofChip, type Tone } from "../components/StatusBadge";
 import { DeniedState, EmptyState, ErrorState, Skeleton, UnverifiedPanel } from "../components/states";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -72,6 +75,15 @@ export function ObjectiveDetail() {
     | { kind: "error"; err: ApiError }
   >({ kind: "loading" });
   const [polTick, setPolTick] = useState(0);
+  /* Autonomous-loop observability reads — same 5s poll cadence, same
+     abort/newest-wins and fail-closed identity conventions as the
+     auto-policy read. atMs guards out-of-order responses even if an
+     abort lands late. */
+  const [schSt, setSchSt] = useState<EpRead<AutoSchedulerStatus>>({ kind: "missing" });
+  const [drvSt, setDrvSt] = useState<EpRead<AutoDriverStatus>>({ kind: "missing" });
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const cptAt = useRef<number | null>(null);
+  const lastApplied = useRef({ sch: 0, drv: 0 });
   /* Exact-body retry store: the submitted mutation body is kept
      verbatim (action, policy_version, limits, halt params,
      idempotency key) keyed by operation signature. An ambiguous
@@ -99,6 +111,10 @@ export function ObjectiveDetail() {
     setDlg(null);
     setMutBusy(false);
     setPolSt({ kind: "loading" });
+    setSchSt({ kind: "missing" });
+    setDrvSt({ kind: "missing" });
+    cptAt.current = null;
+    lastApplied.current = { sch: 0, drv: 0 };
     pendingOps.current = {};
     pendingCfg.current = null;
     opSeq.current++;
@@ -115,14 +131,17 @@ export function ObjectiveDetail() {
         const c = r.cockpit;
         if (String(c.objective.business_id) !== biz) setSt({ kind: "mismatch", objBiz: c.objective.business_id });
         else if (String(c.objective.objective_id) !== id) setSt({ kind: "error", err: new ApiError(0, "IDENTITY_MISMATCH", "Cockpit response identity does not match the requested objective.") });
-        else setSt({ kind: "ready", data: c, forBiz: biz, forId: id });
+        else {
+          cptAt.current = Date.now();
+          setSt({ kind: "ready", data: c, forBiz: biz, forId: id });
+        }
       })
       .catch((e: unknown) => {
         if (ctl.signal.aborted) return;
         setSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
       });
     return () => ctl.abort();
-  }, [biz, id, tick]);
+  }, [biz, id, tick, polTick]);
 
   const refetch = () => setTick((n) => n + 1);
 
@@ -151,8 +170,73 @@ export function ObjectiveDetail() {
   }, [biz, id, polTick]);
 
   useEffect(() => {
+    if (!biz || !id) return;
+    const ctl = new AbortController();
+    api
+      .autoSchedulerStatusApp(id, ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        const atMs = Date.now();
+        const d = r.auto_scheduler;
+        /* Same fail-closed identity contract as the auto-policy read —
+           a scheduler status for another objective is an error, not data. */
+        if (String(d.objective_id) !== id) {
+          lastApplied.current.sch = atMs;
+          setSchSt(epError(null, "IDENTITY_MISMATCH"));
+          return;
+        }
+        if (!shouldApplyResponse(lastApplied.current.sch, atMs)) return;
+        lastApplied.current.sch = atMs;
+        setSchSt(epReady(d, atMs));
+      })
+      .catch((e: unknown) => {
+        if (ctl.signal.aborted) return;
+        const atMs = Date.now();
+        lastApplied.current.sch = atMs;
+        setSchSt(epError(
+          e instanceof ApiError ? e.status : null,
+          e instanceof ApiError ? e.code : "ERROR",
+        ));
+      });
+    return () => ctl.abort();
+  }, [biz, id, polTick]);
+
+  useEffect(() => {
+    if (!biz || !id) return;
+    const ctl = new AbortController();
+    api
+      .autoDriverStatusApp(id, ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        const atMs = Date.now();
+        const d = r.auto_driver;
+        if (String(d.objective_id) !== id) {
+          lastApplied.current.drv = atMs;
+          setDrvSt(epError(null, "IDENTITY_MISMATCH"));
+          return;
+        }
+        if (!shouldApplyResponse(lastApplied.current.drv, atMs)) return;
+        lastApplied.current.drv = atMs;
+        setDrvSt(epReady(d, atMs));
+      })
+      .catch((e: unknown) => {
+        if (ctl.signal.aborted) return;
+        const atMs = Date.now();
+        lastApplied.current.drv = atMs;
+        setDrvSt(epError(
+          e instanceof ApiError ? e.status : null,
+          e instanceof ApiError ? e.code : "ERROR",
+        ));
+      });
+    return () => ctl.abort();
+  }, [biz, id, polTick]);
+
+  useEffect(() => {
     const iv = setInterval(() => {
-      if (document.visibilityState === "visible") setPolTick((n) => n + 1);
+      if (document.visibilityState === "visible") {
+        setPolTick((n) => n + 1);
+        setNowMs(Date.now());
+      }
     }, 5000);
     return () => clearInterval(iv);
   }, []);
@@ -288,6 +372,27 @@ export function ObjectiveDetail() {
         settle(seq, ctx, "", `Policy ${action} failed (same operation kept for exact-body retry)`)(e, true);
       });
   };
+
+  /* Autonomous-loop input bundle — identity-guarded reads only. The
+     cockpit read is ready here only when st already carries data for
+     THIS route; the loop never sees a foreign objective. */
+  const loopInputs: LoopInputs | null = useMemo(() => {
+    if (!id || !biz || st.kind !== "ready" || st.forId !== id || st.forBiz !== biz)
+      return null;
+    return {
+      objectiveId: id,
+      nowMs,
+      cockpit: epReady(st.data, cptAt.current ?? nowMs),
+      policy:
+        polSt.kind === "ready" && polSt.forId === id
+          ? epReady(polSt.data, nowMs)
+          : polSt.kind === "error"
+            ? epError(polSt.err.status, polSt.err.code)
+            : epMissing(),
+      scheduler: schSt,
+      driver: drvSt,
+    };
+  }, [id, biz, st, polSt, schSt, drvSt, nowMs]);
 
   if (st.kind === "no-business") {
     return (<><h1>Objective</h1><EmptyState title="No business selected" detail="Select a business first — objective detail is rendered inside the selected-business context." /></>);
@@ -439,6 +544,8 @@ export function ObjectiveDetail() {
       {obsErr ? (
         <UnverifiedPanel title="Observation failed integrity check" detail={`${c.observation_error} — KPI/workstream/budget claims below are shown as unverified claims, never verified evidence.`} />
       ) : null}
+
+      {loopInputs ? <ObjectiveAutonomousLoop inputs={loopInputs} nowMs={nowMs} /> : null}
 
       <h2 className="sech">Owner actions</h2>
       <div className="actions">

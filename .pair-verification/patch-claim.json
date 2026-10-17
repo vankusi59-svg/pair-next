@@ -1,23 +1,20 @@
 {
-  "claim_id": "EXTERNAL_INPUT_LATEST_ACCEPTED",
-  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer (R1: exact-name precedence + ordering; R2: commit-boundary TOCTOU re-proof)",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI",
+  "title": "Objective Autonomous Loop live flowchart dashboard (frontend-only observability; zero backend/runtime changes)",
   "affected_surfaces": [
-    "ARTIFACT",
-    "PLANNER",
-    "DEV_INFRA"
+    "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#exact match wins over a NEWER outbox alias (never displaced)",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#equal created_at → artifact_id tiebreak, input-order independent",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands inside the planner window → commit fails closed, zero revisions",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#v3 lands between PREPARED staging and commit → fail closed",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#durable PREPARED resume — drift at resume-commit → fail closed",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#no drift → PREPARED commits once, receipt + supersede land",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#dispatch honors PINNED v2 even after v3 lands — never rebinds"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease without correlated admission",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#INTEGRITY_FAULT coexists",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#settlement never claims completion",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#cross-objective response",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#active edges are observed-only"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 43de5e4. LATEST_ACCEPTED + R1 corrections + R2 commit-boundary TOCTOU closure. Winner selection: EXACT logical_name outranks outbox/<basename> aliases (alias binds only when all aliases collapse to ONE logical_name, else FAIL_CLOSED AMBIGUOUS_SOURCE); ordering = parsed created_at epoch (missing/invalid = provably-oldest) then artifact_id — total order, never insertion order. R2-F1: runPlanning now re-resolves the canonical eligible set inside store.immediate alongside assertPlanDataflow+commitPlan — the planner-call window can no longer commit a stale pin; drift/revocation → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING, check+write share the serialized writer. R2-F2: commitPreparedReplan re-fetches eligible sources inside its existing commit transaction and re-proves fresh.prepared_tasks (bind + assert) before commitPlan — resume-commit drift fails closed pre-revision, no supersede, no fake receipt; the already-committed replay branch never re-proves so valid post-commit drift can't retro-fail. Recovery state machine untouched: the throw lands in recoveryGuard→handleRecoveryApplyFailure → REPLAN infeasible → fresh decision under a new recovery_id, bounded, no infinite replay. R2 tests drive REAL runtime seams: bound-mission runPlanning, dispatch-failure→REPLANNING→staging→commit, durable PREPARED resume via ReplanAttemptLedger.record. R2-T1/T2/T3/T5 failing-first verified (stale pin committed pre-fix); T4/T6 positive controls prove no-drift initial+replan commits still land exactly once.",
-  "risk_override": "HIGH"
+  "description": "BASE 07f22db. Adds a read-only Autonomous Loop observability section to the existing Objective Detail page: a real node-and-edge SVG flowchart (15-node spine OBJECTIVE/POLICY → DURABLE WAKE → SCHEDULER → CLAIM/LEASE → DRIVER ADMISSION → OPERATING PASS → CEO → WORKSTREAM ALLOCATION → PLANNER → MISSION OPEN → EXECUTION → ARTIFACTS/EVIDENCE → REVIEW → SCHEDULER SETTLEMENT → CONTINUATION, plus a continuation→wake loop edge and five evidence-gated side branches BLOCKED/WAITING/RETRY/DENIED-FAULT/OWNER-ACTION), zoom/pan/fit, click-to-inspect evidence panel, per-endpoint freshness, and read-only scheduler/driver/missions detail panels. Pure deterministic derive layer (deriveLoopSnapshot et al.) implements authority rules A–G: lease proves claim not admission (fence/generation correlation), history never presented as current-cycle progress, no per-cycle settlement fabrication, INTEGRITY_FAULT coexisting with older success, separate next_due/lease/policy time concepts. Live data: two new typed GET reads (auto-scheduler, auto-driver) polled on the existing 5s visible-page cadence with abort + atMs staleness guards and the same fail-closed objective-identity contract as the canonical auto-policy read. 22-scenario vitest file proves the derivation contract; Playwright spec proves real-stack rendering, inspector, honest endpoint failure, and no cross-objective leakage. NOTE: the test file lives at src/__tests__/ because the harness executes `npx vitest run <selector>` under the root vitest config (include: src/__tests__/**) — the tested module has zero runtime imports and stays inside apps/mission-control-ui. Zero production-runtime changes: UI surface only, no new endpoints, no mutations, no dependency changes, no lockfile changes.",
+  "risk_override": "MEDIUM"
 }

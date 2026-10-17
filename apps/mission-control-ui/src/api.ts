@@ -194,6 +194,20 @@ export const api = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* Autonomous-loop observability reads (owner-scoped GETs, poll-safe).
+     Abortable; noAuthPrompt so failures render honest states. */
+  autoSchedulerStatusApp: (id: string, signal?: AbortSignal) =>
+    req<{ auto_scheduler: import("./types").AutoSchedulerStatus }>(
+      `/vnext/objectives/${id}/auto-scheduler`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  autoDriverStatusApp: (id: string, signal?: AbortSignal) =>
+    req<{ auto_driver: import("./types").AutoDriverStatus }>(
+      `/vnext/objectives/${id}/auto-driver`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
   autoPolicyControlApp: (
     id: string,
     body: {
