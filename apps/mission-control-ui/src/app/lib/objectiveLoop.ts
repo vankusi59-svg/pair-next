@@ -107,9 +107,10 @@ export interface LoopNodeState {
   detail?: string;
   evidence: LoopEvidence[];
   branch: boolean; // conditional side-branch node
-  /* R3-F2 — durable history, NOT a current-cycle condition. Historical
-     nodes may keep their diagnostic colour but never drive the
-     aggregate headline or an active edge. */
+  /* R3-F2 / R4-F1 — durable history OR a recorded event whose cycle
+     attribution is unverifiable. Such nodes may keep their diagnostic
+     colour but never drive the aggregate headline or an active edge
+     as a current-cycle condition. */
   historical?: boolean;
 }
 
@@ -860,40 +861,43 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
     brRetry = mk("br_retry", "RETRY / BACKOFF", "upcoming", "no retries",
       [absent("retry evidence", "auto-scheduler")], B);
 
-  // DENIED / FAULT — rule E + R3-F2: three distinct concepts —
-  //   (a) a fault correlated to the CURRENT claim fence → current
-  //       failure, prominent and headline-driving;
-  //   (b) a recorded fault without current-fence correlation →
-  //       "latest recorded fault", red but explicitly historical —
-  //       never drives the headline as a current failure;
-  //   (c) denials alone are bounded admission history → neutral
+  // DENIED / FAULT — rule E + R3-F2 + R4-F1: three distinct concepts —
+  //   (a) last_result.fault is a RECORDED fault. The owner-scoped API
+  //       exposes no authoritative fault→fence binding: writeState()
+  //       preserves a prior last_result under a newer last_fence
+  //       (recordDenial updates last_fence without last_result), so a
+  //       matching fence does NOT prove the fault belongs to the
+  //       current claim. Presentation: exact code + "recorded —
+  //       cycle unverified", never a current FAILED assertion.
+  //       Unknown attribution ≠ proof it belongs to a prior cycle.
+  //   (b) denials alone are bounded admission history → neutral
   //       "past denials" diagnostic, never a current FAILED.
+  //   (c) canonical scheduler BLOCKED_*/QUARANTINED stays the
+  //       authoritative current blocker via br_blocked/scheduler.
   let brFault: LoopNodeState;
   const dd = d.kind === "ready" ? d.data : null;
   const faultCode = dd?.last_result?.fault ?? null;
   const denialCount = dd?.denials?.length ?? 0;
   if (faultCode && dd) {
     const schedLease = s.kind === "ready" ? s.data.lease : null;
-    const claimFence =
-      leaseConfirmedActive(schedLease, i.nowMs) ? schedLease!.fence : null;
-    /* Currency is provable only when a confirmed live claim exists AND
-       the faulted pass fence equals it. last_fence null, a different
-       fence, or no live claim → ambiguous → historical (never assume
-       the fault belongs to the current cycle). */
-    const current = claimFence !== null && dd.last_fence === claimFence;
     const e: LoopEvidence[] = [
       ev("last_result.fault", faultCode, "auto-driver"),
       ev("last_fence", dd.last_fence, "auto-driver"),
-      ev("current claim fence", claimFence, "auto-scheduler"),
+      ev("scheduler lease",
+        schedLease ? `${schedLease.state} · fence ${schedLease.fence}` : "none", "auto-scheduler"),
+      ev("driver lease",
+        dd.lease ? `${dd.lease.state} · fence ${dd.lease.fence}` : "none", "auto-driver"),
       ev("denials", denialCount, "auto-driver"),
       ev("last_outcome", dd.last_outcome, "auto-driver"),
     ];
+    /* R4-F1 — recorded fault remains visible (red severity marker)
+       but is explicitly unattributed: no authoritative field binds it
+       to the current claim. Flagged non-current so it never drives
+       the headline or an active edge as a present failure. */
     brFault = mk("br_fault", "DENIED / FAULT", "failed",
-      current ? faultCode : `${faultCode} · prior cycle`, e, B,
-      current
-        ? "Fault recorded on the fence matching the current confirmed claim (rule E)."
-        : "Latest recorded fault — no current-cycle fence correlation; a fresh fault may coexist with an older successful last_outcome (rule E).");
-    if (!current) brFault.historical = true;
+      `recorded fault · ${faultCode}`, e, B,
+      "LATEST RECORDED FAULT — CURRENT CYCLE UNVERIFIED: the driver may preserve a prior last_result under a newer last_fence; no authoritative field binds this fault to the current claim. A fresh fault may coexist with an older successful last_outcome (rule E).");
+    brFault.historical = true;
   } else if (denialCount > 0) {
     brFault = mk("br_fault", "DENIED / FAULT", "upcoming",
       `${denialCount} past denial(s) · historical`,
@@ -902,7 +906,7 @@ function deriveBranches(i: LoopInputs): LoopNodeState[] {
         ev("last_result.fault", null, "auto-driver"),
         ev("last_outcome", dd?.last_outcome ?? null, "auto-driver"),
       ], B,
-      "Denial records are bounded admission history — without a recorded fault they are a diagnostic, not a current failure (rule E).");
+      "Denial records are bounded admission history — without a recorded fault they are a diagnostic, not a current failure (rule E). See the Driver activity panel for the concrete denial records.");
     brFault.historical = true;
   } else
     brFault = mk("br_fault", "DENIED / FAULT", "upcoming", "no fault",

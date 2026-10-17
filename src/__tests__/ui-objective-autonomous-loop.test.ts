@@ -300,10 +300,11 @@ describe("autonomous loop derive — scenarios", () => {
     const s = deriveLoopSnapshot(i);
     const fault = s.nodes.find((n) => n.id === "br_fault")!;
     expect(fault.visual).toBe("failed");
-    /* R3-F2 — exact typed fault code preserved; with no live claim the
-       fault is explicitly labeled prior-cycle, not a current failure */
+    /* R4-F1 — exact typed fault code preserved, labeled as a recorded
+       fault with unverified cycle attribution (matching fences do not
+       prove the fault belongs to the current claim) */
     expect(fault.status).toContain("INTEGRITY_FAULT");
-    expect(fault.status).toContain("prior cycle");
+    expect(fault.status).toContain("recorded fault");
     expect(fault.historical).toBe(true);
     /* older success is still shown on the pass node — as history */
     const pass = s.nodes.find((n) => n.id === "pass")!;
@@ -1196,15 +1197,17 @@ describe("R3-F2 — historical denials/faults never drive current FAILED", () =>
     const f = s.nodes.find((n) => n.id === "br_fault")!;
     expect(f.visual).toBe("failed");
     expect(f.status).toContain("INTEGRITY_FAULT");
-    /* no live claim → latest recorded, not current-cycle */
+    /* R4-F1 — recorded, unattributed: no current-cycle claim */
     expect(f.historical).toBe(true);
-    expect(f.detail).toContain("Latest recorded fault");
+    expect(f.detail).toContain("CURRENT CYCLE UNVERIFIED");
     /* last_outcome preserved separately in pass evidence */
     expect(s.nodes.find((n) => n.id === "pass")!.evidence
       .some((e) => e.value === "CEO_PASS_COMMITTED")).toBe(true);
   });
 
-  it("fault on the CURRENT claim fence → current failure, headline drives", () => {
+  it("fault + last_fence equal to claim fence → STILL not current (R4-F1)", () => {
+    /* writeState preserves last_result under a newer last_fence —
+       fence equality is not an authoritative fault→cycle binding */
     const s = deriveLoopSnapshot(inputs({
       scheduler: sch({
         queue_state: "EXECUTING", claimed_generation: 7,
@@ -1217,10 +1220,11 @@ describe("R3-F2 — historical denials/faults never drive current FAILED", () =>
       }),
     }));
     const f = s.nodes.find((n) => n.id === "br_fault")!;
-    expect(f.visual).toBe("failed");
-    expect(f.historical).toBeFalsy();
-    expect(f.status).toBe("EXECUTION_FAILED");
-    expect(s.headline.visual).toBe("failed");
+    expect(f.visual).toBe("failed");          // recorded fault stays prominent
+    expect(f.status).toContain("EXECUTION_FAILED");
+    expect(f.status).toContain("recorded fault");
+    expect(f.historical).toBe(true);          // but never a CURRENT failure
+    expect(s.headline.visual).not.toBe("failed");
   });
 
   it("scheduler BLOCKED + historical denials → block dominates headline", () => {
@@ -1266,7 +1270,7 @@ describe("R3-F2 — historical denials/faults never drive current FAILED", () =>
     const f = s.nodes.find((n) => n.id === "br_fault")!;
     expect(f.visual).toBe("failed");         // stays visible as latest recorded
     expect(f.historical).toBe(true);         // but NOT a current-cycle failure
-    expect(f.status).toContain("prior cycle");
+    expect(f.status).toContain("recorded fault");
     expect(s.headline.visual).not.toBe("failed");
     expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
   });
@@ -1288,5 +1292,136 @@ describe("R3-F2 — historical denials/faults never drive current FAILED", () =>
     const f = s.nodes.find((n) => n.id === "br_fault")!;
     expect(f.visual).toBe("upcoming");
     expect(f.status).toBe("no fault");
+  });
+});
+
+/* ---------------- R4 audit remediation regressions ---------------- */
+
+describe("R4-F1 — no unsound current-cycle fault attribution", () => {
+  const drv = (over: Parameters<typeof driver>[0]) => epReady(driver(over), AT);
+  const sch = (over: Parameters<typeof scheduler>[0]) => epReady(scheduler(over), AT);
+  const LIVE9 = { state: "ACTIVE", fence: 9, expires_at: NOW + 60_000 };
+
+  it("fault@8 + recordDenial bumped last_fence=9 + claim@9 → NO current FAILED", () => {
+    /* backend-realistic: recordDenial writes last_fence=9 and a denial
+       row while preserving the old last_result.fault */
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({ queue_state: "CLAIMED", claimed_generation: 7, lease: LIVE9 }),
+      driver: drv({
+        last_result: { fault: "EXECUTION_FAILED" },
+        last_fence: 9, // bumped by recordDenial, NOT by a new fault
+        denials: [{ at: "2026-01-01T11:55:00Z", fence: 9, label: "BUDGET_EXCEEDED" }],
+        lease: { ...LIVE9 },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.status).toContain("EXECUTION_FAILED");
+    expect(f.historical).toBe(true);
+    expect(s.headline.visual).not.toBe("failed");
+    expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
+  });
+
+  it("fault + last_fence === claim fence → still no current attribution", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({ queue_state: "EXECUTING", claimed_generation: 7, lease: LIVE9 }),
+      driver: drv({
+        last_result: { fault: "EXECUTION_FAILED" },
+        last_fence: 9, lease: { ...LIVE9 },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.status).toContain("recorded fault");
+    expect(f.historical).toBe(true);
+    expect(s.headline.visual).not.toBe("failed");
+  });
+
+  it("fault with no active claim → recorded fault visible, no FAILED headline", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ last_result: { fault: "PLANNER_EXHAUSTED" }, last_fence: 4 }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");
+    expect(f.detail).toContain("CURRENT CYCLE UNVERIFIED");
+    expect(s.headline.visual).not.toBe("failed");
+  });
+
+  it("INTEGRITY_FAULT + older last_outcome → code preserved, unattributed", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({
+        last_outcome: "CEO_PASS_COMMITTED",
+        last_result: { fault: "INTEGRITY_FAULT" },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.status).toBe("recorded fault · INTEGRITY_FAULT");
+    /* separate evidence rows: outcome, fences, both leases */
+    const lbl = (l: string) => f.evidence.filter((e) => e.label === l);
+    expect(lbl("last_outcome")[0]?.value).toBe("CEO_PASS_COMMITTED");
+    expect(lbl("last_fence").length).toBe(1);
+    expect(lbl("scheduler lease").length).toBe(1);
+    expect(lbl("driver lease").length).toBe(1);
+  });
+
+  it("scheduler BLOCKED + unattributed fault → block owns the headline", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({
+        queue_state: "BLOCKED_RETRY_EXHAUSTED", blocked_reason: "RETRY_LIMIT_REACHED",
+      }),
+      driver: drv({ last_result: { fault: "EXECUTION_FAILED" }, last_fence: 4 }),
+    }));
+    expect(s.headline.visual).toBe("blocked");
+    expect(s.headline.label).toContain("RETRY");
+    expect(s.nodes.find((n) => n.id === "br_fault")!.historical).toBe(true);
+  });
+
+  it("lease observations disagree + fault → no invented attribution", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({ queue_state: "CLAIMED", claimed_generation: 7, lease: LIVE9 }),
+      driver: drv({
+        last_result: { fault: "EXECUTION_FAILED" },
+        last_fence: 9,
+        lease: { state: "SETTLED", fence: 8, expires_at: null },
+      }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.historical).toBe(true);
+    expect(s.headline.visual).not.toBe("failed");
+    /* admission inconsistency stays inconsistent too */
+    expect(s.nodes.find((n) => n.id === "admission")!.status)
+      .toBe("UNKNOWN / INCONSISTENT");
+  });
+
+  it("no fault + historical denials → historical diagnostic only", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ denials: [{ at: "x", fence: 3, label: "BUDGET" }] }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("upcoming");
+    expect(f.status).toContain("past denial");
+    expect(f.detail).toContain("Driver activity panel");
+  });
+
+  it("valid active admission without fault → no false failure edge", () => {
+    const s = deriveLoopSnapshot(inputs({
+      scheduler: sch({ queue_state: "CLAIMED", claimed_generation: 7, lease: LIVE9 }),
+      driver: drv({
+        admissions: [{ at: "x", fence: 9, generation: 7, usage: null }],
+        last_result: { fault: null },
+        lease: { ...LIVE9 },
+      }),
+    }));
+    expect(s.nodes.find((n) => n.id === "admission")!.visual).toBe("active");
+    expect(s.nodes.find((n) => n.id === "br_fault")!.visual).toBe("upcoming");
+    expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
+  });
+
+  it("unattributed fault → diagnostic node visible, edge not an execution path", () => {
+    const s = deriveLoopSnapshot(inputs({
+      driver: drv({ last_result: { fault: "DENIAL_PERSISTENT" }, last_fence: 4 }),
+    }));
+    const f = s.nodes.find((n) => n.id === "br_fault")!;
+    expect(f.visual).toBe("failed");            // diagnostic severity stays visible
+    expect(f.historical).toBe(true);
+    expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
   });
 });

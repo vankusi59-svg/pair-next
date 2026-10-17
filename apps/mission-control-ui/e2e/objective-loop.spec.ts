@@ -200,3 +200,56 @@ test("cockpit observation_error → Missions panel marked UNVERIFIED, no cockpit
   /* headline never claims verified execution */
   await expect(loop.locator(".aloop-head")).not.toContainText("executing");
 });
+
+test("driver denials render as bounded historical table with real labels", async ({ page }) => {
+  const biz = await mkBusiness(page);
+  const oid = await mkObjective(page, biz);
+  await seedSession(page);
+  await page.addInitScript((id: string) => {
+    localStorage.setItem("pair.business_id", id);
+  }, biz);
+  /* The e2e server has no auto-driver (404). Intercept the read and
+     inject a realistic driver payload with 10 denials — proves the
+     table renders bounded (8) historical rows with exact labels. */
+  await page.route("**/vnext/objectives/*/auto-driver*", async (route) => {
+    const denials = Array.from({ length: 10 }, (_, k) => ({
+      at: k === 9 ? "not-a-date" : `2026-01-01T10:${String(k).padStart(2, "0")}:00Z`,
+      fence: k + 1,
+      label: k === 3 ? "<b>inject</b>" : `DENIAL_${k}`,
+    }));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        auto_driver: {
+          objective_id: oid,
+          enabled: true,
+          last_outcome: "WAITING",
+          last_result: { fault: null },
+          last_fence: 4,
+          admissions: [],
+          denials,
+          lease: null,
+        },
+      }),
+    });
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  const loop = page.locator("section.aloop");
+  await expect(loop).toBeVisible();
+
+  const table = loop.locator(".aloop-den-table");
+  await expect(table).toBeVisible();
+  /* bounded at 8 records */
+  await expect(table.locator("tbody tr")).toHaveCount(8);
+  /* exact labels rendered, suspicious text stays plain text */
+  await expect(table).toContainText("DENIAL_9");
+  await expect(table).toContainText("<b>inject</b>");
+  await expect(table.locator("b")).toHaveCount(0);
+  /* malformed timestamp → explicit invalid value, no crash */
+  await expect(table).toContainText("invalid timestamp");
+  /* marked historical, never an objective failure */
+  await expect(loop.locator(".aloop-den-h")).toContainText("historical");
+  /* admission history table untouched */
+  await expect(loop.locator(".aloop-adm-table:not(.aloop-den-table)")).toHaveCount(0);
+});

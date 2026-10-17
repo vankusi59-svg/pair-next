@@ -1,30 +1,25 @@
 {
-  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R3",
-  "title": "R3 audit remediation: cockpit integrity gating covers failed/blocked visuals; historical denials/faults never drive current FAILED headline",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_UI_R4",
+  "title": "R4 audit remediation: no unsound fence-equality fault attribution; concrete historical denials table in Driver Activity",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
     "src/__tests__/ui-objective-autonomous-loop.test.ts",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission FAILED",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#observation_error + mission CANCELLED",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#clean cockpit + mission FAILED",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#independently blocked scheduler",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#recovery: valid cockpit",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#no edge animates toward a cockpit node",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#old denial + newer successful admission",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#old denial only",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#last_result.fault stays prominent",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#fault on the CURRENT claim fence",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#scheduler BLOCKED + historical denials",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#denial at previous fence",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#fault tied to prior fence",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#malformed denial metadata",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#no denials and no fault"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#recordDenial bumped last_fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#last_fence === claim fence",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#fault with no active claim",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#INTEGRITY_FAULT + older last_outcome",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#scheduler BLOCKED + unattributed fault",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#lease observations disagree + fault",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#no fault + historical denials",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#valid active admission without fault",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#unattributed fault",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#STILL not current (R4-F1)"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "R3 remediation on audited R2 HEAD 28966e6 (correction BASE), vs integration BASE 07f22db. R3-F1: cockpit observation-integrity downgrade now covers EVERY operational visual — proven, active, waiting, failed, blocked — so an unverified cockpit read can no longer paint mission FAILED or drive a FAILED aggregate headline; raw claims remain as explicitly unverified evidence; scheduler/driver/policy failures stay independently authoritative. R3-F2: DENIED/FAULT branch now separates three concepts — (a) last_result.fault on the fence matching the confirmed live claim = current failure (failed, headline-driving); (b) last_result.fault without current-fence correlation = 'latest recorded fault', red but flagged historical ('prior cycle' suffix), excluded from headline badN and active edges; (c) denials alone = 'N past denial(s) · historical' neutral diagnostic, never current FAILED. last_outcome preserved separately; no ordering is inferred from array length or malformed denial metadata. 15 new R3 regressions; two R1-era assertions updated only where they encoded the defective denials=fault / fault-code-strict behavior. 77-scenario vitest total, 7 Playwright specs unchanged-and-green. Root test file remains the documented tooling exception; production scope apps/mission-control-ui/** only; zero backend/authority changes.",
+  "description": "R4 remediation on audited R3 HEAD 83f8b6a (correction BASE), vs integration BASE 07f22db. R4-F1: removed last_fence===claimFence as proof of current-cycle fault attribution — backend writeState() preserves last_result under a newer last_fence (recordDenial updates last_fence without last_result), so NO owner-scoped field authoritatively binds a fault to a claim. DENIED/FAULT now renders 'recorded fault · CODE' (exact code preserved incl. INTEGRITY_FAULT) with detail 'LATEST RECORDED FAULT — CURRENT CYCLE UNVERIFIED', flagged non-current: no active edge, never drives the headline; unknown attribution is NOT asserted as prior-cycle. last_outcome/last_fence/scheduler lease/driver lease kept as separate evidence rows. Scheduler BLOCKED_*/QUARANTINED stays the authoritative current blocker. Two R3 assertions updated only where they encoded the disproven fence-equality attribution (documented in test comments). R4-F2: typed AutoDriverDenial {at, fence, label} replacing opaque records; Driver Activity panel gains a bounded (8-row) historical denials table — exact labels, recorded order preserved, fmtTs-safe timestamps, null-safe placeholders, plain-text React rendering, neutral empty state, existing admission table untouched; inspector detail refers operators to the panel. Playwright spec #8 proves real table rendering incl. 10→8 bounding, injection-safe label text, and malformed timestamp handling. 86-scenario vitest + 8 e2e specs. Root test file remains the documented tooling exception; production scope apps/mission-control-ui/** only; zero backend/authority changes.",
   "risk_override": "MEDIUM"
 }

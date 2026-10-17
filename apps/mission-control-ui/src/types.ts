@@ -264,6 +264,16 @@ export interface AutoDriverAdmission {
   usage: { ceo_calls: number | null; microusd: number | null; missions: number | null } | null;
 }
 
+/* R4-F2 — backend recordDenial writes { at: ISO timestamp, fence,
+   label }; kept bounded server-side (last 8). Extra keys are tolerated
+   for forward compatibility. */
+export interface AutoDriverDenial {
+  at?: string | null;
+  fence?: number | null;
+  label?: string | null;
+  [k: string]: unknown;
+}
+
 export interface AutoDriverStatus {
   objective_id: string;
   enabled: boolean;
@@ -271,6 +281,6 @@ export interface AutoDriverStatus {
   last_result: { fault?: string | null } | null;
   last_fence: number | null;
   admissions: AutoDriverAdmission[];
-  denials: Array<Record<string, unknown>>;
+  denials: AutoDriverDenial[];
   lease: { state: string; fence: number | null; expires_at: number | null } | null;
 }

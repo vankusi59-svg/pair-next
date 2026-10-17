@@ -502,6 +502,35 @@ function LoopPanels(props: { inputs: LoopInputs }) {
             </tbody>
           </table>
         ) : null}
+        {/* R4-F2 — concrete denial records, marked historical. Backend
+            bound is already 8; slice again defensively. Recorded order
+            is preserved — malformed timestamps render as such, never
+            re-ordered on. */}
+        {d.kind === "ready" ? (
+          d.data.denials?.length ? (
+            <>
+              <p className="aloop-den-h">
+                Recent admission denials <span className="aloop-den-tag">historical</span>
+              </p>
+              <table className="aloop-adm-table aloop-den-table">
+                <thead>
+                  <tr><th>at</th><th>fence</th><th>label</th></tr>
+                </thead>
+                <tbody>
+                  {d.data.denials.slice(-8).map((dn, k) => (
+                    <tr key={`den-${k}`}>
+                      <td>{fmtTs(dn?.at ?? null)}</td>
+                      <td>{dn?.fence ?? "—"}</td>
+                      <td>{dn?.label ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          ) : (
+            <p className="aloop-den-empty">no denials recorded</p>
+          )
+        ) : null}
       </Panel>
 
       <Panel title="Missions">
