@@ -4,6 +4,7 @@ import { IntegrityError, NotFoundError } from "./errors.js";
 import { DriverDenial, DRIVER_FAULT_LABELS } from "./objective-driver-fault.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import { AUTO_POLICY_ENTITY } from "./objective-auto-policy.js";
+import { KPI_AUTH_ENTITY, KPI_VERIFIER_SCHEMA, kpiAuthEffectiveReason } from "./objective-kpi-verifier-authority.js";
 import type { ObjectiveAutoPolicyService, AutoPolicyStatus } from "./objective-auto-policy.js";
 import type { OperatingOutcome } from "./objective-operating-loop.js";
 import { isSqliteContentionError } from "./store.js";
@@ -311,12 +312,16 @@ export class ObjectiveAutoScheduler {
       if (!a.status.configured || !a.status.effective) {
         return { eligible: false, reason: "POLICY_NOT_EFFECTIVE" };
       }
+      // Authority identity = the objective_digest domain (terms_version +
+      // protected terms): terms_current re-proves binding==current digest
+      // live — NOT row.version. Runtime writes (KPI progress, spend,
+      // evidence) bump version without mutating authority; the verifier
+      // advance inside a pass must never count as external drift.
       if (!a.status.terms_current ||
           a.status.policy_version !== q!.policy_version ||
           a.status.terms_digest_binding !== q!.terms_digest ||
           a.status.owner_authority_id !== q!.owner_authority_id ||
-          a.status.business_id !== q!.business_id ||
-          Number(a.row.version) !== q!.objective_version) {
+          a.status.business_id !== q!.business_id) {
         return { eligible: false, reason: "STALE_BINDING" };
       }
       const prior = this.lease(objectiveId);
@@ -340,8 +345,7 @@ export class ObjectiveAutoScheduler {
         a.status.policy_version !== q.policy_version ||
         a.status.terms_digest_binding !== q.terms_digest ||
         a.status.owner_authority_id !== q.owner_authority_id ||
-        a.status.business_id !== q.business_id ||
-        Number(a.row.version) !== q.objective_version) {
+        a.status.business_id !== q.business_id) {
       invalid(`stale policy/objective binding ${q.objective_id}`);
     }
   }
@@ -602,6 +606,78 @@ export class ObjectiveAutoScheduler {
     });
   }
 
+  /** A canonical, owner-granted KVA can re-arm exactly one settled
+   * VERIFIED_KPI_EVIDENCE wait. This is a wake ONLY, not KPI progress.
+   * Caller atomically composes this with the owner-scoped grant, so a
+   * committed grant cannot lose its wake on a process crash. No change
+   * to the global wake topic filter or its persisted cursor digest.
+   */
+  notifyKpiVerifierGrant(objectiveId: string, authorizationId: string): Queue | null {
+    return this.proof(() => {
+      const q = this.queue(objectiveId);
+      // Blocked/quarantined, healthy, in-flight and scheduled waits never
+      // get new generations from KVA notifications.
+      if (!q || q.queue_state !== "WAITING_EVIDENCE" ||
+          q.wait_kind !== "VERIFIED_KPI_EVIDENCE" || q.next_due !== null ||
+          q.pending_generation !== q.claimed_generation ||
+          q.claimed_generation !== q.settled_generation) return q;
+      const a = this.authority(objectiveId);
+      if (!a.status.configured || !a.status.effective || !a.status.terms_current) return q;
+      this.requireCurrent(q, a);
+      const active = this.lease(objectiveId);
+      if (active?.state === "ACTIVE" && Number(active.expires_at) > this.instant()) return q;
+      if (!/^KVA_[A-Za-z0-9]+$/.test(authorizationId)) {
+        invalid("KPI verifier grant identifier invalid");
+      }
+      const grant = this.store.get(KPI_AUTH_ENTITY, authorizationId) as Row;
+      if (String(grant.authorization_id) !== authorizationId ||
+          String(grant.objective_id) !== objectiveId ||
+          String(grant.schema_version) !== KPI_VERIFIER_SCHEMA) {
+        invalid("KPI verifier grant binding mismatch");
+      }
+      // A replay of an expired/revoked grant is a no-op, never a wake.
+      if (kpiAuthEffectiveReason(grant, a.row, String(grant.kpi_id), this.instant()) !== null)
+        return q;
+      const authDigest = digest({
+        schema: KPI_VERIFIER_SCHEMA, authorization_id: authorizationId,
+        objective_id: objectiveId, kpi_id: String(grant.kpi_id),
+        rule_digest: String(grant.rule_digest),
+        terms: Number(grant.objective_terms_version),
+      });
+      if (String(grant.authorization_digest) !== authDigest) {
+        invalid("KPI verifier grant digest mismatch");
+      }
+      const receiptId = `kpi-verifier-grant:${authorizationId}`;
+      const prior = readSchedulerRow<Row>(this.store, WAKE_SEGMENT, receiptId);
+      if (prior) {
+        if (String(prior.objective_id) !== objectiveId ||
+            String(prior.authorization_digest) !== authDigest)
+          invalid("KPI verifier grant wake replay mismatch");
+        return q;
+      }
+      writeSchedulerRow(this.store, WAKE_SEGMENT, receiptId, {
+        objective_id: objectiveId, authorization_id: authorizationId,
+        authorization_digest: authDigest, source_key: receiptId,
+        source_digest: authDigest,
+        semantic_digest: digest({ objectiveId, authorizationId, authDigest }),
+        generation: q.pending_generation + 1,
+      }, "KPI_VERIFIER_GRANT_SOURCE", receiptId);
+      return writeSchedulerRow<Queue>(this.store, WAKE_STATE, objectiveId, {
+        ...fields(q), pending_generation: q.pending_generation + 1,
+        checkpoint_digest: digest({
+          previous: q.checkpoint_digest, authorization_id: authorizationId,
+          authorization_digest: authDigest,
+        }),
+        reasons: [...new Set([...q.reasons, "KPI_VERIFIER_GRANT"])].slice(0, 32),
+        source_refs: [...q.source_refs, receiptId].slice(-256),
+        coalesced_count: Number(q.coalesced_count ?? 0) +
+          (q.source_refs.length >= 256 ? 1 : 0),
+        queue_state: "WAITING_CONSUMER", wait_kind: null,
+        next_due: null, wait_streak: 0, blocked_reason: null,
+      }, "KPI_VERIFIER_GRANT", receiptId);
+    });
+  }
+
   /** Persisted scheduler next_due is a scheduler checkpoint, not a
    * canonical external event. This only re-hints already-due durable state;
    * it never resets retry budget or makes an owner blocker runnable. */
@@ -650,11 +726,13 @@ export class ObjectiveAutoScheduler {
 
   private requireRebind(q: Queue, a: { row: Row; status: AutoPolicyStatus }): Queue {
     const lease = this.lease(q.objective_id);
+    // Same precision contract as requireCurrent — runtime objective
+    // writes (the pass's own verifier/spend effects) are not drift.
     if (lease?.state === "ACTIVE" &&
         (lease.policy_version !== a.status.policy_version ||
          lease.owner_authority_id !== a.status.owner_authority_id ||
          lease.terms_digest !== a.status.terms_digest_binding ||
-         lease.objective_version !== a.row.version || !a.status.effective)) {
+         !a.status.terms_current || !a.status.effective)) {
       writeSchedulerRow(this.store, LEASE_STATE, q.objective_id, {
         ...fields(lease), state: "INVALIDATED", fence: lease.fence + 1,
         token_hash: null, expires_at: null,
@@ -857,10 +935,16 @@ export class ObjectiveAutoScheduler {
     }
     const a = this.authority(handle.objective_id);
     this.requireCurrent(q, a);
+    // Terms drift is re-proven by requireCurrent via terms_current —
+    // lease pins add the policy/owner identity layer. The monotonic
+    // row version is deliberately NOT a pin: a pass's own canonical
+    // progress writes must not invalidate its own lease.
     if (lease.policy_version !== a.status.policy_version ||
         lease.terms_digest !== a.status.terms_digest_binding ||
         lease.owner_authority_id !== a.status.owner_authority_id ||
-        lease.objective_version !== a.row.version) invalid("stale lease authority");
+        !a.status.terms_current || !a.status.effective) {
+      invalid("stale lease authority");
+    }
     return { q, lease };
   }
 

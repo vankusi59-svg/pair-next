@@ -1,17 +1,18 @@
 {
-  "claim_id": "OBJECTIVE_AUTO_DRIVER_TYPED_FAULT_CLASSIFICATION",
-  "title": "Preserve class-typed driver denials in durable fault records",
+  "claim_id": "KPI_VERIFIER_GRANT_REARMS_EVIDENCE_WAIT",
+  "title": "Atomic KPI verifier grant wakes eligible evidence wait",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10c.test.ts#driver faultCode",
-    "src/__tests__/pair-p15-10c.test.ts#C04/C29 revoke mid-pass",
-    "src/__tests__/pair-p15-10c-r1.test.ts"
+    "src/__tests__/pair-p15-10c.test.ts#KVA grant wake for settled KPI evidence queue",
+    "src/__tests__/pair-p15-10d.test.ts#P15.10-D",
+    "src/__tests__/pair-p15-10d.test.ts#A2 no KVA",
+    "src/__tests__/pair-p15-10c-r2.test.ts#P15.10-C R3"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "HIGH-risk backend observability-only repair vs BASE 709f71a9e9ebb78adc3e813d0da3734364d7b3b3. A shared DriverDenial class and closed DRIVER_FAULT_LABELS module removes the driver/scheduler import cycle while preserving the driver public re-export. faultCode now recognizes only actual DriverDenial instances with allowlisted label and matching FAIL_CLOSED_<label> code prior to generic IntegrityError fallback. Non-driver IntegrityError and forged/unknown/tampered inputs remain generic; no raw error messages persisted. Existing PASS_FAULT, SETTLE_FAULT, skipped/tick results consume faultCode; recordDenial already saves e.label and quarantine sanitizes. Pure mapping/forgery tests plus C04/C29 integration: the mid-pass revoke/pause control calls now carry the current policy_version (previously they threw FAIL_CLOSED_POLICY_VERSION_CONFLICT before gate() ran, so the scenario never exercised DriverDenial) — C04 now proves a real mid-pass DriverDenial(DRIVER_AUTHORITY_LOST) persists into last_result.fault and the QUARANTINED blocked_reason, and that the canonical observe path reaps the stale lease as INVALIDATED after the worker's release is denied. No lease, heartbeat, retry, scheduler behavior or UI changes. Live demo repro is not available in this environment. npm verify:change and full suite have NOT run in this connector-only environment; hand off to local Devin for mandatory READY_FOR_INDEPENDENT_AUDIT and independent audit. No merge.",
+  "description": "HIGH-risk scheduler/KPI endpoint repair vs BASE e0885f7de03e2a961680a3b72e458fb398bb4a62. (1) WAITING_EVIDENCE/VERIFIED_KPI_EVIDENCE deadlock: owner-scoped canonical KPI grant wakes a settled quiet queue atomically inside the same store.immediate as the grant; scheduler.notifyKpiVerifierGrant re-proves queue state, authority binding, no active lease, KVA identity+schema+digest+effective state, then writes a receipt-bound (kpi-verifier-grant:<authorization_id>) idempotent wake + pending_generation bump. Healthy/quarantined/blocked/active/non-KPI waits and malformed/forged/revoked/expired/foreign grants never wake; grant never mints progress — KVR comes only from the pass verifier. (2) Precision defect found by the real e2e: the pass's OWN verifier write (advance->recordProgress) bumps objective row.version, which raw-version pins treated as drift -> mid-pass DRIVER_AUTHORITY_LOST. Pins in claimable/requireCurrent/requireRebind/currentLease now bind authority identity only (policy_version, terms_digest_binding, terms_current = live objective_digest, owner, business, effective); terms/status/owner drift still fails closed, runtime progress/spend writes do not count as drift. No lease lifecycle/heartbeat/retry/sign-off changes; objective_version kept for diagnostics. AUDIT R1 CLOSURE — regression-only, zero production diff: new R3 tests in pair-p15-10c-r2 prove every commit boundary still fails closed without the raw version pin: external recordProgress mid-CEO-await -> attempt STALE, zero decision rows (R1-KPI); external accountBudget mid-await -> same (R1-BUD); pass's own runtime write -> gate holds, settle commits (R1-SELF); owner amend mid-pass -> DRIVER_AUTHORITY_LOST, no settle (R1-AMEND); drift between PRIORITIZE review and allocation -> bounded WAITING via observation re-proof, zero WAL (R1-DISP); pause/resume covered by R2-F1a. No bypass confirmed.",
   "risk_override": "HIGH"
 }

@@ -1384,13 +1384,22 @@ export function createMissionControlServer(
           return void json(res, 200, svc.status(m[1]!, kpiActor));
         }
         if (action === "grant") {
-          return void json(res, 200, svc.grant(m[1]!, {
-            actor: kpiActor,
-            kpi_id: String(body.kpi_id ?? ""),
-            rule: body.rule,
-            expires_at: String(body.expires_at ?? ""),
-            idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
-          }));
+          // Grant + eligible wake are one canonical transaction. If either
+          // write fails, no partial grant survives the failed request.
+          const objectiveId = m[1]!;
+          const granted = deps.store.immediate(() => {
+            const saved = svc.grant(objectiveId, {
+              actor: kpiActor,
+              kpi_id: String(body.kpi_id ?? ""),
+              rule: body.rule,
+              expires_at: String(body.expires_at ?? ""),
+              idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
+            });
+            deps.autoScheduler?.notifyKpiVerifierGrant(
+              objectiveId, String(saved.authorization_id));
+            return saved;
+          });
+          return void json(res, 200, granted);
         }
         if (action === "revoke" || action === "disable") {
           return void json(res, 200, svc.control(m[1]!, String(body.authorization_id ?? ""), {

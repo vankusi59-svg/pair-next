@@ -22,6 +22,9 @@ import {
   IntegrityError,
   NotFoundError,
   faultCode,
+  ObjectiveKpiVerificationService,
+  WAKE_SEGMENT,
+  KPI_AUTH_ENTITY,
 } from "../pair/index.js";
 import type { OperatingPassResult } from "../pair/index.js";
 
@@ -201,6 +204,229 @@ function mkDriver(s: Stack, opts: {
 
 const queue = (s: Stack, id: string) =>
   readSchedulerRow<Record<string, unknown>>(s.store, WAKE_STATE, id)!;
+
+describe("KVA grant wake for settled KPI evidence queue", () => {
+  const makeGrant = (s: Stack, id: string, key: string) => {
+    const service = new ObjectiveKpiVerificationService({
+      store: s.store, objectives: s.objectives,
+      workstreams: {} as never, business: {} as never, artifacts: {} as never,
+    });
+    const kpi = (s.objectives.get(id).kpis as Array<{ kpi_id: string }>)[0]!;
+    return service.grant(id, {
+      actor: OWNER, kpi_id: kpi.kpi_id,
+      rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+      expires_at: FUTURE, idempotency_key: key,
+    });
+  };
+
+  it("only a real grant wakes a quiet verified-KPI wait; no progress is minted", async () => {
+    const s = fresh("kva-rearm");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    const driver = mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver;
+    const first = await driver.tick();
+    expect(first.driven[0]).toMatchObject({ outcome: "INSUFFICIENT_VERIFIED_PROGRESS", settled: true });
+    const before = queue(s, id);
+    expect(before).toMatchObject({ queue_state: "WAITING_EVIDENCE",
+      wait_kind: "VERIFIED_KPI_EVIDENCE", next_due: null });
+    expect(before.pending_generation).toBe(before.claimed_generation);
+    expect(before.claimed_generation).toBe(before.settled_generation);
+    const g = makeGrant(s, id, "kva-once");
+    const rearmed = s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id))!;
+    expect(rearmed.queue_state).toBe("WAITING_CONSUMER");
+    expect(rearmed.pending_generation).toBe(Number(before.pending_generation) + 1);
+    expect(s.store.list("kpi_verification_receipt")).toHaveLength(0);
+    s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id));
+    expect(queue(s, id).pending_generation).toBe(rearmed.pending_generation);
+    s.setNow(s.now() + 30_001);
+    // The fairness cursor parked past this row's rank — the rearmed
+    // generation is reached after one FAIR_ROUND cohort wrap, so the
+    // claim may consume a second tick.
+    const d2 = mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver;
+    let second = await d2.tick();
+    if (!second.driven.length) second = await d2.tick();
+    expect(second.driven[0]).toMatchObject({ outcome: "INSUFFICIENT_VERIFIED_PROGRESS", settled: true });
+    expect(queue(s, id).queue_state).toBe("WAITING_EVIDENCE");
+    expect(s.store.list("kpi_verification_receipt")).toHaveLength(0);
+  });
+
+  it("healthy or quarantined queue does not wake from grant", () => {
+    const s = fresh("kva-healthy");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    const g = makeGrant(s, id, "kva-noop");
+    const healthy = queue(s, id);
+    s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id));
+    expect(queue(s, id)).toEqual(healthy);
+    s.scheduler.quarantine(id, "DRIVER_AUTHORITY_LOST");
+    const blocked = queue(s, id);
+    s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id));
+    expect(queue(s, id)).toEqual(blocked);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      `kpi-verifier-grant:${g.authorization_id}`)).toBeNull();
+  });
+
+  it("non-owner grant fails before wake", async () => {
+    const s = fresh("kva-owner");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const kpi = (s.objectives.get(id).kpis as Array<{kpi_id:string}>)[0]!;
+    const service = new ObjectiveKpiVerificationService({
+      store: s.store, objectives: s.objectives,
+      workstreams: {} as never, business: {} as never, artifacts: {} as never,
+    });
+    expect(() => service.grant(id, {
+      actor: "operator:FOREIGN", kpi_id: kpi.kpi_id,
+      rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+      expires_at: FUTURE, idempotency_key: "unauthorized",
+    })).toThrow();
+    expect(queue(s, id).queue_state).toBe("WAITING_EVIDENCE");
+  });
+
+  it("malformed or unknown authorization identifiers fail closed", async () => {
+    const s = fresh("kva-badid");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const before = queue(s, id);
+    expect(() =>
+      s.scheduler.notifyKpiVerifierGrant(id, "not-an-authorization")).toThrow();
+    expect(() =>
+      s.scheduler.notifyKpiVerifierGrant(id, "KVA_ghost")).toThrow();
+    expect(queue(s, id)).toEqual(before);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      "kpi-verifier-grant:KVA_ghost")).toBeNull();
+  });
+
+  it("revoked and expired grants cannot rearm a quiet wait", async () => {
+    const s = fresh("kva-dead");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const kpi = (s.objectives.get(id).kpis as Array<{ kpi_id: string }>)[0]!;
+    const svc = new ObjectiveKpiVerificationService({
+      store: s.store, objectives: s.objectives,
+      workstreams: {} as never, business: {} as never, artifacts: {} as never,
+    });
+    const g = svc.grant(id, {
+      actor: OWNER, kpi_id: kpi.kpi_id,
+      rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+      expires_at: FUTURE, idempotency_key: "rev-me",
+    });
+    svc.control(id, String(g.authorization_id), {
+      actor: OWNER, action: "revoke", idempotency_key: "rv-1",
+    });
+    const before = queue(s, id);
+    s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id));
+    expect(queue(s, id)).toEqual(before);
+    // Expired: grant valid at issue, past expiry at notify time.
+    const exp = new Date(Date.now() + 5_000).toISOString();
+    const g2 = svc.grant(id, {
+      actor: OWNER, kpi_id: kpi.kpi_id,
+      rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+      expires_at: exp, idempotency_key: "exp-me",
+    });
+    s.setNow(Date.now() + 10_000);
+    s.scheduler.notifyKpiVerifierGrant(id, String(g2.authorization_id));
+    expect(queue(s, id)).toEqual(before);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      `kpi-verifier-grant:${g2.authorization_id}`)).toBeNull();
+  });
+
+  it("a BLOCKED_AUTHORITY queue is never resurrected by a grant", async () => {
+    const s = fresh("kva-blocked");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const { policy_version } = s.policy.status(id, OWNER) as
+      { policy_version: number };
+    s.policy.control({ objective_id: id, actor: OWNER, action: "disable",
+      policy_version, idempotency_key: "dis-1" });
+    s.wakeup.tick();
+    const blocked = queue(s, id);
+    expect(blocked.queue_state).toBe("BLOCKED_AUTHORITY");
+    const g = makeGrant(s, id, "blk");
+    s.scheduler.notifyKpiVerifierGrant(id, String(g.authorization_id));
+    expect(queue(s, id)).toEqual(blocked);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      `kpi-verifier-grant:${g.authorization_id}`)).toBeNull();
+  });
+
+  it("grant and wake commit atomically — a wake fault rolls back the grant", async () => {
+    const s = fresh("kva-atomic");
+    const id = oid(mkObjective(s, mkBiz(s.store)));
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const before = queue(s, id);
+    const kpi = (s.objectives.get(id).kpis as Array<{ kpi_id: string }>)[0]!;
+    const svc = new ObjectiveKpiVerificationService({
+      store: s.store, objectives: s.objectives,
+      workstreams: {} as never, business: {} as never, artifacts: {} as never,
+    });
+    let aid = "";
+    // The endpoint's exact composition: one immediate() wrapping
+    // grant + notify. A forged identifier inside the same transaction
+    // must undo the whole thing — no half-committed grant, no wake.
+    expect(() => s.store.immediate(() => {
+      const g = svc.grant(id, {
+        actor: OWNER, kpi_id: kpi.kpi_id,
+        rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+        expires_at: FUTURE, idempotency_key: "atomic",
+      });
+      aid = String(g.authorization_id);
+      s.scheduler.notifyKpiVerifierGrant(id, "forged-identifier");
+    })).toThrow();
+    expect(() => s.store.get(KPI_AUTH_ENTITY, aid)).toThrow();
+    expect(queue(s, id)).toEqual(before);
+  });
+
+  it("two distinct valid grants can never produce two generations for one quiet wait", async () => {
+    const s = fresh("kva-two-grants");
+    const biz = mkBiz(s.store);
+    const o = s.objectives.create({
+      business_id: biz, title: "two-kpi", statement: "s",
+      kpis: [
+        { name: "ka", unit: "u", baseline: 0, target: 1 },
+        { name: "kb", unit: "u", baseline: 0, target: 1 },
+      ],
+      deadline: FUTURE, budget_ceiling_microusd: 1_000_000,
+      operator_id: OP, dedup_key: "dk-two-" + counter,
+    });
+    const id = String(o.objective_id);
+    enable(s, id);
+    wake(s, id);
+    await mkDriver(s, { outcome: "INSUFFICIENT_VERIFIED_PROGRESS" }).driver.tick();
+    const kpis = o.kpis as Array<{ kpi_id: string }>;
+    const svc = new ObjectiveKpiVerificationService({
+      store: s.store, objectives: s.objectives,
+      workstreams: {} as never, business: {} as never, artifacts: {} as never,
+    });
+    const grantFor = (kpiId: string, key: string) => svc.grant(id, {
+      actor: OWNER, kpi_id: kpiId,
+      rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+      expires_at: FUTURE, idempotency_key: key,
+    });
+    const g1 = grantFor(String(kpis[0]!.kpi_id), "two-1");
+    const g2 = grantFor(String(kpis[1]!.kpi_id), "two-2");
+    const before = queue(s, id);
+    const rearmed = s.scheduler.notifyKpiVerifierGrant(id, String(g1.authorization_id))!;
+    expect(rearmed.pending_generation).toBe(Number(before.pending_generation) + 1);
+    // The queue is armed now — the second grant is a durable no-op for
+    // THIS wait and keeps its wake eligibility for the next quiet wait.
+    const again = s.scheduler.notifyKpiVerifierGrant(id, String(g2.authorization_id))!;
+    expect(again.pending_generation).toBe(rearmed.pending_generation);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      `kpi-verifier-grant:${g2.authorization_id}`)).toBeNull();
+  });
+});
 
 describe("P15.10-C — governed autonomous Objective driver", () => {
   it("C01 default OFF: without a driver nothing consumes the schedule", async () => {
