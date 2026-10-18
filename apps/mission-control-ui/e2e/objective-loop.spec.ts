@@ -253,3 +253,18 @@ test("driver denials render as bounded historical table with real labels", async
   /* admission history table untouched */
   await expect(loop.locator(".aloop-adm-table:not(.aloop-den-table)")).toHaveCount(0);
 });
+
+test("polling preserves scroll position — page never collapses to top", async ({ page }) => {
+  const biz = await mkBusiness(page);
+  const oid = await mkObjective(page, biz);
+  await gotoObjective(page, biz, oid);
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  const before = await page.evaluate(() => window.scrollY);
+  expect(before).toBeGreaterThan(200);
+  /* Outlast two full 5s poll cycles: the cockpit read must refetch
+     silently — a loading-state reset would collapse the document to the
+     skeleton and clamp the scroll to top (the reported defect). */
+  await page.waitForTimeout(11_000);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeGreaterThan(900);
+  expect(await page.evaluate(() => window.scrollY)).toBeGreaterThanOrEqual(before - 8);
+});

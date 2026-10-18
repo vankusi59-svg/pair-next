@@ -1140,3 +1140,27 @@ export function nodeInspector(
 ): LoopNodeState | null {
   return snap.nodes.find((n) => n.id === id) ?? null;
 }
+
+/* ---------------- poll gate ---------------- */
+
+/** Silent re-poll gate for a whole-page route read (ObjectiveDetail's
+   cockpit load state): decides whether a scheduled refetch may keep the
+   last-good snapshot. An unconditional "loading" reset on each 5s poll
+   collapses the document to the skeleton for a frame — document height
+   drops below scrollY and the browser clamps the scroll to top.
+   Semantics: ready-for-this-exact-identity → "keep"; missing/expired or
+   foreign-identity previous state → "loading"; no business selected →
+   "no-business". */
+export type PollGate = "keep" | "loading" | "no-business";
+
+export function pollGate(
+  prev: { kind: string; forId?: string | null; forBiz?: string | null } | null,
+  biz: string | null | undefined,
+  id: string | undefined,
+): PollGate {
+  if (!biz) return "no-business";
+  if (prev !== null && prev.kind === "ready" && prev.forId === id && prev.forBiz === biz) {
+    return "keep";
+  }
+  return "loading";
+}

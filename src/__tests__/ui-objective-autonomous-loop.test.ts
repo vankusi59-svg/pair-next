@@ -30,6 +30,7 @@ import {
   fmtDue,
   fmtTs,
   nodeInspector,
+  pollGate,
   shouldApplyResponse,
 } from "../../apps/mission-control-ui/src/app/lib/objectiveLoop";
 import type {
@@ -1423,5 +1424,34 @@ describe("R4-F1 — no unsound current-cycle fault attribution", () => {
     expect(f.visual).toBe("failed");            // diagnostic severity stays visible
     expect(f.historical).toBe(true);
     expect(s.edges.find((e) => e.to === "br_fault")!.active).toBe(false);
+  });
+});
+
+/* ---- scroll-collapse fix — silent re-poll gate -------------------------
+   The cockpit fetch effect used to reset page state to "loading" on
+   EVERY 5s polTick — one frame of skeleton collapsed document height,
+   clamping window scroll to top. pollGate now decides per-identity:
+   keep the last-good snapshot while a silent refetch is in flight. */
+describe("pollGate — silent re-poll keeps last-good snapshot", () => {
+  const ready = (forId: string, forBiz: string) =>
+    ({ kind: "ready", forId, forBiz }) as const;
+
+  it("ready for THIS identity → keep (never collapses to loading)", () => {
+    expect(pollGate(ready("o1", "b1"), "b1", "o1")).toBe("keep");
+  });
+  it("ready for a FOREIGN objective or business → loading (fail-closed)", () => {
+    expect(pollGate(ready("o2", "b1"), "b1", "o1")).toBe("loading");
+    expect(pollGate(ready("o1", "b2"), "b1", "o1")).toBe("loading");
+    expect(pollGate(ready("o1", "b1"), "b1", undefined)).toBe("loading");
+  });
+  it("non-ready previous state → loading", () => {
+    expect(pollGate({ kind: "loading" }, "b1", "o1")).toBe("loading");
+    expect(pollGate({ kind: "error" }, "b1", "o1")).toBe("loading");
+    expect(pollGate(null, "b1", "o1")).toBe("loading");
+  });
+  it("no business selected → no-business regardless of prev", () => {
+    expect(pollGate(ready("o1", "b1"), null, "o1")).toBe("no-business");
+    expect(pollGate(ready("o1", "b1"), "", "o1")).toBe("no-business");
+    expect(pollGate(null, null, "o1")).toBe("no-business");
   });
 });
