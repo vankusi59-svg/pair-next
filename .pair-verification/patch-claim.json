@@ -1,19 +1,18 @@
 {
-  "claim_id": "OBJECTIVE_DETAIL_POLL_SCROLLFIX",
-  "title": "Objective detail: silent re-poll keeps last-good snapshot — page no longer collapses to top every 5s",
+  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_TERMINAL_HEADLINE",
+  "title": "Objective autonomous loop: canonical terminal verdict takes headline precedence",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#pollGate",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#ready for THIS identity",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#ready for a FOREIGN",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#non-ready previous state",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#no business selected"
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#terminal headline",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#R3-F1",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#R3-F2",
+    "src/__tests__/ui-objective-autonomous-loop.test.ts#R4-F1"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "Standalone bugfix vs integration BASE 87ecc8e (staging/pr59-safe post-PR-129-merge). Operator-reported defect: the Objective Detail page jumped to top on every 5s poll. Root cause: the cockpit fetch effect in ObjectiveDetail.tsx (deps [biz,id,tick,polTick]) ran an UNCONDITIONAL setSt({kind:loading}) on every effect re-run — each 5s polTick produced one render of the loading skeleton, collapsing document height below scrollY so the browser clamped scroll to 0, then content restored. Reproduced live (scrollY 2111→0 at first poll, document height 2831→720 for ~30ms with skeleton rendered). Fix: new pure pollGate(prev,biz,id) in objectiveLoop.ts — 'keep' when prev is ready for THIS objective/business, 'loading' on first fetch or foreign-identity prev (fail-closed identity contract preserved), 'no-business' when no business selected; the effect applies it in the setSt updater so silent refetches keep the last-good snapshot. Vitest block (4 tests) proves keep/loading/no-business semantics; new e2e spec 'polling preserves scroll position' covers two full 5s poll cycles end-to-end (non-harness evidence). Verified on the live stack: scrollY held 2111 across 15s of polling. 90-scenario vitest + 9 e2e specs green; tsc clean; production build clean. Scope: objectiveLoop.ts, ObjectiveDetail.tsx, root test file (documented tooling exception), e2e spec; zero backend/authority changes; no new deps.",
+  "description": "Frontend-only headline precedence fix vs BASE e2d7985b52cab9cf3c9acb05c0f5f5e855683afa. Canonical status on an identity-verified ready cockpit read (ACHIEVED, INFEASIBLE, EXPIRED, CANCELLED — the closed terminal set) determines terminal aggregate headline ahead of independently observed blocked scheduler nodes. ACHIEVED reuses proven/green; negative terminal statuses use failed/red. Observation-integrity note remains explicit; nonterminal/unknown/missing/error/foreign cockpit reads preserve existing bad-node precedence. No node/edge changes, authority, API, persistence or scheduler changes. Added Vitest terminal headline fail-closed regressions and a routed-response Playwright scenario confirming green terminal headline + retained red scheduler and integrity badge. This branch is for independent verification; no tests or verify:change were executed in the connector-only environment.",
   "risk_override": "MEDIUM"
 }

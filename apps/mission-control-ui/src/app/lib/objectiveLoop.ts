@@ -1088,8 +1088,27 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
   const unknownN = nodes.filter((n) => n.visual === "unknown").length;
   const waitingN = nodes.filter((n) => n.visual === "waiting").length;
   const obsNote = obsBad ? " · cockpit claims unverified" : "";
+  /* The canonical objective row is independent of derived cockpit
+     observation claims. Exact terminal statuses take headline precedence
+     even when the scheduler correctly refuses further claims. Identity
+     is already checked in `ck`; missing/foreign reads never override. */
+  const terminalStatus = ck.kind === "ready" ? ck.data.objective.status : null;
   let headline: LoopSnapshot["headline"];
-  if (badN.length)
+  if (terminalStatus === "ACHIEVED")
+    headline = {
+      visual: "proven",
+      label: "objective achieved",
+      detail: "canonical objective status: ACHIEVED" + obsNote,
+    };
+  else if (terminalStatus === "INFEASIBLE" ||
+           terminalStatus === "EXPIRED" ||
+           terminalStatus === "CANCELLED")
+    headline = {
+      visual: "failed",
+      label: "objective " + terminalStatus.toLowerCase(),
+      detail: "canonical objective status: " + terminalStatus + obsNote,
+    };
+  else if (badN.length)
     headline = {
       visual: badN.some((n) => n.visual === "blocked") ? "blocked" : "failed",
       label: badN[0].status,
