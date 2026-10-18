@@ -312,12 +312,16 @@ export class ObjectiveAutoScheduler {
       if (!a.status.configured || !a.status.effective) {
         return { eligible: false, reason: "POLICY_NOT_EFFECTIVE" };
       }
+      // Authority identity = the objective_digest domain (terms_version +
+      // protected terms): terms_current re-proves binding==current digest
+      // live — NOT row.version. Runtime writes (KPI progress, spend,
+      // evidence) bump version without mutating authority; the verifier
+      // advance inside a pass must never count as external drift.
       if (!a.status.terms_current ||
           a.status.policy_version !== q!.policy_version ||
           a.status.terms_digest_binding !== q!.terms_digest ||
           a.status.owner_authority_id !== q!.owner_authority_id ||
-          a.status.business_id !== q!.business_id ||
-          Number(a.row.version) !== q!.objective_version) {
+          a.status.business_id !== q!.business_id) {
         return { eligible: false, reason: "STALE_BINDING" };
       }
       const prior = this.lease(objectiveId);
@@ -341,8 +345,7 @@ export class ObjectiveAutoScheduler {
         a.status.policy_version !== q.policy_version ||
         a.status.terms_digest_binding !== q.terms_digest ||
         a.status.owner_authority_id !== q.owner_authority_id ||
-        a.status.business_id !== q.business_id ||
-        Number(a.row.version) !== q.objective_version) {
+        a.status.business_id !== q.business_id) {
       invalid(`stale policy/objective binding ${q.objective_id}`);
     }
   }
@@ -723,11 +726,13 @@ export class ObjectiveAutoScheduler {
 
   private requireRebind(q: Queue, a: { row: Row; status: AutoPolicyStatus }): Queue {
     const lease = this.lease(q.objective_id);
+    // Same precision contract as requireCurrent — runtime objective
+    // writes (the pass's own verifier/spend effects) are not drift.
     if (lease?.state === "ACTIVE" &&
         (lease.policy_version !== a.status.policy_version ||
          lease.owner_authority_id !== a.status.owner_authority_id ||
          lease.terms_digest !== a.status.terms_digest_binding ||
-         lease.objective_version !== a.row.version || !a.status.effective)) {
+         !a.status.terms_current || !a.status.effective)) {
       writeSchedulerRow(this.store, LEASE_STATE, q.objective_id, {
         ...fields(lease), state: "INVALIDATED", fence: lease.fence + 1,
         token_hash: null, expires_at: null,
@@ -930,10 +935,16 @@ export class ObjectiveAutoScheduler {
     }
     const a = this.authority(handle.objective_id);
     this.requireCurrent(q, a);
+    // Terms drift is re-proven by requireCurrent via terms_current —
+    // lease pins add the policy/owner identity layer. The monotonic
+    // row version is deliberately NOT a pin: a pass's own canonical
+    // progress writes must not invalidate its own lease.
     if (lease.policy_version !== a.status.policy_version ||
         lease.terms_digest !== a.status.terms_digest_binding ||
         lease.owner_authority_id !== a.status.owner_authority_id ||
-        lease.objective_version !== a.row.version) invalid("stale lease authority");
+        !a.status.terms_current || !a.status.effective) {
+      invalid("stale lease authority");
+    }
     return { q, lease };
   }
 

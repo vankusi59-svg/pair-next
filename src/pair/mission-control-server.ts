@@ -1386,8 +1386,9 @@ export function createMissionControlServer(
         if (action === "grant") {
           // Grant + eligible wake are one canonical transaction. If either
           // write fails, no partial grant survives the failed request.
+          const objectiveId = m[1]!;
           const granted = deps.store.immediate(() => {
-            const saved = svc.grant(m[1]!, {
+            const saved = svc.grant(objectiveId, {
               actor: kpiActor,
               kpi_id: String(body.kpi_id ?? ""),
               rule: body.rule,
@@ -1395,7 +1396,7 @@ export function createMissionControlServer(
               idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
             });
             deps.autoScheduler?.notifyKpiVerifierGrant(
-              m[1]!, String(saved.authorization_id));
+              objectiveId, String(saved.authorization_id));
             return saved;
           });
           return void json(res, 200, granted);
