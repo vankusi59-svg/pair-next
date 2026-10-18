@@ -2,7 +2,7 @@
   "claim_id": "OBJECTIVE_AUTO_DRIVER_TYPED_FAULT_CLASSIFICATION",
   "title": "Preserve class-typed driver denials in durable fault records",
   "affected_surfaces": [
-    "API"
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-10c.test.ts#driver faultCode",
