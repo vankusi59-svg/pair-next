@@ -6,7 +6,7 @@ import type { CockpitPayload } from "../types";
 import type { AutoDriverStatus, AutoPolicyStatus, AutoSchedulerStatus } from "../../types";
 import { ObjectiveAutonomousLoop } from "../components/ObjectiveAutonomousLoop";
 import type { EpRead, LoopInputs } from "../lib/objectiveLoop";
-import { epError, epMissing, epReady, shouldApplyResponse } from "../lib/objectiveLoop";
+import { epError, epMissing, epReady, pollGate, shouldApplyResponse } from "../lib/objectiveLoop";
 import { StatusBadge, ProofChip, type Tone } from "../components/StatusBadge";
 import { DeniedState, EmptyState, ErrorState, Skeleton, UnverifiedPanel } from "../components/states";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -121,7 +121,16 @@ export function ObjectiveDetail() {
   }, [biz, id]);
 
   useEffect(() => {
-    setSt(biz ? { kind: "loading" } : { kind: "no-business" });
+    /* Silent re-poll: keep the last good snapshot for THIS identity while
+       the refetch is in flight. An unconditional "loading" reset on every
+       5s poll collapses the page to the skeleton for a frame — document
+       height drops below scrollY and the browser clamps the scroll to
+       the top. Loading still shows on first fetch and on identity change
+       (prev belongs to another route/business). */
+    setSt((prev) => {
+      const g = pollGate(prev, biz, id);
+      return g === "keep" ? prev : g === "no-business" ? { kind: "no-business" } : { kind: "loading" };
+    });
     if (!biz || !id) return;
     const ctl = new AbortController();
     api
