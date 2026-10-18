@@ -253,7 +253,9 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const { driver, calls } = mkDriver(s, {
       onPass: (call, gate) => {
         s.policy.control({ objective_id: call.objective_id, actor: OWNER,
-          action: "revoke", idempotency_key: "rv-" + Math.random() });
+          action: "revoke",
+          policy_version: s.policy.status(call.objective_id, OWNER).policy_version!,
+          idempotency_key: "rv-" + Math.random() });
         gate(); // must throw DRIVER_AUTHORITY_LOST
       },
     });
@@ -263,8 +265,20 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const persisted = readSchedulerRow<Record<string, unknown>>(s.store, DRIVER_STATE,
       `auto-driver-state:${oid(o)}`)!;
     expect((persisted.last_result as { fault: string }).fault).toBe("DRIVER_AUTHORITY_LOST");
+    // Non-transient authority loss quarantines the queue under the same
+    // typed label — the durable denial vocabulary, not raw error text.
+    const q = queue(s, oid(o));
+    expect(q.queue_state).toBe("QUARANTINED");
+    expect(q.blocked_reason).toBe("DRIVER_AUTHORITY_LOST");
+    // The revoke drifted the lease's pinned policy_version, so the
+    // worker's own release is denied ("stale lease authority") — the
+    // lease is never settled by the worker; the canonical observe path
+    // reaps it via rebind invalidation.
     const lease = readSchedulerRow<Record<string, unknown>>(s.store, LEASE_STATE, oid(o))!;
-    expect(["RELEASED", "INVALIDATED"]).toContain(lease.state);
+    expect(lease.state).toBe("ACTIVE");
+    s.scheduler.observe(oid(o));
+    const reaped = readSchedulerRow<Record<string, unknown>>(s.store, LEASE_STATE, oid(o))!;
+    expect(reaped.state).toBe("INVALIDATED");
     // No settle receipt for this fence — the generation stays unclaimed
     // for retry/observability, never silently committed.
     expect(readSchedulerRow(s.store, SCHEDULER_RECEIPT,
@@ -279,7 +293,9 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const { driver, calls } = mkDriver(s, {
       onPass: (call, gate) => {
         s.policy.control({ objective_id: call.objective_id, actor: OWNER,
-          action: "pause", idempotency_key: "pz-" + Math.random() });
+          action: "pause",
+          policy_version: s.policy.status(call.objective_id, OWNER).policy_version!,
+          idempotency_key: "pz-" + Math.random() });
         gate();
       },
     });
