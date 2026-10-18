@@ -1100,8 +1100,8 @@ export function deriveLoopSnapshot(i: LoopInputs): LoopSnapshot {
       label: "objective achieved",
       detail: "canonical objective status: ACHIEVED" + obsNote,
     };
-  else if (terminalStatus === "FAILED" ||
-           terminalStatus === "ABORTED" ||
+  else if (terminalStatus === "INFEASIBLE" ||
+           terminalStatus === "EXPIRED" ||
            terminalStatus === "CANCELLED")
     headline = {
       visual: "failed",

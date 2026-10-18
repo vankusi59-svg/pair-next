@@ -1465,7 +1465,7 @@ describe("terminal headline — canonical objective verdict", () => {
     expect(s.nodes.find((n) => n.id === "scheduler")!.visual).toBe("blocked");
   });
 
-  it.each(["FAILED", "ABORTED", "CANCELLED"])("%s → terminal-negative red headline", (status) => {
+  it.each(["INFEASIBLE", "EXPIRED", "CANCELLED"])("%s → terminal-negative red headline", (status) => {
     const s = deriveLoopSnapshot(withStatus(status));
     expect(s.headline.visual).toBe("failed");
     expect(s.headline.label).toBe("objective " + status.toLowerCase());
@@ -1473,7 +1473,7 @@ describe("terminal headline — canonical objective verdict", () => {
   });
 
   it("terminal-negative + observation_error retains integrity note", () => {
-    const s = deriveLoopSnapshot(withStatus("FAILED", "DIGEST_MISMATCH"));
+    const s = deriveLoopSnapshot(withStatus("INFEASIBLE", "DIGEST_MISMATCH"));
     expect(s.headline.visual).toBe("failed");
     expect(s.headline.detail).toContain("cockpit claims unverified");
     expect(s.observationVerified).toBe(false);
@@ -1497,7 +1497,10 @@ describe("terminal headline — canonical objective verdict", () => {
   });
 
   it("noncanonical and unrecognized status never mint terminal outcome", () => {
-    for (const status of ["TARGET_MET_CANDIDATE", "achieved", "", "ACHIEVED "]) {
+    /* FAILED/ABORTED are NOT canonical objective statuses — the closed
+       set is ACTIVE|PAUSED|BLOCKED|ACHIEVED|INFEASIBLE|EXPIRED|CANCELLED.
+       An unrecognized string must never mint a terminal verdict. */
+    for (const status of ["FAILED", "ABORTED", "TARGET_MET_CANDIDATE", "achieved", "", "ACHIEVED "]) {
       const s = deriveLoopSnapshot(withStatus(status));
       expect(s.headline.visual).toBe("blocked");
       expect(s.headline.label).toBe("BLOCKED_AUTHORITY");
