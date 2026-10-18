@@ -17,8 +17,57 @@ import {
   providerEntryId,
   CODEX_CLI_PROVIDER_ID,
   readSchedulerRow,
+  DRIVER_FAULT_LABELS,
+  DriverDenial,
+  IntegrityError,
+  NotFoundError,
+  faultCode,
 } from "../pair/index.js";
 import type { OperatingPassResult } from "../pair/index.js";
+
+/* Pure classification coverage plus a real persisted PASS_FAULT
+ * assertion in the existing C04/C29 revocation test below. */
+describe("driver faultCode — closed typed-denial vocabulary", () => {
+  it.each(DRIVER_FAULT_LABELS)("preserves typed %s", (label) => {
+    const e = new DriverDenial(label, "private detail", false);
+    expect(e.code).toBe(`FAIL_CLOSED_${label}`);
+    expect(faultCode(e)).toBe(label);
+  });
+
+  it("ordinary IntegrityError and impersonating class shapes stay generic", () => {
+    expect(faultCode(new IntegrityError("FAIL_CLOSED_P15_6_X", "private")))
+      .toBe("INTEGRITY_FAULT");
+    expect(faultCode(new IntegrityError("FAIL_CLOSED_DRIVER_AUTHORITY_LOST", "private")))
+      .toBe("INTEGRITY_FAULT");
+    expect(faultCode(Object.assign(
+      new IntegrityError("FAIL_CLOSED_DRIVER_AUTHORITY_LOST", "private"),
+      { label: "DRIVER_AUTHORITY_LOST", transient: false })))
+      .toBe("INTEGRITY_FAULT");
+  });
+
+  it("forged and unknown codes cannot mint a driver fault", () => {
+    expect(faultCode({ code: "DRIVER_PASS_FAULT" })).toBe("UNEXPECTED_FAULT");
+    expect(faultCode({ code: "FAIL_CLOSED_DRIVER_PASS_FAULT",
+      label: "DRIVER_PASS_FAULT", transient: false })).toBe("UNEXPECTED_FAULT");
+    expect(faultCode({ code: "FAIL_CLOSED_PRIVATE_SECRET" })).toBe("UNEXPECTED_FAULT");
+  });
+
+  it("tampering with an actual instance fails closed", () => {
+    const fakeLabel = new DriverDenial("DRIVER_PASS_FAULT", "private", false);
+    Object.assign(fakeLabel, { label: "PRIVATE_SECRET" });
+    expect(faultCode(fakeLabel)).toBe("INTEGRITY_FAULT");
+    const fakeCode = new DriverDenial("DRIVER_PASS_FAULT", "private", false);
+    Object.assign(fakeCode, { code: "FAIL_CLOSED_DRIVER_AUTHORITY_LOST" });
+    expect(faultCode(fakeCode)).toBe("INTEGRITY_FAULT");
+  });
+
+  it("non-driver standard fault classifications remain intact", () => {
+    expect(faultCode(new NotFoundError("private"))).toBe("NOT_FOUND");
+    expect(faultCode({ code: "SQLITE_BUSY" })).toBe("SQLITE_CONTENTION");
+    expect(faultCode({ code: "SQLITE_LOCKED" })).toBe("SQLITE_CONTENTION");
+    expect(faultCode(new Error("private message"))).toBe("UNEXPECTED_FAULT");
+  });
+});
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p1510c-"));
 const OP = "1882810918";
@@ -204,15 +253,32 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const { driver, calls } = mkDriver(s, {
       onPass: (call, gate) => {
         s.policy.control({ objective_id: call.objective_id, actor: OWNER,
-          action: "revoke", idempotency_key: "rv-" + Math.random() });
+          action: "revoke",
+          policy_version: s.policy.status(call.objective_id, OWNER).policy_version!,
+          idempotency_key: "rv-" + Math.random() });
         gate(); // must throw DRIVER_AUTHORITY_LOST
       },
     });
     const out = await driver.tick();
     expect(calls).toHaveLength(0); // pass threw before returning
-    expect(out.driven[0]!.fault).toBe("INTEGRITY_FAULT");
+    expect(out.driven[0]!.fault).toBe("DRIVER_AUTHORITY_LOST");
+    const persisted = readSchedulerRow<Record<string, unknown>>(s.store, DRIVER_STATE,
+      `auto-driver-state:${oid(o)}`)!;
+    expect((persisted.last_result as { fault: string }).fault).toBe("DRIVER_AUTHORITY_LOST");
+    // Non-transient authority loss quarantines the queue under the same
+    // typed label — the durable denial vocabulary, not raw error text.
+    const q = queue(s, oid(o));
+    expect(q.queue_state).toBe("QUARANTINED");
+    expect(q.blocked_reason).toBe("DRIVER_AUTHORITY_LOST");
+    // The revoke drifted the lease's pinned policy_version, so the
+    // worker's own release is denied ("stale lease authority") — the
+    // lease is never settled by the worker; the canonical observe path
+    // reaps it via rebind invalidation.
     const lease = readSchedulerRow<Record<string, unknown>>(s.store, LEASE_STATE, oid(o))!;
-    expect(["RELEASED", "INVALIDATED"]).toContain(lease.state);
+    expect(lease.state).toBe("ACTIVE");
+    s.scheduler.observe(oid(o));
+    const reaped = readSchedulerRow<Record<string, unknown>>(s.store, LEASE_STATE, oid(o))!;
+    expect(reaped.state).toBe("INVALIDATED");
     // No settle receipt for this fence — the generation stays unclaimed
     // for retry/observability, never silently committed.
     expect(readSchedulerRow(s.store, SCHEDULER_RECEIPT,
@@ -227,7 +293,9 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const { driver, calls } = mkDriver(s, {
       onPass: (call, gate) => {
         s.policy.control({ objective_id: call.objective_id, actor: OWNER,
-          action: "pause", idempotency_key: "pz-" + Math.random() });
+          action: "pause",
+          policy_version: s.policy.status(call.objective_id, OWNER).policy_version!,
+          idempotency_key: "pz-" + Math.random() });
         gate();
       },
     });

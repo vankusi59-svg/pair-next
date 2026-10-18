@@ -46,6 +46,7 @@
 
 import { utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { DriverDenial } from "./objective-driver-fault.js";
 import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
@@ -104,32 +105,9 @@ const HISTORY_LIMIT = 32;
 
 type Row = Record<string, unknown> & { version: number };
 
-/** Typed driver fault labels — durable vocabulary only, never raw
- *  error text. Mirrored into the scheduler FAULT_LABELS allowlist. */
-export const DRIVER_FAULT_LABELS = [
-  "DRIVER_CAP_EXHAUSTED",
-  "DRIVER_COST_UNVERIFIED",
-  "DRIVER_COST_HALTED",
-  "DRIVER_AUTHORITY_LOST",
-  "DRIVER_PASS_FAULT",
-  "DRIVER_ADMISSION_DENIED",
-  // AUDIT R1 F2/F4 — unconditional subscription-only denials.
-  "DRIVER_METERED_FORBIDDEN",
-  "DRIVER_SUBSCRIPTION_UNVERIFIED",
-] as const;
-export type DriverFaultLabel = (typeof DRIVER_FAULT_LABELS)[number];
-
-export class DriverDenial extends IntegrityError {
-  constructor(
-    public readonly label: DriverFaultLabel,
-    detail: string,
-    /** Transient denials release the lease for a later retry;
-     *  permanent denials quarantine for owner action. */
-    public readonly transient: boolean,
-  ) {
-    super(`FAIL_CLOSED_${label}`, detail);
-  }
-}
+/* Public DriverDenial API retained; class lives in the shared module. */
+export { DriverDenial, DRIVER_FAULT_LABELS } from "./objective-driver-fault.js";
+export type { DriverFaultLabel } from "./objective-driver-fault.js";
 
 function invalid(reason: string): never {
   throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_AUTO_DRIVER", reason);
