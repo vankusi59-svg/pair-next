@@ -223,3 +223,64 @@ export interface AutoPolicyStatus {
   terms_digest_binding: string | null;
   terms_current: boolean;
 }
+
+/* Autonomous-loop observability reads (owner-scoped GETs):
+   GET /api/vnext/objectives/:id/auto-scheduler and /auto-driver.
+   next_due and lease.expires_at are epoch milliseconds or null;
+   admission.at is ISO. Fields arrive as-observed — never fabricated. */
+export interface AutoSchedulerStatus {
+  objective_id: string;
+  scheduler_mode: string;
+  scheduler_ready: boolean;
+  driver_integrated: boolean;
+  consumer_ready: boolean;
+  driver_ready: boolean;
+  objective_runnable: boolean;
+  driver_missing: string[];
+  policy_effective: boolean;
+  policy_version: number | null;
+  terms_current: boolean;
+  queue_state: string;
+  pending_generation: number | null;
+  claimed_generation: number | null;
+  checkpoint_digest: string | null;
+  pending_reasons: string[];
+  coalesced_count: number | null;
+  source_refs: string[];
+  next_due: number | null;
+  wait_kind: string | null;
+  retry_count: number;
+  blocked_reason: string | null;
+  owner_action_required: boolean;
+  /* R1-F6 — backend lease expiry is epoch milliseconds or null. */
+  lease: { state: string; fence: number | null; expires_at: number | null } | null;
+  catchup_state: string | null;
+}
+
+export interface AutoDriverAdmission {
+  at: string;
+  fence: number | null;
+  generation: number | null;
+  usage: { ceo_calls: number | null; microusd: number | null; missions: number | null } | null;
+}
+
+/* R4-F2 — backend recordDenial writes { at: ISO timestamp, fence,
+   label }; kept bounded server-side (last 8). Extra keys are tolerated
+   for forward compatibility. */
+export interface AutoDriverDenial {
+  at?: string | null;
+  fence?: number | null;
+  label?: string | null;
+  [k: string]: unknown;
+}
+
+export interface AutoDriverStatus {
+  objective_id: string;
+  enabled: boolean;
+  last_outcome: string | null;
+  last_result: { fault?: string | null } | null;
+  last_fence: number | null;
+  admissions: AutoDriverAdmission[];
+  denials: AutoDriverDenial[];
+  lease: { state: string; fence: number | null; expires_at: number | null } | null;
+}
