@@ -57,6 +57,45 @@ async function gotoObjective(page: Page, biz: string, oid: string) {
   await expect(page.locator("section.aloop")).toBeVisible();
 }
 
+
+test("terminal ACHIEVED overrides blocked headline, not blocked scheduler or unverified warning", async ({ page }) => {
+  const biz = await mkBusiness(page);
+  const oid = await mkObjective(page, biz);
+  /* Intercept the two independently sourced reads. Only the canonical
+     cockpit objective row supplies the verdict; the scheduler keeps its
+     observed authority denial. No backend state is modified. */
+  await page.route("**/vnext/objectives/*/cockpit*", async (route) => {
+    const res = await route.fetch();
+    const json = await res.json();
+    if (json?.cockpit?.objective?.objective_id === oid) {
+      json.cockpit.objective.status = "ACHIEVED";
+      json.cockpit.observation_error = "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW";
+    }
+    await route.fulfill({ response: res, json });
+  });
+  await page.route("**/vnext/objectives/*/auto-scheduler*", async (route) => {
+    const res = await route.fetch();
+    const json = await res.json();
+    if (json?.auto_scheduler?.objective_id === oid) {
+      json.auto_scheduler.queue_state = "BLOCKED_AUTHORITY";
+      json.auto_scheduler.blocked_reason = "OBJECTIVE_ACHIEVED";
+    }
+    await route.fulfill({ response: res, json });
+  });
+  await gotoObjective(page, biz, oid);
+  const loop = page.locator("section.aloop");
+  await expect(loop.locator(".aloop-head .sbadge.t-ok"))
+    .toContainText("objective achieved");
+  await expect(loop.locator(".aloop-head-detail"))
+    .toContainText("cockpit claims unverified");
+  await expect(loop.locator(".aloop-head .sbadge.t-danger"))
+    .toContainText("unverified cockpit observation");
+  const schedulerNode = loop.getByRole("button", { name: /SCHEDULER: BLOCKED_AUTHORITY/ }).first();
+  await expect(schedulerNode).toBeVisible();
+  await expect(schedulerNode).toHaveClass(/ns-blocked/);
+  await expect(loop.getByRole("button", { name: /OBJECTIVE_ACHIEVED/ }).first()).toBeVisible();
+});
+
 test("loop dashboard renders on objective detail with real node/edge graph", async ({ page }) => {
   const biz = await mkBusiness(page);
   const oid = await mkObjective(page, biz);

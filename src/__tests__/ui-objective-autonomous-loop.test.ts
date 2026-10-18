@@ -1427,6 +1427,88 @@ describe("R4-F1 — no unsound current-cycle fault attribution", () => {
   });
 });
 
+
+/* Terminal headline: a canonical objective verdict dominates the
+   scheduler's independently valid post-terminal BLOCKED_AUTHORITY.
+   Identity / availability / observation integrity remain fail-closed. */
+describe("terminal headline — canonical objective verdict", () => {
+  const blocked = epReady(scheduler({
+    queue_state: "BLOCKED_AUTHORITY",
+    blocked_reason: "OBJECTIVE_ACHIEVED",
+    pending_reasons: [],
+  }), AT);
+  const withStatus = (status: string, observation_error: string | null = null) => {
+    const c = cockpit({ observation_error });
+    c.objective.status = status;
+    return inputs({ cockpit: epReady(c, AT), scheduler: blocked });
+  };
+
+  it("ACHIEVED + BLOCKED_AUTHORITY → green objective achieved, node stays blocked", () => {
+    const s = deriveLoopSnapshot(withStatus("ACHIEVED"));
+    expect(s.headline).toEqual({
+      visual: "proven",
+      label: "objective achieved",
+      detail: "canonical objective status: ACHIEVED",
+    });
+    expect(s.nodes.find((n) => n.id === "scheduler")!.visual).toBe("blocked");
+    expect(s.nodes.find((n) => n.id === "br_blocked")!.visual).toBe("blocked");
+    expect(s.nodes.find((n) => n.id === "br_blocked")!.status).toContain("OBJECTIVE_ACHIEVED");
+  });
+
+  it("ACHIEVED + observation_error → achieved but cockpit claims remain unverified", () => {
+    const s = deriveLoopSnapshot(withStatus("ACHIEVED", "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW"));
+    expect(s.headline.visual).toBe("proven");
+    expect(s.headline.label).toBe("objective achieved");
+    expect(s.headline.detail).toContain("cockpit claims unverified");
+    expect(s.observationVerified).toBe(false);
+    expect(s.observationError).toBe("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    expect(s.nodes.find((n) => n.id === "scheduler")!.visual).toBe("blocked");
+  });
+
+  it.each(["FAILED", "ABORTED", "CANCELLED"])("%s → terminal-negative red headline", (status) => {
+    const s = deriveLoopSnapshot(withStatus(status));
+    expect(s.headline.visual).toBe("failed");
+    expect(s.headline.label).toBe("objective " + status.toLowerCase());
+    expect(s.headline.detail).toContain("canonical objective status: " + status);
+  });
+
+  it("terminal-negative + observation_error retains integrity note", () => {
+    const s = deriveLoopSnapshot(withStatus("FAILED", "DIGEST_MISMATCH"));
+    expect(s.headline.visual).toBe("failed");
+    expect(s.headline.detail).toContain("cockpit claims unverified");
+    expect(s.observationVerified).toBe(false);
+  });
+
+  it("ACTIVE + BLOCKED_AUTHORITY keeps the existing live blocked headline", () => {
+    const s = deriveLoopSnapshot(withStatus("ACTIVE"));
+    expect(s.headline.visual).toBe("blocked");
+    expect(s.headline.label).toBe("BLOCKED_AUTHORITY");
+  });
+
+  it("cockpit missing / errored / foreign identity → never terminal override", () => {
+    const foreign = cockpit();
+    foreign.objective.objective_id = "OBJ_FOREIGN";
+    foreign.objective.status = "ACHIEVED";
+    for (const ck of [epMissing<CockpitPayload>(), epError(503, "UNAVAILABLE"), epReady(foreign, AT)]) {
+      const s = deriveLoopSnapshot(inputs({ cockpit: ck, scheduler: blocked }));
+      expect(s.headline.visual).toBe("blocked");
+      expect(s.headline.label).toBe("BLOCKED_AUTHORITY");
+    }
+  });
+
+  it("noncanonical and unrecognized status never mint terminal outcome", () => {
+    for (const status of ["TARGET_MET_CANDIDATE", "achieved", "", "ACHIEVED "]) {
+      const s = deriveLoopSnapshot(withStatus(status));
+      expect(s.headline.visual).toBe("blocked");
+      expect(s.headline.label).toBe("BLOCKED_AUTHORITY");
+    }
+    const c = cockpit();
+    c.lifecycle.objective_status = "ACHIEVED";
+    const s = deriveLoopSnapshot(inputs({ cockpit: epReady(c, AT), scheduler: blocked }));
+    expect(s.headline.visual).toBe("blocked");
+  });
+});
+
 /* ---- scroll-collapse fix — silent re-poll gate -------------------------
    The cockpit fetch effect used to reset page state to "loading" on
    EVERY 5s polTick — one frame of skeleton collapsed document height,
