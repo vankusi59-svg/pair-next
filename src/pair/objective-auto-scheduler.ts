@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { digest } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { DriverDenial, DRIVER_FAULT_LABELS } from "./objective-driver-fault.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import { AUTO_POLICY_ENTITY } from "./objective-auto-policy.js";
 import type { ObjectiveAutoPolicyService, AutoPolicyStatus } from "./objective-auto-policy.js";
@@ -111,18 +112,25 @@ const SAFE_FAULT_CODES = new Set<string>([
  *  P15.10-C adds the DRIVER_* labels the production driver's typed
  *  denials produce (still a closed set — raw error text and arbitrary
  *  error.code values can never persist). */
+const DRIVER_LABELS = new Set<string>(DRIVER_FAULT_LABELS);
 const FAULT_LABELS = new Set<string>([
   "SQLITE_CONTENTION", "NOT_FOUND", "INTEGRITY_FAULT", "UNEXPECTED_FAULT",
-  "DRIVER_CAP_EXHAUSTED", "DRIVER_COST_UNVERIFIED", "DRIVER_COST_HALTED",
-  "DRIVER_AUTHORITY_LOST", "DRIVER_PASS_FAULT", "DRIVER_ADMISSION_DENIED",
-  // AUDIT R1 F2/F4 — unconditional subscription-only denials.
-  "DRIVER_METERED_FORBIDDEN", "DRIVER_SUBSCRIPTION_UNVERIFIED",
+  ...DRIVER_FAULT_LABELS,
 ]);
 
 /** Typed, bounded fault label for durable state. Raw exception text and
  * arbitrary error.code values are untrusted and may carry
  * secrets/canaries — never persist them. */
 export function faultCode(e: unknown): string {
+  /* Only a genuine DriverDenial instance with a closed, matching
+   * label/code pair receives the precise typed classification.
+   * Raw text, arbitrary error.code and object-shaped mocks are untrusted. */
+  if (e instanceof DriverDenial) {
+    const label: unknown = e.label;
+    if (typeof label === "string" && DRIVER_LABELS.has(label) &&
+        e.code === `FAIL_CLOSED_${label}`) return label;
+    return "INTEGRITY_FAULT";
+  }
   const code = String((e as { code?: unknown } | null | undefined)?.code ?? "");
   if (SAFE_FAULT_CODES.has(code)) return code;
   if (isSqliteContentionError(e)) return "SQLITE_CONTENTION";

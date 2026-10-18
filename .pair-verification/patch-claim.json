@@ -1,18 +1,17 @@
 {
-  "claim_id": "OBJECTIVE_AUTONOMOUS_LOOP_TERMINAL_HEADLINE",
-  "title": "Objective autonomous loop: canonical terminal verdict takes headline precedence",
+  "claim_id": "OBJECTIVE_AUTO_DRIVER_TYPED_FAULT_CLASSIFICATION",
+  "title": "Preserve class-typed driver denials in durable fault records",
   "affected_surfaces": [
-    "UI"
+    "API"
   ],
   "required_tests": [
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#terminal headline",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#R3-F1",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#R3-F2",
-    "src/__tests__/ui-objective-autonomous-loop.test.ts#R4-F1"
+    "src/__tests__/pair-p15-10c.test.ts#driver faultCode",
+    "src/__tests__/pair-p15-10c.test.ts#C04/C29 revoke mid-pass",
+    "src/__tests__/pair-p15-10c-r1.test.ts"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "Frontend-only headline precedence fix vs BASE e2d7985b52cab9cf3c9acb05c0f5f5e855683afa. Canonical status on an identity-verified ready cockpit read (ACHIEVED, INFEASIBLE, EXPIRED, CANCELLED — the closed terminal set) determines terminal aggregate headline ahead of independently observed blocked scheduler nodes. ACHIEVED reuses proven/green; negative terminal statuses use failed/red. Observation-integrity note remains explicit; nonterminal/unknown/missing/error/foreign cockpit reads preserve existing bad-node precedence. No node/edge changes, authority, API, persistence or scheduler changes. Added Vitest terminal headline fail-closed regressions and a routed-response Playwright scenario confirming green terminal headline + retained red scheduler and integrity badge. This branch is for independent verification; no tests or verify:change were executed in the connector-only environment.",
-  "risk_override": "MEDIUM"
+  "description": "HIGH-risk backend observability-only repair vs BASE 709f71a9e9ebb78adc3e813d0da3734364d7b3b3. A shared DriverDenial class and closed DRIVER_FAULT_LABELS module removes the driver/scheduler import cycle while preserving the driver public re-export. faultCode now recognizes only actual DriverDenial instances with allowlisted label and matching FAIL_CLOSED_<label> code prior to generic IntegrityError fallback. Non-driver IntegrityError and forged/unknown/tampered inputs remain generic; no raw error messages persisted. Existing PASS_FAULT, SETTLE_FAULT, skipped/tick results consume faultCode; recordDenial already saves e.label and quarantine sanitizes. Pure mapping/forgery tests and C04/C29 integration durable PASS_FAULT assertion added. No lease, heartbeat, retry, scheduler behavior or UI changes. Live demo repro is not available in this environment. npm verify:change and full suite have NOT run in this connector-only environment; hand off to local Devin for mandatory READY_FOR_INDEPENDENT_AUDIT and independent audit. No merge.",
+  "risk_override": "HIGH"
 }
