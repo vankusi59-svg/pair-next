@@ -8,6 +8,8 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 
 - PR #134 open: feat/p15-9-owner-seams-p16a → staging/pr59-safe (HEAD 55edffb, R3 PASS)
 - PR #135 open: feat/p16-b-reasoning-brief → feat/p15-9-owner-seams-p16a (HEAD 47be280, R2 PASS)
+- PR #136 open: feat/p16-c-ceo-brief-consumption → feat/p16-b-reasoning-brief (HEAD 4c29bf2, R3 PASS)
+- PR #137 open: feat/p16-d-chat-read-grants → feat/p16-c-ceo-brief-consumption (R2 PASS)
 - Step 0 (P15.9 owner-action gaps): DONE — HEAD 3616737840a6b2ff86d7c69be466357d649f7d1d
   - POST /api/vnext/objectives/:id/{progress,evidence,amend} — x-operator-id only authority
   - accountBudget intentionally NOT exposed (no assertOwner — pipeline seam)
@@ -24,9 +26,10 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 - P16-B ReasoningBrief contract: DONE — PR #135 (47be280); ReasoningBriefService.briefFor
   deterministic from contextFor; provenance from integrity notes; volatile-stripped digest;
   options name existing authority channels only; reasoner = transport+usable gates reported
-- P16-C CEO consumption via ceo-planning-cycle injection (no ceo-decision schema change)
-- P16-D capability-gap advisory (DRIVER_* fault classification → persisted projection)
-- Chat company-status read blocked by UNVERIFIED_IDENTITY (operational-query.ts) — prerequisite seam
+- P16-C CEO consumption via ceo-planning-cycle injection (no ceo-decision schema change): DONE — PR #136
+- P16-D verified-identity seam (operator/telegram scoped chat reads): DONE — PR #137;
+  canonical conversation_read_grant, owner-claim+admin mint lanes, UNVERIFIED_IDENTITY stays default-deny
+- Capability-gap advisory (DRIVER_* fault classification → persisted projection): remaining P16 item
 - P17: business_id/objective_id tenancy scope on experience/memory (schema migration) → Brain consumption
 - P18: objective_relation entity → portfolio → parallel → handoff → duties → recovery → company E2E
 
@@ -38,11 +41,9 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 
 ## NEXT ACTION
 
-P16-C — CEO consumes ReasoningBrief: inject brief into buildCeoObservation/CEO user prompt
-(seam: ceo-planning-cycle.ts ~:822/946-950, observation feeds buildCeoUserPrompt). Requirements:
-deterministic CEO validation + commit authority intact; no ceo-decision schema change unless
-governed; brief staleness check via context_digest pin. Also: PR #134 (P15.9+P16-A) and #135
-(P16-B) await owner merge — #135 base must retarget to staging/pr59-safe after #134 merges.
+P16 remaining: capability-gap advisory (DRIVER_* fault classification → persisted projection).
+Also: PRs #134–#137 all await owner merge — each PR's base must retarget to staging/pr59-safe
+as its predecessor merges (stacked chain).
 
 ---
 ## R1 REPAIR CHECKPOINT (2026-10-24)
@@ -68,3 +69,10 @@ governed; brief staleness check via context_digest pin. Also: PR #134 (P15.9+P16
 - Contract shift: mid-flight mutation visible only via brief → STALE at cycle boundary (was P15_5_STALE_REVIEW at review layer); p15-5 test 18 updated, zero-commit invariant unchanged.
 - verify:change --base adf68c0 → READY_FOR_INDEPENDENT_AUDIT. Tests 14/14 + regression green. Review: R1 NEEDS_FIX→repaired, R2 PASS, R3 PASS.
 - P16 remaining: P16-D verified-identity (operator/telegram scoped chat reads — Phase-5 seam, UNVERIFIED_IDENTITY stays default-deny by design).
+
+## P16-D — verified read grants (COMPLETE 2026-10-24)
+- PR #137 `feat/p16-d-chat-read-grants` → `feat/p16-c-ceo-brief-consumption` (stacked on #136). Commits: `07da74a` feat, `1763e40` R1 repairs, R2 hygiene.
+- `conversation-read-grant.ts`: canonical grant entity — principal_ref (telegram:<chat>/operator:<id>) × explicit scope {objective_ids, business_ids, own_footprint} + operator_ref + expiry (90d max TTL) + terminal disable/revoke + digest pin (incl. state/dedup_key) + event anchors + idempotent mint.
+- Mint lanes: admin credential (any scope) or operator claim (same authority as vnext owner actions — own operator_ref + provable scope only). Enforcement: operational-query `readGrants?` seam — granted principals read exactly vouched scope; providers/executors stay INSUFFICIENT_AUTHORITY; ungranted/expired/revoked/forged/resurrected principals stay UNVERIFIED_IDENTITY. Zero writes on read path.
+- HTTP: /api/conversations/read-grants* inside adminBoundary; status visibility scoped (no cross-principal enumeration); AUTHORITY→403 code-only (no foreign-id leak).
+- verify:change --base 4c29bf2 → READY_FOR_INDEPENDENT_AUDIT. Tests 22/22 + regressions green. Review: R1 PASS (6 minors repaired), R2 PASS.
