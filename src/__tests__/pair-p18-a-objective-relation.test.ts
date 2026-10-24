@@ -52,6 +52,9 @@
  *       on starved edges), while semantic unproven-ness stays null.
  *   R24 non-object payloads — 'null'/primitives with valid hashes
  *       typed HASH_MISMATCH and isolate-skip, never a TypeError wedge.
+ *   R25 undigestable payloads — digest() itself throws (non-finite
+ *       numbers, pathological nesting) → classified HASH_MISMATCH,
+ *       isolate-skip on reads, loud wedge on strict mints.
  */
 
 import { describe, expect, it } from "vitest";
@@ -918,6 +921,39 @@ describe("P18-A — objective_relation canonical entity", () => {
       s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
     } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
     expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    s.store.close();
+  });
+
+  it("R25 undigestable payloads — non-finite/deep content classified, not crashed", () => {
+    const s = fresh("r25");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const legit = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const plant = (key: string, payload: string) => db.prepare(
+      "INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", key, 1, payload, "0".repeat(64), "2026-01-01T00:00:00.000Z");
+    // Non-finite number parses to Infinity — digest() throws raw
+    // inside the verify predicate; before the wrap this was an
+    // untyped Error wedging all reads.
+    plant("AAA_INF", '{"a":1e999}');
+    // Pathological nesting — RangeError out of the canonicalizer.
+    plant("AAA_DEEP", "{\"a\":".repeat(5000));
+    const got = s.relations.relationsFor(a);
+    expect(got.map((r) => String(r.relation_id))).toEqual([legit.relation_id]);
+    // Same on the event tail: undigestable metadata_json classifies
+    // EVENT_HASH_MISMATCH (fails this row only, not the service).
+    db.prepare("UPDATE events SET metadata_json=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run('{"a":1e999}', legit.relation_id);
+    expect(s.relations.relationsFor(b)).toHaveLength(0); // its anchor is corrupt
+    // Strict mint wedges loudly with the typed code.
+    let code = "";
+    try {
+      s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
+    expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH"); // AAA_* rows trip first
     s.store.close();
   });
 });

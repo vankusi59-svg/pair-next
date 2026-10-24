@@ -196,7 +196,16 @@ export class PairEvidenceStore {
       event_type: row.event_type, old_state: row.old_state, new_state: row.new_state,
       actor: row.actor, correlation_id: row.correlation_id, metadata, created_at: row.created_at,
     };
-    if (digest(body) !== row.event_hash) {
+    let mismatch: boolean;
+    try {
+      // digest() itself throws on undigestable content (non-finite
+      // numbers, pathological nesting) — that is unverifiable, i.e. a
+      // mismatch, never a raw crash.
+      mismatch = digest(body) !== row.event_hash;
+    } catch {
+      mismatch = true;
+    }
+    if (mismatch) {
       throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
     }
     return { ...row, metadata };
@@ -254,9 +263,15 @@ export class PairEvidenceStore {
         // the key so paged consumers can isolate-and-skip it.
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
       }
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
           digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
-          payload.entity_type !== input.entity_type || payload.version !== row.version) {
+          payload.entity_type !== input.entity_type || payload.version !== row.version;
+      } catch {
+        mismatch = true; // undigestable is unverifiable — classify, don't crash
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
       }
       return payload;
@@ -392,8 +407,14 @@ export class PairEvidenceStore {
     // 'null'/'5'/[] parse fine and digest fine — a non-object payload
     // is corruption, not a valid entity body (avoids null.property
     // crashes typed as raw TypeErrors downstream).
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-        digest(payload) !== row.payload_hash) {
+    let mismatch: boolean;
+    try {
+      mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+        digest(payload) !== row.payload_hash;
+    } catch {
+      mismatch = true;
+    }
+    if (mismatch) {
       throw new IntegrityError(
         "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
         `${entityType}:${entityId}`,
@@ -430,8 +451,14 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-          digest(payload) !== row.payload_hash) {
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
       return payload as T & { version: number };
@@ -560,8 +587,14 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-          digest(payload) !== row.payload_hash) {
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
       return { ...row, payload };
@@ -635,8 +668,14 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-          digest(payload) !== row.payload_hash) {
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
       return payload;
@@ -667,8 +706,14 @@ export class PairEvidenceStore {
           `${row.entity_type}:${row.entity_id}`,
         );
       }
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
-          digest(payload) !== row.payload_hash) {
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError(
           "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
           `${row.entity_type}:${row.entity_id}`,
