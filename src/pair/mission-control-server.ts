@@ -507,7 +507,10 @@ export function createMissionControlServer(
           /^\/api\/conversations\/read-grants(\/|$)/.test(p))) ||
       (method === "GET" &&
         (p === "/api/conversations" ||
-          /^\/api\/conversations\/[^/]+(\/messages)?$/.test(p)));
+          /^\/api\/conversations\/[^/]+(\/messages)?$/.test(p) ||
+          // P16-D — by-id grant status is operational-status authority too;
+          // without it the admin credential 401s on a route it mints into.
+          /^\/api\/conversations\/read-grants(\/|$)/.test(p)));
     if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch) {
       // The MC token remains the general API credential. The admin
       // token unlocks ONLY the operational-status boundary — every

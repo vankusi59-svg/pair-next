@@ -26,8 +26,10 @@
  *                  authority on canonical rows.
  *
  * What a grant is NOT: it is not sender authentication (a `telegram:<chat>`
- * grant vouches the channel equality the ingress already proves — never who
- * typed), it is not admin (grants only ever produce the scoped sections),
+ * grant vouches the channel identity claimed at that boundary — never who
+ * typed; the effective audience is "any MC-token holder who can present
+ * that chat id", exactly the claim contract the telegram ingress uses),
+ * it is not admin (grants only ever produce the scoped sections),
  * and it is not a write (the read path stays no-mutation; revocation is the
  * escape hatch and reads carry zero write authority).
  *
@@ -49,6 +51,10 @@ export const CONV_READ_GRANT_DISABLED_EVENT = "CONVERSATION_READ_GRANT_DISABLED"
 export const CONV_READ_GRANT_REVOKED_EVENT = "CONVERSATION_READ_GRANT_REVOKED";
 
 export type ConvReadGrantState = "ENABLED" | "DISABLED" | "REVOKED";
+
+/** Upper bound on a grant's lifetime — delegated reads are time-boxed
+ *  authority, never effectively-permanent. */
+export const MAX_CONV_READ_GRANT_TTL_MS = 90 * 24 * 3600_000;
 
 export interface ConvReadGrantScope {
   /** Explicit objective ids the principal may read (status envelope). */
@@ -102,15 +108,21 @@ export function isOperatorRef(value: unknown): value is string {
   return typeof value === "string" && /^operator:[^\s:]+$/.test(value);
 }
 
-/** The canonical content the digest pins — scope normalized (sorted,
- *  deduped) so equivalent vouches digest identically. */
+/** The canonical content the digest pins — INCLUDING lifecycle state and
+ *  the dedup key, so an in-place row mutation (e.g. flipping REVOKED back
+ *  to ENABLED, or rewriting dedup_key to replay under a second identity)
+ *  invalidates the pinned digest instead of passing re-proof silently.
+ *  Scope is normalized (sorted, deduped) so equivalent vouches digest
+ *  identically. */
 export function convReadGrantDigest(row: {
   grant_id: string;
   principal_ref: string;
   operator_ref: string;
   scope: ConvReadGrantScope;
+  state: string;
   expires_at: number;
   granted_by: string;
+  dedup_key: string | null;
 }): string {
   return digest({
     schema: CONV_READ_GRANT_SCHEMA,
@@ -122,8 +134,10 @@ export function convReadGrantDigest(row: {
       business_ids: [...new Set(row.scope.business_ids)].sort(),
       own_footprint: row.scope.own_footprint,
     },
+    state: row.state,
     expires_at: row.expires_at,
     granted_by: row.granted_by,
+    dedup_key: row.dedup_key,
   });
 }
 
@@ -198,12 +212,26 @@ export class ConversationReadGrantService {
     return this.store.list<ConvReadGrantRow>(CONV_READ_GRANT_ENTITY);
   }
 
-  /** Strict rows only — a tampered/forged grant fails closed on ANY path. */
+  /** Strict rows only — a tampered/forged grant fails closed on ANY path.
+   *  Beyond digest re-proof this also skips the RESURRECTION signature:
+   *  an ENABLED row whose grant_id already carries a DISABLED/REVOKED
+   *  event (the row was closed then flipped back in place — the state
+   *  field is digest-pinned, but a store-level rewrite could recompute it;
+   *  the append-only event chain still exposes the close). */
   private validRows(): ConvReadGrantRow[] {
+    const closed = new Set<string>();
+    for (const ev of this.store.listEvents(CONV_READ_GRANT_ENTITY)) {
+      if (
+        String(ev.event_type) === CONV_READ_GRANT_DISABLED_EVENT ||
+        String(ev.event_type) === CONV_READ_GRANT_REVOKED_EVENT
+      ) {
+        closed.add(String(ev.entity_id));
+      }
+    }
     return this.rows().filter((r) => {
       try { assertConvReadGrantRow(r); return true; }
       catch { return false; }
-    });
+    }).filter((r) => !(r.state === "ENABLED" && closed.has(r.grant_id)));
   }
 
   /** The objectives/businesses the claimed owner ref can canonically prove —
@@ -235,28 +263,13 @@ export class ConversationReadGrantService {
   grant(input: ConvReadGrantInput): { grant: ConvReadGrantRow; replayed: boolean } {
     const actor = assertActor(input.actor, input.actor_kind);
     const scope = normalizeScope(input.scope);
-    const dedup = input.idempotency_key ?? null;
-    if (dedup !== null) {
-      const prior = this.validRows().find((g) => g.dedup_key === dedup);
-      if (prior) {
-        if (
-          prior.principal_ref === input.principal_ref &&
-          prior.operator_ref === input.operator_ref &&
-          sameScope(prior.scope, scope) &&
-          prior.expires_at === input.expires_at
-        ) {
-          return { grant: prior, replayed: true };
-        }
-        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_IDEMPOTENT_MISMATCH", dedup);
-      }
-    }
-
     if (!scope.own_footprint && scope.objective_ids.length === 0 && scope.business_ids.length === 0) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_SCOPE_EMPTY", "scope");
     }
     if (
       typeof input.expires_at !== "number" || !Number.isFinite(input.expires_at) ||
-      input.expires_at <= this.now()
+      input.expires_at <= this.now() ||
+      input.expires_at > this.now() + MAX_CONV_READ_GRANT_TTL_MS
     ) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_EXPIRY", String(input.expires_at));
     }
@@ -270,7 +283,9 @@ export class ConversationReadGrantService {
     if (input.actor_kind === "operator") {
       // The owner claim may only vouch itself — never a foreign owner ref —
       // and only scope it can canonically prove ownership over. A claim that
-      // cannot prove ownership vouches nothing (fail closed).
+      // cannot prove ownership vouches nothing (fail closed). This runs
+      // BEFORE the dedup replay below so a foreign claim can never use an
+      // existing dedup_key as an existence/metadata oracle.
       if (actor !== input.operator_ref) {
         throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY", input.operator_ref);
       }
@@ -284,6 +299,22 @@ export class ConversationReadGrantService {
         if (!provable.business_ids.has(bid)) {
           throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY", bid);
         }
+      }
+    }
+
+    const dedup = input.idempotency_key ?? null;
+    if (dedup !== null) {
+      const prior = this.validRows().find((g) => g.dedup_key === dedup);
+      if (prior) {
+        if (
+          prior.principal_ref === input.principal_ref &&
+          prior.operator_ref === input.operator_ref &&
+          sameScope(prior.scope, scope) &&
+          prior.expires_at === input.expires_at
+        ) {
+          return { grant: prior, replayed: true };
+        }
+        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_READ_GRANT_IDEMPOTENT_MISMATCH", dedup);
       }
     }
 
@@ -353,6 +384,10 @@ export class ConversationReadGrantService {
         [atField]: utcnow(),
         [byField]: actor,
       } as ConvReadGrantRow;
+      // Lifecycle is digest-pinned — the close re-pins so a later in-place
+      // flip back to ENABLED invalidates re-proof (and the event chain
+      // independently exposes the resurrection signature in validRows).
+      next.grant_digest = convReadGrantDigest(next);
       const saved = this.store.put(CONV_READ_GRANT_ENTITY, grantId, next) as unknown as ConvReadGrantRow;
       this.store.event({
         entity_type: CONV_READ_GRANT_ENTITY,
@@ -360,7 +395,12 @@ export class ConversationReadGrantService {
         event_type: eventType,
         actor,
         new_state: state,
-        metadata: { grant_id: grantId, grant_digest: row.grant_digest, action: input.action },
+        metadata: {
+          grant_id: grantId,
+          grant_digest: next.grant_digest,
+          prior_digest: row.grant_digest,
+          action: input.action,
+        },
       });
       return { grant: saved, replayed: false };
     });

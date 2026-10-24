@@ -283,6 +283,47 @@ describe("ConversationReadGrantService — mint lanes", () => {
     }))).toBe("FAIL_CLOSED_CONVERSATION_READ_GRANT_SCHEMA");
   });
 
+  it("expiry boundary: expires_at <= now and absurd far-future TTL both fail closed", () => {
+    const { store, grants } = fresh("expiry-bound");
+    seedFootprints(store);
+    const base = {
+      actor: OP_REF, actor_kind: "operator" as const,
+      principal_ref: TG, operator_ref: OP_REF,
+      scope: { objective_ids: ["OBJ_A"], business_ids: [], own_footprint: false },
+    };
+    expect(code(() => grants.grant({ ...base, expires_at: NOW_MS })))
+      .toBe("FAIL_CLOSED_CONVERSATION_READ_GRANT_EXPIRY");
+    // Effectively-permanent delegation exceeds the TTL bound.
+    expect(code(() => grants.grant({ ...base, expires_at: NOW_MS + 1e15 })))
+      .toBe("FAIL_CLOSED_CONVERSATION_READ_GRANT_EXPIRY");
+    // expires_at exactly at the read boundary vouches nothing.
+    grants.grant({ ...base, expires_at: NOW_MS + 1 });
+    // (grant minted while valid — the scope check below re-evaluates `now`
+    // through the service clock, which is still NOW_MS → in scope)
+    expect(grants.scopeForPrincipal(TG)).not.toBeNull();
+  });
+
+  it("dedup replay can never be an existence/metadata oracle for a foreign claim", () => {
+    const { store, grants } = fresh("dedup-oracle");
+    seedFootprints(store);
+    grants.grant({
+      actor: "admin", actor_kind: "admin",
+      principal_ref: TG, operator_ref: FOREIGN_REF,
+      scope: { objective_ids: ["OBJ_B"], business_ids: [], own_footprint: false },
+      expires_at: NOW_MS + 60_000,
+      idempotency_key: "shared-key",
+    });
+    // A foreign operator claim replaying the same dedup_key hits the
+    // authority gate BEFORE the dedup oracle — it learns nothing.
+    expect(code(() => grants.grant({
+      actor: OP_REF, actor_kind: "operator",
+      principal_ref: TG, operator_ref: FOREIGN_REF,
+      scope: { objective_ids: ["OBJ_B"], business_ids: [], own_footprint: false },
+      expires_at: NOW_MS + 60_000,
+      idempotency_key: "shared-key",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY");
+  });
+
   it("own_footprint owner mint needs no declared ids — the footprint IS the scope", () => {
     const { store, grants } = fresh("mint-footprint");
     seedFootprints(store);
@@ -383,6 +424,34 @@ describe("ConversationReadGrantService — control + scope resolution", () => {
     const st = grants.status({ principal_ref: TG });
     expect(st).toHaveLength(2);
     expect(st.every((g) => g.expired_pending)).toBe(true);
+  });
+
+  it("resurrection: a close-then-flipped-back-ENABLED row keeps a valid digest but is still skipped", () => {
+    const { store, grants } = fresh("resurrect");
+    seedFootprints(store);
+    const g = grants.grant({
+      actor: OP_REF, actor_kind: "operator",
+      principal_ref: TG, operator_ref: OP_REF,
+      scope: { objective_ids: ["OBJ_A"], business_ids: [], own_footprint: false },
+      expires_at: NOW_MS + 60_000,
+    }).grant;
+    grants.control(g.grant_id, { actor: OP_REF, actor_kind: "operator", action: "revoke" });
+    expect(grants.scopeForPrincipal(TG)).toBeNull();
+    // Store-level rewrite flips the row back to ENABLED and re-pins the
+    // digest for that state — strict re-proof passes it, but the canonical
+    // event chain still records the close: validRows skips the
+    // resurrection signature on EVERY path.
+    const resurrected = {
+      ...g,
+      state: "ENABLED",
+      revoked_at: null,
+      revoked_by: null,
+      grant_digest: g.grant_digest, // original ENABLED-state digest re-pins
+      version: 2,
+    };
+    store.put("conversation_read_grant", g.grant_id, resurrected, 2);
+    expect(grants.scopeForPrincipal(TG)).toBeNull();
+    expect(grants.status({ grant_id: g.grant_id })).toHaveLength(0);
   });
 });
 
@@ -543,6 +612,46 @@ describe("OperationalQueryService — grant-verified scoped reads", () => {
     expect(Object.keys(env.sections as object)).toHaveLength(0);
   });
 
+  it("footprint scope covers missions proven through BARE-stored draft ownership", () => {
+    const { store, grants } = fresh("footprint-draft");
+    seedFootprints(store);
+    // conversation_mission_draft.owner_operator_id stores the RAW claim
+    // ("alice") — a canonical-only footprint would silently miss it.
+    store.put("mission", "MSN_DRAFT", {
+      mission_id: "MSN_DRAFT", project_id: "PRJ_1", goal: "drafted",
+      bound_open_id: null, status: "CREATED", metadata: {}, created_at: NOW,
+    }, 0);
+    store.put("mission_runtime", "MRT_MSN_DRAFT", {
+      mission_id: "MSN_DRAFT", state: "RUNNING", created_at: NOW,
+    }, 0);
+    store.put("conversation_mission_draft", "CMD_A", {
+      draft_id: "CMD_A", session_id: "CS_a", owner_operator_id: OP,
+      mission_id: "MSN_DRAFT", state: "CONFIRMED", created_at: NOW,
+    }, 0);
+    grants.grant({
+      actor: OP_REF, actor_kind: "operator",
+      principal_ref: TG, operator_ref: OP_REF,
+      scope: { objective_ids: [], business_ids: [], own_footprint: true },
+      expires_at: NOW_MS + 60_000,
+    });
+    const ops = opsWith(store, grants);
+    const env = statusReq(ops, { kind: "telegram", operator_id: TG }, "what is running");
+    const missions = ((env.sections as Record<string, unknown>).active_missions as {
+      items: Array<{ mission_id: string }>;
+    }).items.map((m) => m.mission_id);
+    expect(missions).toContain("MSN_DRAFT");
+    expect(missions).toContain("MSN_BOUND");
+    expect(missions).not.toContain("MSN_FOREIGN");
+  });
+
+  it("an unwired readGrants seam keeps every non-admin UNVERIFIED_IDENTITY", () => {
+    const { store } = fresh("unwired");
+    seedFootprints(store);
+    const ops = opsWith(store, null);
+    const env = statusReq(ops, { kind: "telegram", operator_id: TG });
+    expect(unavailFor(env, "objectives_owned")).toBe("UNVERIFIED_IDENTITY");
+  });
+
   it("the read path performs zero writes — no grant rows, no events, no version churn", () => {
     const { store, grants } = fresh("no-writes");
     seedFootprints(store);
@@ -655,9 +764,13 @@ describe("HTTP — /api/conversations/read-grants", () => {
     }, admHdr());
     expect(replay.status).toBe(200);
     expect((replay.body as { grant: ConvReadGrantRow; replayed: boolean }).replayed).toBe(true);
-    // Status: admin sees the grant.
+    // Status: admin sees the grant — both the list and the BY-ID route
+    // (the by-id GET must sit inside the admin boundary too).
     const st = await get(port, "/api/conversations/read-grants", admHdr());
     expect((st.body as { grants: ConvReadGrantRow[] }).grants).toHaveLength(1);
+    const byId = await get(port, `/api/conversations/read-grants/${grant.grant_id}`, admHdr());
+    expect(byId.status).toBe(200);
+    expect((byId.body as { grants: ConvReadGrantRow[] }).grants[0]!.grant_id).toBe(grant.grant_id);
   });
 
   it("owner claim mints its own provable scope; foreign scope and foreign operator_ref → 403", async () => {

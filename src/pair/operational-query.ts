@@ -370,6 +370,11 @@ export class OperationalQueryService {
   private scopeForActorRef(actorRef: string): OperatorScope {
     const raw = String(actorRef);
     const actors = new Set<string>([raw, canonicalOperatorActor(raw)]);
+    // Canonical refs also try their BARE form — some canonical surfaces
+    // (conversation_mission_draft.owner_operator_id) store the raw claim
+    // ("alice") rather than `operator:alice`; dropping it would silently
+    // under-serve a footprint grant versus the claim's own view.
+    if (raw.startsWith("operator:")) actors.add(raw.slice("operator:".length));
     const objectiveIds = new Set<string>();
     const businessIds = new Set<string>();
     const missionIds = new Set<string>();
