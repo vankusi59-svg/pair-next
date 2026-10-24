@@ -35,12 +35,14 @@ export class ProceduralMemoryManager {
         (this.db.prepare("PRAGMA table_info(procedural_memory)").all() as Array<{ name: string }>)
           .map((c) => c.name),
       );
-      const hasScope = cols.has("scope_business_id");
+      const hasScope = cols.has("scope_business_id") && cols.has("scope_objective_id");
       const columnList = `id, name, description, steps${hasScope ? ", scope_business_id, scope_objective_id" : ""}`;
       const updateTail = hasScope
-        ? `,
-           scope_business_id = excluded.scope_business_id,
-           scope_objective_id = excluded.scope_objective_id`
+        ? // Caller-supplied scope wins; absent preserves the existing
+          // binding (scope-unaware writers never silently un-scope).
+          `,
+           scope_business_id = COALESCE(excluded.scope_business_id, scope_business_id),
+           scope_objective_id = COALESCE(excluded.scope_objective_id, scope_objective_id)`
         : "";
       this.db.prepare(
         `INSERT INTO procedural_memory (${columnList})

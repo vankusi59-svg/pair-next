@@ -144,6 +144,7 @@ export interface ScopedExperienceReader {
     rows: Array<Record<string, unknown>>;
     excluded_unscoped: number;
     excluded_out_of_scope: number;
+    excluded_ineligible?: number;
   };
 }
 
@@ -458,13 +459,13 @@ export class BrainContextService {
             scope_business_id: row.scope_business_id ?? null,
             scope_objective_id: row.scope_objective_id ?? null,
             evidence_origin: row.evidence_origin ?? null,
-            stale: row.stale === true,
           })),
           admitted: e.rows.length,
           truncated: e.rows.length > 16,
           excluded: {
             unscoped: e.excluded_unscoped,
             out_of_scope: e.excluded_out_of_scope,
+            ineligible: e.excluded_ineligible ?? 0,
           },
         },
         [],

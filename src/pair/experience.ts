@@ -487,10 +487,16 @@ export class ExperienceService {
    *  7. permission_effect == NONE
    *  8. relevance ranking (deterministic token overlap)
    */
-  /** P17 — tenancy admission for a scoped query. An objective-scoped
-   *  row is visible only to its objective; a business-scoped row to any
-   *  read inside its business; an UNSCOPED row (both null — every
-   *  legacy v1 row) is never admitted to a scoped read. */
+  /** P17 — tenancy admission, symmetric:
+   *  - objective query: the objective's own rows + business-shared rows
+   *    of its canonical business (a query omitting business_id derives
+   *    it from the objective — an objective that does not resolve
+   *    admits NOTHING, never the world).
+   *  - business query: business-shared rows only — an objective-private
+   *    row (scope_objective_id set) stays private to its objective.
+   *  - unscoped query: UNSCOPED rows only. "No scope asserted" means
+   *    exactly that — a scope-bound row is never visible outside its
+   *    scope, on ANY read path (raw-forged malformed pairs included). */
   private scopeAdmits(
     exp: Record<string, unknown>,
     query: { objective_id?: string; business_id?: string },
@@ -498,18 +504,25 @@ export class ExperienceService {
     const rowObj = exp.scope_objective_id != null ? String(exp.scope_objective_id) : null;
     const rowBiz = exp.scope_business_id != null ? String(exp.scope_business_id) : null;
     if (query.objective_id) {
+      let bid = query.business_id ?? null;
+      if (bid === null) {
+        const obj = this.store.tryGet("objective", query.objective_id) as
+          Record<string, unknown> | null;
+        bid = obj ? String(obj.business_id ?? "") || null : null;
+        if (bid === null) return false; // objective unproven — fail closed
+      }
       if (rowObj === query.objective_id) {
         // An objective-scoped row whose business disagrees is a
         // malformed binding — never admitted (write-side assertScope
         // forbids it; a raw-forged row could still carry it).
-        return rowBiz === null || rowBiz === query.business_id;
+        return rowBiz === null || rowBiz === bid;
       }
-      return rowObj === null && query.business_id != null && rowBiz === query.business_id;
+      return rowObj === null && rowBiz === bid;
     }
     if (query.business_id) {
-      return rowBiz === query.business_id;
+      return rowObj === null && rowBiz === query.business_id;
     }
-    return true;
+    return rowObj === null && rowBiz === null;
   }
 
   retrieve(query: {
@@ -608,10 +621,12 @@ export class ExperienceService {
     rows: Array<Record<string, unknown>>;
     excluded_unscoped: number;
     excluded_out_of_scope: number;
+    excluded_ineligible: number;
   } {
     const all = this.store.list("experience");
     let excluded_unscoped = 0;
     let excluded_out_of_scope = 0;
+    const inScopeIds = new Set<string>();
     for (const e of all) {
       const rowObj = e.scope_objective_id != null ? String(e.scope_objective_id) : null;
       const rowBiz = e.scope_business_id != null ? String(e.scope_business_id) : null;
@@ -619,15 +634,24 @@ export class ExperienceService {
         excluded_unscoped += 1;
       } else if (!this.scopeAdmits(e, scope)) {
         excluded_out_of_scope += 1;
+      } else {
+        inScopeIds.add(String(e.experience_id));
       }
     }
+    const rows = this.retrieve({
+      objective_id: scope.objective_id,
+      business_id: scope.business_id,
+    });
+    // In-scope rows that did not surface — below the status/trust/
+    // staleness floor (CANDIDATE, QUARANTINED, revoked, stale).
+    // admitted + ineligible = the complete in-scope population; the
+    // projection never hides them.
+    const excluded_ineligible = inScopeIds.size - rows.length;
     return {
-      rows: this.retrieve({
-        objective_id: scope.objective_id,
-        business_id: scope.business_id,
-      }),
+      rows,
       excluded_unscoped,
       excluded_out_of_scope,
+      excluded_ineligible,
     };
   }
 }

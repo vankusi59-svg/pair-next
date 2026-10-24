@@ -62,6 +62,8 @@ import {
   ReconciliationService,
   RecoveryController,
   ScopedMemoryReader,
+  VerifiedExperiencePlannerAdvisor,
+  VerifiedExperienceRoutingAdvisor,
   WorkforceAllocationService,
   WorkforceService,
   WORKFORCE_ALLOCATION_ENTITY,
@@ -314,9 +316,12 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
       s.experience.qualify(String(r.experience_id), {
         verifier_id: "t", verifier_result: { ok: true } });
     }
-    // Legacy unscoped query — every row still visible (advisor compat).
+    // STRICT unscoped query — "no scope asserted" admits only unscoped
+    // rows. A scope-bound row is never visible outside its scope, on
+    // ANY read path (the advisor contract fix from P17 R1).
     const all = s.experience.retrieve({ text: "label" });
-    expect(all.length).toBe(4);
+    expect(all.map((r) => String(r.experience_id))).toEqual(
+      [String(unscoped.experience_id)]);
     // Scoped query for objective A: only its own + business-shared rows.
     const scoped = s.experience.retrieve({ objective_id: oid, business_id: bid });
     const ids = scoped.map((r) => String(r.experience_id));
@@ -324,10 +329,17 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
     expect(ids).toContain(String(bizRow.experience_id));
     expect(ids).not.toContain(String(unscoped.experience_id));
     expect(ids).not.toContain(String(foreign.experience_id));
-    // Scoped query for business B (objective-agnostic): only foreign row.
+    // Objective-only query derives the canonical business itself.
+    const scopedObj = s.experience.retrieve({ objective_id: oid });
+    expect(scopedObj.map((r) => String(r.experience_id)).sort()).toEqual(
+      [String(objRow.experience_id), String(bizRow.experience_id)].sort());
+    // Business-only query: business-shared rows only — the foreign row
+    // is objective-private to O2 and stays private.
     const scopedB = s.experience.retrieve({ business_id: bid2 });
-    expect(scopedB.map((r) => String(r.experience_id))).toEqual(
-      [String(foreign.experience_id)]);
+    expect(scopedB).toHaveLength(0);
+    const scopedA = s.experience.retrieve({ business_id: bid });
+    expect(scopedA.map((r) => String(r.experience_id))).toEqual(
+      [String(bizRow.experience_id)]);
     s.store.close();
   });
 
@@ -344,10 +356,11 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
     s.experience.createCandidate({ type: "FAILURE_SIGNATURE",
       source_evidence_refs: [ref], provenance: "f", scope_business_id: bid2 });
     const r = s.experience.scopedFor({ objective_id: oid, business_id: bid });
-    // CANDIDATE rows are below the admitted-status floor — the rows
-    // list is empty but the counts still report them honestly.
+    // CANDIDATE rows are below the admitted-status floor — in-scope
+    // but not surfaced → excluded_ineligible, never hidden.
     expect(r.excluded_unscoped).toBe(1);
     expect(r.excluded_out_of_scope).toBe(1);
+    expect(r.excluded_ineligible).toBe(2);
     for (const e of s.store.list<Row>("experience")) {
       s.experience.qualify(String(e.experience_id), {
         verifier_id: "t", verifier_result: { ok: true } });
@@ -356,6 +369,7 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
     expect(r2.rows.length).toBe(2);
     expect(r2.excluded_unscoped).toBe(1);
     expect(r2.excluded_out_of_scope).toBe(1);
+    expect(r2.excluded_ineligible).toBe(0);
     s.store.close();
   });
 
@@ -514,6 +528,11 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
     const dir = path.join(ROOT, `${counter++}-t8mem`);
     fs.mkdirSync(dir, { recursive: true });
     const adb = createDatabase(path.join(dir, "state.db"));
+    // One scoped memory row — the MEMORY fact emits only on real
+    // content (an empty wired table mints no permanent UNVERIFIED fact).
+    new SemanticMemoryManager(adb.raw).store({
+      category: "domain", key: "k", value: "v", source: "t",
+      scopeBusinessId: bid });
     const brain = brainWith(s, {
       experience: s.experience, scopedMemory: new ScopedMemoryReader(adb.raw) });
     const briefs = new ReasoningBriefService(s.store, { brain });
@@ -543,6 +562,74 @@ describe("P17 — tenancy scope for experience + memory → Brain", () => {
     expect(r.semantic).toHaveLength(0);
     expect(r.excluded_out_of_scope).toBe(1);
     adb.close();
+  });
+
+  it("T11 routing advisor reads only the mission's tenancy scope", () => {
+    const { s, oid, bid, binding } = seeded("t11", ["a"]);
+    const bid2 = mkBusiness(s);
+    const o2 = mkObjective(s, bid2);
+    const ref = anyRef(s);
+    const mk = (label: string, scope: Record<string, unknown>) => s.experience.createCandidate({
+      type: "EXECUTOR_OBSERVATION", source_evidence_refs: [ref],
+      provenance: label, compatibility_scope: { executors: ["EX_A"] },
+      outcome: "SUCCESS", ...scope,
+    });
+    const objRow = mk("obj", { scope_objective_id: oid });
+    const bizRow = mk("biz", { scope_business_id: bid });
+    const unscoped = mk("unscoped", {});
+    const foreign = mk("foreign", { scope_objective_id: String(o2.objective_id) });
+    for (const r of s.store.list<Row>("experience")) {
+      s.experience.qualify(String(r.experience_id), {
+        verifier_id: "t", verifier_result: { ok: true } });
+    }
+    // Drive the bound work item to a real bound mission — the advisor
+    // resolves its tenancy through the canonical chain.
+    const cid = childOfKey(s, binding!, "a");
+    if (String(s.store.get("work_item", cid).status) === "READY") s.biz.openWorkItem(cid, OP);
+    const mid = boundMissionId(s, cid);
+    const advisor = new VerifiedExperienceRoutingAdvisor(s.service, s.experience);
+    const rec = advisor.advise({
+      eligible: [{ executor_id: "EX_A" } as never],
+      task: { mission_id: mid } as never,
+    });
+    const considered = rec.experience_ids_considered as string[];
+    expect(considered).toContain(String(objRow.experience_id));
+    expect(considered).toContain(String(bizRow.experience_id));
+    // THE LEAK (R1-MAJOR): foreign-scope + unscoped rows must never
+    // reach a scoped mission's routing advice.
+    expect(considered).not.toContain(String(foreign.experience_id));
+    expect(considered).not.toContain(String(unscoped.experience_id));
+    // A scopeless mission sees only unscoped rows.
+    const standalone = s.service.createMission({
+      project_id: s.projectId, goal: "standalone", metadata: {} });
+    const rec2 = advisor.advise({
+      eligible: [{ executor_id: "EX_A" } as never],
+      task: { mission_id: String(standalone.mission_id) } as never,
+    });
+    expect(rec2.experience_ids_considered as string[]).toEqual([String(unscoped.experience_id)]);
+    s.store.close();
+  });
+
+  it("T12 planner advisor reads only the mission's tenancy scope", () => {
+    const { s, oid, bid, binding } = seeded("t12", ["a"]);
+    const ref = anyRef(s);
+    const scoped = s.experience.createCandidate({
+      type: "PLAN_TEMPLATE", source_evidence_refs: [ref],
+      provenance: "a", scope_objective_id: oid });
+    s.experience.createCandidate({
+      type: "PLAN_TEMPLATE", source_evidence_refs: [ref],
+      provenance: "u" });
+    for (const r of s.store.list<Row>("experience")) {
+      s.experience.qualify(String(r.experience_id), {
+        verifier_id: "t", verifier_result: { ok: true } });
+    }
+    const cid = childOfKey(s, binding!, "a");
+    if (String(s.store.get("work_item", cid).status) === "READY") s.biz.openWorkItem(cid, OP);
+    const mid = boundMissionId(s, cid);
+    const advisor = new VerifiedExperiencePlannerAdvisor(s.service, s.experience);
+    const rec = advisor.advise({ goal: "g", mission_id: mid });
+    expect(rec.experience_ids_considered as string[]).toEqual([String(scoped.experience_id)]);
+    s.store.close();
   });
 
   it("T10 forged experience scope binding → exclusion, never admitted", () => {

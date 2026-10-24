@@ -160,7 +160,6 @@ export interface ReasoningBriefOpts {
    as expected. */
 const EXPECTED_GAP_CODES = new Set([
   "BINDING_ABSENT",
-  "SCOPE_BINDING_ABSENT",
   "ARTIFACT_AUTHORITY_NOT_WIRED",
   "AUTO_POLICY_NOT_WIRED",
   "AUTO_DRIVER_NOT_WIRED",
@@ -508,7 +507,11 @@ export class ReasoningBriefService {
     //    never claimed proven). Exclusion counts stay visible — a
     //    scope wall is a fact too, not just the admitted rows. --
     const expRows = (experience.experiences as Array<Record<string, unknown>> | undefined) ?? [];
-    if (expRows.length || (experience.admitted ?? 0) || experience.excluded != null) {
+    // Emit only on real admitted content — a wired-but-empty section
+    // must not mint a permanent zero-fact (an all-exclusion scope
+    // still surfaces the counts INSIDE the section, and the Brain
+    // unavailable channel carries the wiring story).
+    if (expRows.length || Number(experience.admitted ?? 0) > 0) {
       const byType: Record<string, number> = {};
       for (const r of expRows) {
         const t = String(r.type);
@@ -530,7 +533,10 @@ export class ReasoningBriefService {
     }
     const sem = (memory.semantic as unknown[] | undefined) ?? [];
     const proc = (memory.procedural as unknown[] | undefined) ?? [];
-    if (sem.length || proc.length || memory.excluded != null) {
+    // Same rule — an empty wired memory table is "no memory yet", not
+    // an UNVERIFIED fact; emitting it would cap every wired brief at
+    // MEDIUM forever.
+    if (sem.length || proc.length) {
       out.push({
         predicate: "MEMORY",
         subject: oid,

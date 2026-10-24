@@ -40,6 +40,70 @@ function ref(entityType: string, entityId: string): string {
   return `${entityType}:${entityId}`;
 }
 
+/* P17 — canonical scope derivation, evidence-only:
+ *   mission.bound_open_id → work_open_binding → work_item →
+ *   parent chain → root → root work_item's own objective_id/business_id.
+ * The ROOT work_item carries the canonical pins (work-graph inherits
+ * objective_id/business_id from the root at mint) — no binding-table
+ * pattern-match needed. Any link that fails to resolve degrades to
+ * business-only (or unscoped) — never throws, never fabricates an
+ * objective claim: an under-scoped row is simply invisible to tighter
+ * reads. A binding whose business disagrees with the mission's own is
+ * malformed → objective claim dropped, mission's business kept. */
+export function deriveMissionScope(
+  store: { tryGet: (t: string, id: string) => unknown; },
+  missionId: string,
+): {
+  scope_business_id: string | null;
+  scope_objective_id: string | null;
+} {
+  const none = { scope_business_id: null, scope_objective_id: null };
+  const workItemRoot = (workItemId: string): Record<string, unknown> | null => {
+    let id = workItemId;
+    for (let depth = 0; depth < 64; depth++) {
+      const item = store.tryGet("work_item", id) as Record<string, unknown> | null;
+      if (!item) return null;
+      const parent = item.parent_work_item_id != null ? String(item.parent_work_item_id) : "";
+      if (!parent) return item;
+      id = parent;
+    }
+    return null; // cyclic/deeper-than-cap — unproven, degrade
+  };
+  try {
+    const mission = store.tryGet("mission", missionId) as Record<string, unknown> | null;
+    if (!mission) return none;
+    const businessId = mission.business_id != null ? String(mission.business_id) : null;
+    const openId = mission.bound_open_id != null ? String(mission.bound_open_id) : "";
+    if (openId) {
+      const ob = store.tryGet("work_open_binding", openId) as Record<string, unknown> | null;
+      if (ob && String(ob.mission_id ?? "") === String(mission.mission_id)) {
+        const bindingBiz = ob.business_id != null ? String(ob.business_id) : null;
+        // A binding disagreeing with the mission's canonical business
+        // is malformed — drop the objective claim, keep the mission's
+        // own business (the binding cannot override it).
+        if (bindingBiz !== null && businessId !== null && bindingBiz !== businessId) {
+          return { scope_business_id: businessId, scope_objective_id: null };
+        }
+        const wid = ob.work_item_id != null ? String(ob.work_item_id) : "";
+        const root = wid ? workItemRoot(wid) : null;
+        if (root) {
+          const rootObj = root.objective_id != null ? String(root.objective_id) : null;
+          const rootBiz = root.business_id != null ? String(root.business_id) : null;
+          if (rootObj) {
+            return {
+              scope_business_id: rootBiz ?? businessId,
+              scope_objective_id: rootObj,
+            };
+          }
+        }
+      }
+    }
+    return { scope_business_id: businessId, scope_objective_id: null };
+  } catch {
+    return none;
+  }
+}
+
 export interface ExtractedObservation {
   type: string;
   seriesKey: string;
@@ -73,56 +137,13 @@ export class ExperienceExtractor {
     return this.service.store;
   }
 
-  /* P17 — canonical scope derivation. The chain is evidence-only:
-   *   mission.bound_open_id → work_open_binding → work_item →
-   *   parent chain → root → objective_workstream_binding → objective.
-   * Any link that fails to resolve degrades to business-only (or
-   * unscoped) — never throws, never fabricates an objective claim:
-   * an under-scoped row is simply invisible to tighter reads. */
-  private workItemRoot(workItemId: string): string | null {
-    let id = workItemId;
-    for (let depth = 0; depth < 64; depth++) {
-      const item = this.store.tryGet("work_item", id) as Record<string, unknown> | null;
-      if (!item) return null;
-      const parent = item.parent_work_item_id != null ? String(item.parent_work_item_id) : "";
-      if (!parent) return id;
-      id = parent;
-    }
-    return null; // cyclic/deeper-than-cap — unproven, degrade
-  }
-
+  /* P17 — canonical scope derivation. See deriveMissionScope below —
+   *  the extractor delegates to the shared evidence-only resolver. */
   missionScope(missionId: string): {
     scope_business_id: string | null;
     scope_objective_id: string | null;
   } {
-    const none = { scope_business_id: null, scope_objective_id: null };
-    try {
-      const mission = this.store.tryGet("mission", missionId) as Record<string, unknown> | null;
-      if (!mission) return none;
-      let businessId = mission.business_id != null ? String(mission.business_id) : null;
-      const openId = mission.bound_open_id != null ? String(mission.bound_open_id) : "";
-      if (openId) {
-        const ob = this.store.tryGet("work_open_binding", openId) as Record<string, unknown> | null;
-        if (ob && String(ob.mission_id ?? "") === String(mission.mission_id)) {
-          businessId = String(ob.business_id ?? businessId ?? "") || businessId;
-          const wid = ob.work_item_id != null ? String(ob.work_item_id) : "";
-          const root = wid ? this.workItemRoot(wid) : null;
-          if (root) {
-            const ws = (this.store.list("objective_workstream_binding") as Array<Record<string, unknown>>)
-              .find((b) => String(b.root_work_item_id) === root);
-            if (ws) {
-              return {
-                scope_business_id: String(ws.business_id ?? businessId ?? "") || businessId,
-                scope_objective_id: String(ws.objective_id),
-              };
-            }
-          }
-        }
-      }
-      return { scope_business_id: businessId, scope_objective_id: null };
-    } catch {
-      return none;
-    }
+    return deriveMissionScope(this.store, missionId);
   }
 
   private executionScope(exec: Record<string, unknown>, task: Record<string, unknown> | null) {
@@ -139,10 +160,20 @@ export class ExperienceExtractor {
    * part of the dedup identity.
    */
   fold(obs: ExtractedObservation): Record<string, unknown> {
+    // Normalize the obs scope the same way assertScope normalizes the
+    // STORED row (an objective scope always carries the objective's own
+    // canonical business) — otherwise an objective-only obs scope
+    // {null, O} can never match its stored {B, O} member and mints a
+    // duplicate series row.
     const scope = {
       scope_business_id: obs.scopeBusinessId ?? null,
       scope_objective_id: obs.scopeObjectiveId ?? null,
     };
+    if (scope.scope_objective_id !== null && scope.scope_business_id === null) {
+      const obj = this.store.tryGet("objective", scope.scope_objective_id) as
+        Record<string, unknown> | null;
+      if (obj) scope.scope_business_id = String(obj.business_id ?? "") || null;
+    }
     const existing = this.experience.findBySeriesKey(obs.seriesKey, scope);
     if (existing) {
       return this.experience.foldObservation(String(existing.experience_id), {

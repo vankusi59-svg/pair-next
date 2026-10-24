@@ -53,7 +53,9 @@ export class SemanticMemoryManager {
       ),
     );
     const hasTrust = cols.has("trust_class");
-    const hasScope = cols.has("scope_business_id");
+    // Both scope columns must exist — a partially-applied V13 must
+    // degrade to unscoped writes, not silently fail every INSERT.
+    const hasScope = cols.has("scope_business_id") && cols.has("scope_objective_id");
     try {
       const columnList = [
         "id, category, key, value, confidence, source, embedding_key",
@@ -68,9 +70,12 @@ export class SemanticMemoryManager {
            evidence_refs = excluded.evidence_refs`
           : "",
         hasScope
-          ? `,
-           scope_business_id = excluded.scope_business_id,
-           scope_objective_id = excluded.scope_objective_id`
+          ? // A caller that supplies no scope preserves the row's
+            // existing binding — scope is never silently erased by a
+            // scope-unaware writer.
+            `,
+           scope_business_id = COALESCE(excluded.scope_business_id, scope_business_id),
+           scope_objective_id = COALESCE(excluded.scope_objective_id, scope_objective_id)`
           : "",
       ].join("");
       this.db.prepare(
