@@ -144,8 +144,9 @@ const LEGAL_TRANSITIONS = new Set([
  *  unkeyable (a colon-agent's pointers would land inside another
  *  endpoint's prefix range and wedge it forever). Canonical OBJ_/AGT_
  *  ids never contain one; raw-SQL agent rows can. The boundary rejects
- *  colon endpoints at mint AND at reads, and provenRow drops any stored
- *  row carrying one — that shape could never have been minted. */
+ *  colon endpoints at mint AND at reads, provenRow drops any stored row
+ *  carrying one — that shape could never have been minted — and
+ *  ensureIndex never projects them into pointer rows. */
 function keyable(id: unknown): boolean {
   return typeof id === "string" && id !== "" && !id.includes(":");
 }

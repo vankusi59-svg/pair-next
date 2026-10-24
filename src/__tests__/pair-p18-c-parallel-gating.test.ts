@@ -440,4 +440,46 @@ describe("P18-C — parallel admission gating", () => {
     expect(s.relations.admissionView(x).upstream).toEqual([y]);
     s.store.close();
   });
+
+  it("C14 colon-endpoint rows mint no poison pointers into sibling ranges", () => {
+    const s = fresh("c14");
+    const bid = mkBiz(s.store);
+    const a = claimable(s, bid);
+    const b = oid(mkObjective(s, bid));
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Raw-SQL relation whose from endpoint is `{a}:evil` — unmintable
+    // (provenRow drops colon endpoints), and ensureIndex must not
+    // project it: pointer `{a}:evil:{rel}` would land inside `{a}:`'s
+    // range and wedge that objective's admissionView permanently.
+    const rid = "REL_pois" + counter;
+    const payload: Row = {
+      schema: "pair.os.vnext.objective-relation.v1",
+      relation_id: rid, business_id: bid,
+      from_objective_id: `${a}:evil`, to_objective_id: b,
+      kind: "DEPENDS_ON", state: "ACTIVE", note: null,
+      created_by: OWNER, dedup_key: "pk" + counter,
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      entity_type: "objective_relation", entity_id: rid, version: 1,
+    };
+    payload.relation_digest = relationDigest(payload);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", rid, 1, JSON.stringify(payload),
+        digest(payload), "2026-01-01T00:00:00.000Z");
+    s.store.immediate(() => s.relations.ensureIndex());
+    const ptrs = db.prepare(
+      "SELECT entity_id FROM entities WHERE entity_type='objective_relation_index'")
+      .all() as Array<{ entity_id: string }>;
+    expect(ptrs.some((p) => p.entity_id === `${a}:evil:${rid}`)).toBe(false);
+    // The keyable to-endpoint still indexes (dead pointer — the row
+    // can never re-prove, so it never gates).
+    expect(ptrs.some((p) => p.entity_id === `${b}:${rid}`)).toBe(true);
+    // The innocent objective is unaffected: no wedge, no phantom gate.
+    expect(s.relations.admissionView(a)).toEqual({ upstream: [], conflicts: [] });
+    expect(s.scheduler.claimable(a).eligible).toBe(true);
+    // And a colon endpoint arg fails typed, never silently under-gates.
+    expectFail(() => s.relations.admissionView(`${a}:evil`),
+      "FAIL_CLOSED_RELATION_FIELDS");
+    s.store.close();
+  });
 });

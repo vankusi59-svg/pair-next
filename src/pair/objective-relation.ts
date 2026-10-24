@@ -162,6 +162,17 @@ const LEGAL_TRANSITIONS = new Set([
   "SUSPENDED>REVOKED",
 ]);
 
+/** Index keys are `:`-delimited (`{objectiveId}:{relationId}`) — an
+ *  endpoint id containing a colon is unkeyable: its pointer would land
+ *  inside another objective's prefix range and wedge that objective's
+ *  admissionView permanently. Canonical OBJ_ ids never contain one;
+ *  raw-SQL rows can. create() rejects colon endpoints, provenRow drops
+ *  stored rows carrying one, and ensureIndex never projects them. */
+function keyableEndpoint(id: unknown): boolean {
+  return typeof id === "string" && id !== "" && !id.includes(":");
+}
+const keyable = keyableEndpoint;
+
 export class ObjectiveRelationService {
   private _objectives?: ObjectiveAuthorityService;
   constructor(private readonly store: PairEvidenceStore) {}
@@ -234,6 +245,10 @@ export class ObjectiveRelationService {
     // A self-relation can never be minted — a fabricated one is never
     // served either.
     if (String(row.from_objective_id) === String(row.to_objective_id)) return null;
+    // Colon endpoints are unkeyable at the index boundary — a stored
+    // row carrying one could never have been minted: unproven.
+    if (!keyableEndpoint(row.from_objective_id) ||
+        !keyableEndpoint(row.to_objective_id)) return null;
     // Event tail must be a legal chain: CREATED first (with identity
     // pins matching the row), then STATE hops that are legal
     // transitions chaining from the prior new_state, ending at the
@@ -376,6 +391,10 @@ export class ObjectiveRelationService {
     const toId = String(input.to_objective_id ?? "");
     if (!fromId || !toId) {
       fail("FAIL_CLOSED_RELATION_FIELDS", "from/to objective ids required");
+    }
+    if (!keyableEndpoint(fromId) || !keyableEndpoint(toId)) {
+      fail("FAIL_CLOSED_RELATION_FIELDS",
+        "objective ids must be ':'-free — index-keyed endpoints");
     }
     if (fromId === toId) {
       fail("FAIL_CLOSED_RELATION_FIELDS", "self-relation is meaningless");
@@ -623,6 +642,13 @@ export class ObjectiveRelationService {
     upstream: string[];
     conflicts: string[];
   } {
+    // The index path builds a `:`-delimited prefix range — a colon
+    // endpoint is unkeyable and must fail loudly, never silently
+    // under-gate by scanning an empty range.
+    if (!keyableEndpoint(objectiveId)) {
+      fail("FAIL_CLOSED_RELATION_FIELDS",
+        "objective id must be a non-empty ':'-free string (index-keyed)");
+    }
     if (!this.indexBuilt()) return this.admissionGlobal(objectiveId);
     const upstream = new Set<string>();
     const conflicts = new Set<string>();
@@ -762,8 +788,15 @@ export class ObjectiveRelationService {
         // semantically unproven at read time (dead pointer, no gate).
         const relId = String(row.entity_id);
         after = relId;
-        this.indexEdge(relId, String(row.from_objective_id ?? ""));
-        this.indexEdge(relId, String(row.to_objective_id ?? ""));
+        // Unkeyable endpoints (colons — never mintable via create(),
+        // never re-provable in provenRow) get NO pointer: indexing one
+        // would mint a poison key inside an innocent objective's prefix
+        // range and wedge its admissionView forever. Keyable endpoints
+        // on unproven rows still index — dead pointers never gate.
+        const fromEp = row.from_objective_id;
+        const toEp = row.to_objective_id;
+        if (keyable(fromEp)) this.indexEdge(relId, String(fromEp));
+        if (keyable(toEp)) this.indexEdge(relId, String(toEp));
         processed++;
         if (processed >= INDEX_CHUNK) { cut = true; break; }
       }

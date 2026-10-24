@@ -512,4 +512,22 @@ describe("P18-E — org-agent duties spanning objectives", () => {
     expect(d.state).toBe("ACTIVE");
     store.close();
   });
+
+  it("E18 non-string endpoints fail typed, never raw TypeError", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA } = mkScope(store);
+    for (const bad of [123, {}, true, ["x"]] as unknown[]) {
+      expectFail(() => duties.dutiesForAgent(bad as string),
+        "FAIL_CLOSED_DUTY_FIELDS");
+      expectFail(() => duties.dutiesForObjective(bad as string),
+        "FAIL_CLOSED_DUTY_FIELDS");
+      // covers() re-proves the agent endpoint — typed fail, never a
+      // raw TypeError; a non-array objective set alone yields false.
+      expectFail(() => duties.covers(bad as string, [objA]),
+        "FAIL_CLOSED_DUTY_FIELDS");
+    }
+    expect(duties.covers(agent, "x" as never)).toBe(false);
+    expect(duties.covers(agent, null as never)).toBe(false);
+    store.close();
+  });
 });
