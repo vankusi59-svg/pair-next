@@ -144,3 +144,9 @@ as its predecessor merges (stacked chain).
 - Boundaries: handoff keeps raw upstream (no provenance expansion), duties keep declared coverage, CONFLICTS unaffected, superseding the dependent itself is lineage not a lease gate, portfolio raw-status satisfaction = recovery-unaware advisory (documented). Root admissionView budget trips still propagate typed in claimable/claim.
 - verify:change READY_FOR_INDEPENDENT_AUDIT (base 9b0e986). Review: R1 1 MODERATE+4 LOW → repaired, R2 PASS. Tests F1-F15 15/15; regressions 376+306 green.
 - P18 series status: A #140 → B #141 → C #142 → D #143 → E #144 → F #145, all READY_FOR_INDEPENDENT_AUDIT, all adversarial-reviewed to PASS, owner-merge pending throughout.
+
+## MERGE COMPLETE — 2026-10-24 (owner-authorized)
+- All 12 stacked milestone PRs merged sequentially into `staging/pr59-safe` (#134-#145), each retargeted to staging before merge to preserve per-PR merge records.
+- `staging/pr59-safe` → `main` via PR **#146** (`d0d50dd`): the complete P16-P18 governed autonomy program now lives on the repo default branch.
+- Open PRs remaining: 0. Merged: #134-#146.
+- Local feat/* branches remain for archaeology; remote feature branches left undeleted (owner may clean).
