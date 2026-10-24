@@ -33,6 +33,12 @@
  *  - state SUSPENDED / REVOKED render as their state — only ACTIVE
  *    edges derive blocked.
  *
+ *  Recovery bound (P18-F): satisfaction here judges the upstream's own
+ *  status only — it does NOT walk the supersession DAG. A FAILED edge
+ *  whose upstream has an achieved declared replacement still reports
+ *  FAILED/blocked even though the scheduler gate now releases
+ *  admission. This surface is advisory; the gate is canonical.
+ *
  * Consistency bound: the read is not transactional — the strict
  * objective enumeration and the relation re-proof are two snapshots.
  * An owner amendment landing between them can render an objective the

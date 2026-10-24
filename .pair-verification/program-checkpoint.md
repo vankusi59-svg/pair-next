@@ -136,3 +136,11 @@ as its predecessor merges (stacked chain).
 - Indexes `org_agent_duty_index` (O:/A: pointer rows) + chunked resumable rebuild (marker only after complete scan); proof-agnostic pointers; corrupt → FAIL_CLOSED_DUTY_INDEX, poison → isolate-and-skip.
 - Endpoint keyability gate (no ':' ids → unforgeable index keys); sentinel-free `startsWith` prefix scans (astral keys included — R4 parity fix applied to relation index too).
 - verify:change READY_FOR_INDEPENDENT_AUDIT; review R3+R4 PASS. 18/18 focused, 15/15 p18-c (C14/C15 parity regressions).
+
+## P18-F — supersession-aware recovery + company E2E (PR #145) — P18 SERIES COMPLETE
+- `feat/p18-f-recovery` → stacked on `feat/p18-e-org-duties` (#144). HEAD `19e2735` (feat `3ac3124` + R1 `e3fb36f` + R2 `19e2735`).
+- `admissionView` gains `superseded_by` (proven ACTIVE SUPERSEDES to==id, index+fallback identical). Scheduler `upstreamSatisfied`: BFS over the proven supersession DAG, cycle-safe, SUPERSEDE_WALK_CAP=128 — satisfied iff ANY reachable node is ACHIEVED. Failed upstream + achieved declared replacement releases admission; pending upstream + achieved replacement releases too (same authority class as revoking the edge).
+- R1 MODERATE fixed: mid-walk PROOF_LIMIT contained as unmet (was: unguarded relationGate throw → proof() rollback → fairness cursor frozen → global-scan livelock). Scan's gate call now under stoppedOnBudget guard like queue()/lease(). Cap-trip drains already-seen nodes (any in-window node can satisfy).
+- Boundaries: handoff keeps raw upstream (no provenance expansion), duties keep declared coverage, CONFLICTS unaffected, superseding the dependent itself is lineage not a lease gate, portfolio raw-status satisfaction = recovery-unaware advisory (documented). Root admissionView budget trips still propagate typed in claimable/claim.
+- verify:change READY_FOR_INDEPENDENT_AUDIT (base 9b0e986). Review: R1 1 MODERATE+4 LOW → repaired, R2 PASS. Tests F1-F15 15/15; regressions 376+306 green.
+- P18 series status: A #140 → B #141 → C #142 → D #143 → E #144 → F #145, all READY_FOR_INDEPENDENT_AUDIT, all adversarial-reviewed to PASS, owner-merge pending throughout.

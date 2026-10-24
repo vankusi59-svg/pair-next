@@ -29,6 +29,10 @@ export const FAIRNESS_STATE = "objective_auto_fairness";
 const GLOBAL = "LOCAL_PAIR_DB";
 const MAX_ACTIVE = 4;
 const PAGE = 64;
+/** P18-F recovery: bound on supersession-DAG nodes visited per unmet
+ *  upstream inside relationGate — a wider owner-authored graph stays
+ *  gated rather than walking unbounded (contained, never a wedge). */
+const SUPERSEDE_WALK_CAP = 128;
 /** R2-F1 — per-call bound on shortlist pages in nextFairCandidate. The
  *  SQL filter already excludes non-actionable and actively-leased rows,
  *  so a second page is only needed if a full PAGE of shortlisted rows
@@ -285,16 +289,66 @@ export class ObjectiveAutoScheduler {
    *  (admissionView): a corrupt relation row propagates and wedges
    *  admission rather than silently clearing it; an unproven/forged
    *  edge never gates. Upstream status re-reads strict here because
-   *  the relation proof pins endpoints, not their mutable status. */
+   *  the relation proof pins endpoints, not their mutable status.
+   *
+   *  Recovery (P18-F): an unmet upstream is resolved through the
+   *  proven supersession DAG — the requirement is satisfied iff ANY
+   *  objective reachable from it through ACTIVE SUPERSEDES edges
+   *  (itself included) is ACHIEVED. A declared replacement that has
+   *  already delivered satisfies the dependency; a cycle, an over-cap
+   *  neighborhood or proof-budget exhaustion mid-walk simply stays
+   *  gated — transient and owner-authored states fail contained to
+   *  this objective, never wedge the scan. Note the boundary is
+   *  upstream SATISFACTION only: superseding the dependent itself is
+   *  lineage metadata, not a lease gate (the owner pauses/cancels it
+   *  explicitly). */
   private relationGate(objectiveId: string, activeLeases: string[]): string | null {
     const { upstream, conflicts } = this.relations.admissionView(objectiveId);
     for (const up of upstream) {
-      const u = this.objectives.get(up) as Row;
-      if (String(u.status) !== "ACHIEVED") return "UPSTREAM_UNMET";
+      if (!this.upstreamSatisfied(up)) return "UPSTREAM_UNMET";
     }
     const active = new Set(activeLeases);
     if (conflicts.some((c) => active.has(c))) return "CONFLICT_LEASE_HELD";
     return null;
+  }
+
+  /** BFS over the proven supersession DAG rooted at an unmet upstream:
+   *  satisfied iff any reachable node — the upstream itself or one of
+   *  its declared replacements — is ACHIEVED. Visited-set makes cycles
+   *  finite; SUPERSEDE_WALK_CAP bounds the neighborhood size (nodes
+   *  already inside the cap still get their status checked). Each step
+   *  uses the same STRICT admissionView seam, so a corrupt edge row
+   *  wedges loudly while a forged or revoked edge never unlocks
+   *  admission. Proof-budget exhaustion mid-walk is transient work
+   *  pressure, not corruption — it returns "unmet" like the over-cap
+   *  path rather than throwing the whole scan into a permanent
+   *  livelock on a legitimate (within-cap) recovery topology. */
+  private upstreamSatisfied(objectiveId: string): boolean {
+    const seen = new Set<string>([objectiveId]);
+    const queue = [objectiveId];
+    let expand = true;
+    while (queue.length) {
+      const cur = queue.shift() as string;
+      let row: Row;
+      let neighbors: string[] = [];
+      try {
+        row = this.objectives.get(cur) as Row;
+        if (expand) {
+          neighbors = this.relations.admissionView(cur).superseded_by;
+        }
+      } catch (e) {
+        if (e instanceof IntegrityError && e.code === PROOF_LIMIT) return false;
+        throw e;
+      }
+      if (String(row.status) === "ACHIEVED") return true;
+      for (const s of neighbors) {
+        if (seen.has(s)) continue;
+        if (seen.size >= SUPERSEDE_WALK_CAP) { expand = false; break; }
+        seen.add(s);
+        queue.push(s);
+      }
+    }
+    return false;
   }
 
   /** Read-only roster view for claimable()'s conflict gate — mirrors
@@ -1254,8 +1308,23 @@ export class ObjectiveAutoScheduler {
             // (furthest already advanced past it; it re-enters next
             // rotation when its upstream completes or the edge is
             // revoked). Corrupt relations propagate — an admission
-            // authority never scans on an unprovable graph.
-            if (this.relationGate(item.entity_id, activeLeases) !== null) {
+            // authority never scans on an unprovable graph. Budget
+            // exhaustion mid-gate (P18-F: a deep supersession walk on a
+            // legitimate graph can spend the whole read budget) is
+            // transient pressure — stop the scan like the queue/lease
+            // guards instead of throwing the rotation into a permanent
+            // livelock on a cursor that can never advance.
+            let gate: string | null;
+            try {
+              gate = this.relationGate(item.entity_id, activeLeases);
+            } catch (err) {
+              if (err instanceof IntegrityError &&
+                  (err.code === PROOF_LIMIT || budgetLow())) {
+                stoppedOnBudget = true; break;
+              }
+              throw err;
+            }
+            if (gate !== null) {
               continue;
             }
             // the claim decision is the visit that must be journaled — it
