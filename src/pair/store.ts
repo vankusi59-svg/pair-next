@@ -254,7 +254,8 @@ export class PairEvidenceStore {
         // the key so paged consumers can isolate-and-skip it.
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
       }
-      if (digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
           payload.entity_type !== input.entity_type || payload.version !== row.version) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
       }
@@ -388,7 +389,11 @@ export class PairEvidenceStore {
         `${entityType}:${entityId}`,
       );
     }
-    if (digest(payload) !== row.payload_hash) {
+    // 'null'/'5'/[] parse fine and digest fine — a non-object payload
+    // is corruption, not a valid entity body (avoids null.property
+    // crashes typed as raw TypeErrors downstream).
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+        digest(payload) !== row.payload_hash) {
       throw new IntegrityError(
         "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
         `${entityType}:${entityId}`,
@@ -425,7 +430,8 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
-      if (digest(payload) !== row.payload_hash) {
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
       return payload as T & { version: number };
@@ -554,7 +560,8 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
-      if (digest(payload) !== row.payload_hash) {
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
       return { ...row, payload };
@@ -628,7 +635,8 @@ export class PairEvidenceStore {
       } catch {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
-      if (digest(payload) !== row.payload_hash) {
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
       return payload;
@@ -659,7 +667,8 @@ export class PairEvidenceStore {
           `${row.entity_type}:${row.entity_id}`,
         );
       }
-      if (digest(payload) !== row.payload_hash) {
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash) {
         throw new IntegrityError(
           "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
           `${row.entity_type}:${row.entity_id}`,

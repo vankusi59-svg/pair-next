@@ -47,6 +47,13 @@
  * canonical (from,to,kind) triple — CONFLICTS dedups symmetrically.
  * Reads are O(relation rows + their event tails); a store read-budget
  * trip propagates loudly rather than truncating the proven set.
+ * Deletion bound: DELETE of a relation row or its events, followed by
+ * a verbatim restore after intervening mints, is bit-indistinguishable
+ * from fabrication — it can admit a duplicate or a cycle a strict
+ * wedge cannot safely prevent (wedging fabricated-looking rows would
+ * let one plant freeze all mints). This lane is dominated by the
+ * platform's no-MAC trust bound (digests verify integrity, they do
+ * not authenticate the writer).
  *
  * What a relation is NOT (P18-A boundary): minting one changes nothing
  * executable by itself — no admission gate, no scheduling effect, no

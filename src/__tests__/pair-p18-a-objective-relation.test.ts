@@ -50,6 +50,8 @@
  *   R23 strict re-proof depth — event-tail and endpoint corruption
  *       wedge strict writes too (dup mint / cycle admission / RESUME
  *       on starved edges), while semantic unproven-ness stays null.
+ *   R24 non-object payloads — 'null'/primitives with valid hashes
+ *       typed HASH_MISMATCH and isolate-skip, never a TypeError wedge.
  */
 
 import { describe, expect, it } from "vitest";
@@ -882,6 +884,40 @@ describe("P18-A — objective_relation canonical entity", () => {
     expect(code(() => s.relations.create({
       from_objective_id: a, to_objective_id: d, kind: "DEPENDS_ON", actor: OWNER })))
       .toBe("FAIL_CLOSED_EVENT_HASH_MISMATCH"); // b→c, not REL_FAB
+    s.store.close();
+  });
+
+  it("R24 non-object payloads — 'null' wedged every read before the guard", () => {
+    const s = fresh("r24");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const legit = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // 'null' parses and digests fine — before the type guard it
+    // crashed entityPage's key binding with a raw TypeError, wedging
+    // every lenient read. Now: typed HASH_MISMATCH → isolate-skip.
+    const nullHash = digest(JSON.parse("null"));
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "AAA_NULL", 1, "null", nullHash, "2026-01-01T00:00:00.000Z");
+    const got = s.relations.relationsFor(a);
+    expect(got.map((r) => String(r.relation_id))).toEqual([legit.relation_id]);
+    // get() on the same row → typed IntegrityError (not NOT_FOUND via
+    // a null return, not a TypeError).
+    try {
+      s.store.get("objective_relation", "AAA_NULL");
+      expect.unreachable("should throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(IntegrityError);
+      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    }
+    // Strict write path: 'null' row also wedges mints loudly.
+    let code = "";
+    try {
+      s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
+    expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
     s.store.close();
   });
 });
