@@ -53,6 +53,13 @@ import {
   PairControlPlane,
   PairEvidenceStore,
   ProviderCatalog,
+  CEO_CODEX_DEFAULT_MODEL,
+  CODEX_CLI_PROVIDER_ID,
+  createDefaultObjectiveOperatingService,
+  ensureCodexCliCatalog,
+  type CeoDecisionInvoker,
+  type CeoInvokeInput,
+  type CeoInvokeResult,
   ReconciliationService,
   RecoveryController,
   ReasoningBriefService,
@@ -269,6 +276,46 @@ function grantBundle(s: FullStack, oid: string, rule: Record<string, unknown>) {
     actor: OWNER, kpi_id: KPI,
     rule: { rule_type: "DELIVERABLE_BUNDLE", ...rule },
     expires_at: FUTURE, idempotency_key: `kv-${counter++}` });
+}
+
+const CEO_WAIT = JSON.stringify({
+  schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+  workstreams: null, priority_order: null,
+  wait_reason: "AWAITING_PROGRESS", summary: null });
+
+class CountingInvoker implements CeoDecisionInvoker {
+  calls = 0;
+  async invoke(input: CeoInvokeInput): Promise<CeoInvokeResult> {
+    this.calls++;
+    return { model_entry_id: input.transport.model_entry_id,
+      provider_id: input.transport.provider_id,
+      model_id: input.transport.model_id, raw_text: CEO_WAIT };
+  }
+}
+
+function qualifyCeo(store: PairEvidenceStore) {
+  const meId = ensureCodexCliCatalog(store, CEO_CODEX_DEFAULT_MODEL, "t");
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  const existing = store.tryGet("provider", pid) as Row | null;
+  store.put("provider", pid, {
+    capabilities: existing?.capabilities ?? ["text_inference"],
+    ...(existing ?? { provider_id: CODEX_CLI_PROVIDER_ID, entry_id: pid }),
+    lifecycle_state: "QUALIFIED", auth_state: "AUTH_OK",
+    health_state: "READY", conditions: [], probe_state: "PROBED",
+    provider_type: "LOCAL_CLI", protocol_family: "CODEX_CLI",
+    endpoint_reference: "codex-cli://local",
+    configured_endpoint_identity: "codex-cli://local",
+    credential_envs: [], credential_reference_name: null,
+  }, existing ? Number(existing.version) : 0);
+  new ProviderCatalog(store).issueQualificationReceipt(
+    CODEX_CLI_PROVIDER_ID, { policy_version: "t", actor: "t" });
+  new ModelEvidenceCatalog(store).recordProbeReceipt({
+    probe_id: `PRB_${counter++}`, model_entry_id: meId,
+    provider_id: CODEX_CLI_PROVIDER_ID, result: "PASS",
+    probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" }, latency_ms: 1 });
+  const q = qualifyModel(store, meId, { capability_scope: ["text_inference"], actor: "t" });
+  if (!q.qualified) throw new Error("model qualification failed");
 }
 
 /** Canonically QUALIFIED codex-cli model — mirrors p15-3's fixture. */
@@ -602,6 +649,7 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
       .toBe("UNVERIFIED");
     expect(b.confidence).toBe("LOW");
     expect(b.missing_information.some((g) => g.code === "BINDING_UNOBSERVABLE")).toBe(true);
+    expect(b.missing_information.some((g) => g.code === "WORKSTREAMS_UNOBSERVABLE")).toBe(true);
     // Terminal → zero options regardless of observation state.
     expect(b.options).toEqual([]);
     s.store.close();
@@ -624,6 +672,100 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
     const marker = b.missing_information.find((g) => g.code === "BRIEF_TRUNCATED");
     expect(marker).toBeTruthy();
     expect(marker!.detail).toContain("facts:");
+    s.store.close();
+  });
+
+  it("RB13 policy-state options cover every legal owner recovery move", async () => {
+    const { s, oid, binding } = seeded("rb13", ["a"]);
+    const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives);
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
+        max_ceo_calls: 8 },
+      idempotency_key: `cfg-rb13-${counter}`,
+    });
+    const policyVersion = () =>
+      Number(policy.statusReadOnly(oid, OWNER).policy_version);
+    const briefWithPolicy = () => {
+      const brain = new BrainContextService({
+        store: s.store, business: s.biz, workforce: s.wf,
+        objectives: s.biz.objectives, workstreams: s.workstreams,
+        artifacts: s.authority, autoPolicy: policy });
+      return new ReasoningBriefService(s.store, { brain }).briefFor(oid, OWNER);
+    };
+    const optIds = () => briefWithPolicy().options.map((o) => o.id);
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: policyVersion(), idempotency_key: `en-rb13-${counter}` });
+    expect(optIds()).toContain("WAIT");
+    expect(optIds()).not.toContain("OWNER_ENABLE_POLICY");
+
+    // Drive a REAL adaptive review to TARGET_MET_CANDIDATE while the
+    // policy is ENABLED — needed for OWNER_REVIEW_SIGNOFF +
+    // OWNER_GATE_BLOCKS_AUTONOMY coverage.
+    qualifyCeo(s.store);
+    const ops = createDefaultObjectiveOperatingService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      invoker: new CountingInvoker() });
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding!, "a");
+    s.kpiSvc.advance(oid);
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    const pending = briefWithPolicy();
+    expect(pending.facts.find((f) => f.predicate === "LATEST_REVIEW")).toBeTruthy();
+    expect(pending.options.some((o) => o.id === "OWNER_REVIEW_SIGNOFF")).toBe(true);
+    // Driver unwired → OWNER_GATE_BLOCKS_AUTONOMY must NOT claim a
+    // blocked driver exists.
+    expect(pending.hypotheses.some((h) => h.id === "OWNER_GATE_BLOCKS_AUTONOMY"))
+      .toBe(false);
+    // With a driver wired + ENABLED policy + pending review → fires.
+    const driverBrain = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: policy,
+      autoDriver: { statusReadOnly: () => ({ enabled: true }) } as never });
+    const withDriver = new ReasoningBriefService(s.store, { brain: driverBrain })
+      .briefFor(oid, OWNER);
+    expect(withDriver.hypotheses.some((h) => h.id === "OWNER_GATE_BLOCKS_AUTONOMY"))
+      .toBe(true);
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "pause",
+      policy_version: policyVersion(), idempotency_key: `pa-rb13-${counter}` });
+    expect(optIds()).toContain("OWNER_RESUME_POLICY");
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "resume",
+      policy_version: policyVersion(), idempotency_key: `re-rb13-${counter}` });
+    // Lazy EXPIRED commit via a mutating read on a stale clock.
+    const stale = new ObjectiveAutoPolicyService(
+      s.store, s.biz.objectives, () => Date.now() + 120_000);
+    stale.status(oid, OWNER);
+    expect(String(policy.statusReadOnly(oid, OWNER).state)).toBe("EXPIRED");
+    expect(optIds()).toContain("OWNER_RECONFIGURE_POLICY");
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 300_000).toISOString(),
+        max_ceo_calls: 8 },
+      policy_version: policyVersion(), idempotency_key: `cfg2-rb13-${counter}` });
+    expect(optIds()).toContain("OWNER_ENABLE_POLICY");
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: policyVersion(), idempotency_key: `en2-rb13-${counter}` });
+    policy.control({ objective_id: oid, actor: OWNER, action: "halt",
+      policy_version: policyVersion(), reason: "test halt",
+      idempotency_key: `ht-rb13-${counter}` });
+    expect(optIds()).toContain("OWNER_RESET_HALT");
+
+    policy.control({ objective_id: oid, actor: OWNER, action: "reset_halt",
+      policy_version: policyVersion(), idempotency_key: `rh-rb13-${counter}` });
+    policy.control({ objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: policyVersion(), idempotency_key: `en3-rb13-${counter}` });
+    policy.control({ objective_id: oid, actor: OWNER, action: "revoke",
+      policy_version: policyVersion(), reason: "owner revoked",
+      idempotency_key: `rv-rb13-${counter}` });
+    // REVOKED has no legal path back — no POLICY_CONTROL option.
+    expect(briefWithPolicy().options.filter((o) => o.kind === "POLICY_CONTROL"))
+      .toEqual([]);
     s.store.close();
   });
 });

@@ -653,9 +653,11 @@ export class ReasoningBriefService {
             id: "OWNER_RESUME_POLICY",
             kind: "POLICY_CONTROL",
             authority_channel: "policy-resume route",
-            rationale: "auto-policy is PAUSED — resume is the legal owner transition back to ENABLED",
+            rationale: "auto-policy is PAUSED — resume is a legal owner transition back to ENABLED (enable also reaches ENABLED and additionally rebinds terms_digest_binding)",
             rests_on: ["AUTO_POLICY"],
-            tradeoff: "resume reauthorizes bounded autonomy under the existing envelope; pausing was a deliberate hold",
+            // Gating on expiry_pending would reintroduce clock
+            // volatility into the digest — honesty lives in the text.
+            tradeoff: "resume reauthorizes bounded autonomy under the existing envelope — but if the authorization window already lapsed (expiry_pending), resume fail-closes and the completable path is disable → configure → enable",
           });
         } else if (policy.state === "EXPIRED") {
           out.push({
@@ -671,7 +673,7 @@ export class ReasoningBriefService {
             id: "OWNER_RESET_HALT",
             kind: "POLICY_CONTROL",
             authority_channel: "policy-reset_halt route",
-            rationale: "auto-policy is HALTED — reset_halt is the only legal owner transition out",
+            rationale: "auto-policy is HALTED — reset_halt is the halt-specific recovery transition that preserves the re-arm path (disable/revoke are also legal but read as abandonment)",
             rests_on: ["AUTO_POLICY"],
             tradeoff: "a halt marks a safety stop — resetting without understanding the halt reason defeats its purpose",
           });
