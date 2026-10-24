@@ -19,6 +19,12 @@
  *       lineage wedge, never silent deny OR expand.
  *   D8  owner amend on an endpoint → relation unproven → scope
  *       shrinks honestly (no cached grant).
+ *   D9  transitivity — C→M and M→F edges do NOT authorize C to F:
+ *       each hop needs its own bilateral-owner relation.
+ *   D10 index-vs-fallback parity — eligible set identical under the
+ *       built pointer index and the strict global fallback.
+ *   D11 revoke-after-pin — stamps minted earlier cannot match once the
+ *       edge is revoked (the dispatch-time eligible re-proof sees []).
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -406,6 +412,80 @@ describe("P18-D — cross-objective deliverable handoff", () => {
     } catch (e) {
       expect(e instanceof IntegrityError || e instanceof Error).toBe(true);
     }
+    ctx.store.close();
+  });
+
+  it("D9 transitivity — C→M plus M→F does NOT authorize C to F", () => {
+    const { ctx, scope, consumer, art } = fixture();
+    // Third objective F in the same business, with its own artifact.
+    const objF = ctx.biz.objectives.create({
+      business_id: scope.businessId,
+      title: "obj F", statement: "grow F",
+      kpis: [{ name: "kpi", unit: "count", baseline: 0, target: 1 }],
+      deadline: "2999-01-01T00:00:00.000Z",
+      budget_ceiling_microusd: 500_000_000,
+      hard_constraints: [], success_conditions: ["done"],
+      dedup_key: `dk-F-${seq++}`, operator_id: OP,
+    });
+    const objFId = String(objF.objective_id);
+    ctx.workstreams.decomposeObjective({
+      objective_id: objFId,
+      expected_objective_version: Number(objF.version),
+      expected_terms_version: Number(objF.terms_version),
+      expected_objective_digest: String(objF.objective_digest),
+      workstreams: [{ workstream_key: "w_far", title: "ws far", goal: "g far" }] as never,
+      actor: OP,
+    });
+    const far = openBoundMission(ctx, objFId, "w_far");
+    const artF = mkAcceptedArtifact(ctx, far.missionId,
+      `far-${seq}.md`, Buffer.from("# far bytes"));
+    // consumer→producer AND producer→F: only the direct hop authorizes.
+    depRel(ctx, scope.consumerObj, scope.producerObj);
+    depRel(ctx, scope.producerObj, objFId);
+    const ids = eligible(ctx, consumer.mission).map((s) => s.artifact_id);
+    expect(ids).toEqual([art.artifactId]);
+    expect(ids).not.toContain(artF.artifactId);
+    ctx.store.close();
+  });
+
+  it("D10 index path vs global fallback — identical eligible set", () => {
+    const { ctx, scope, consumer, art } = fixture();
+    depRel(ctx, scope.consumerObj, scope.producerObj);
+    const db = (ctx.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // create() ran ensureIndex — the marker may already report built.
+    // Force the migration complete, sample the index-path answer.
+    ctx.relations.ensureIndex();
+    const underIndex = eligible(ctx, consumer.mission).map((s) => s.artifact_id);
+    expect(underIndex).toEqual([art.artifactId]);
+    // Drop the marker → admissionView falls back to the strict global
+    // scan; the authorized scope must be IDENTICAL.
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index_state'").run();
+    const underFallback = eligible(ctx, consumer.mission).map((s) => s.artifact_id);
+    expect(underFallback).toEqual(underIndex);
+    ctx.store.close();
+  });
+
+  it("D11 revoke-after-pin — stamped source can no longer match", () => {
+    const { ctx, scope, consumer, art } = fixture();
+    const r = depRel(ctx, scope.consumerObj, scope.producerObj);
+    const list = eligible(ctx, consumer.mission);
+    expect(list.map((s) => s.artifact_id)).toEqual([art.artifactId]);
+    // Plan-time pin: stamps + assert bound.
+    const tasks = [{
+      task_key: "TC1", title: "verify", task_instruction: `read ${art.name}`,
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    }];
+    const out = reconcilePlanDataflow(tasks, { external_input_artifacts: list }).tasks;
+    assertPlanDataflow(out, { external_input_artifacts: list });
+    // REVOKE after the pin — the canonical eligible re-proof that
+    // assertCrossMissionEligibleNow performs at every byte boundary now
+    // sees ZERO sources: the pinned artifact can never be served.
+    ctx.relations.control({ relation_id: r.relation_id, action: "REVOKE", actor: OWNER });
+    const after = eligible(ctx, consumer.mission);
+    expect(after).toHaveLength(0);
+    expect(
+      after.find((s) => String(s.artifact_id) === art.artifactId),
+    ).toBeUndefined();
     ctx.store.close();
   });
 
