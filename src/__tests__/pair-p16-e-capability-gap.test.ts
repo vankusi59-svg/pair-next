@@ -25,6 +25,19 @@
  *       projects — SUBSCRIPTION_UNVERIFIED mid-pass → OPEN gap.
  *  G13  capabilityGaps unwired → driver works unchanged; the status
  *       field is null, never fabricated.
+ *  G14  R1: forged prev row is NEVER laundered — recordGap overwrites a
+ *       digest-invalid row with an honest fresh mint (occurrences reset,
+ *       forged evidence discarded, forged digest kept in prior_digest).
+ *  G15  R1: digest-RECOMPUTED state flip → event-chain cross-check still
+ *       exposes it — UNVERIFIED on read, untouchable by resolveGap.
+ *  G16  R1: cross-objective row substitution → UNVERIFIED (identity
+ *       binding: entity_id AND objective_id must match the query).
+ *  G17  R1: a hostile/failing gapFor seam impl degrades the driver
+ *       status read to the UNVERIFIED marker — never a 500.
+ *  G18  R1: raw payload corruption → gapFor UNVERIFIED, never throws;
+ *       NaN-poisoned prev can't wedge recordGap.
+ *  G19  R1: untyped mid-pass fault → DRIVER_PASS_FAULT gap (EXECUTION)
+ *       — the advisory is not blind to execution-layer breakage.
  */
 
 import { describe, it, expect } from "vitest";
@@ -407,5 +420,162 @@ describe("P16-E — capability-gap advisory projection", () => {
     const st = driver.statusReadOnly(s.oid, OWNER);
     expect(st.capability_gap).toBeNull();
     expect(gapRows(s)).toHaveLength(0); // nothing persisted without the seam
+  });
+
+  /** Forge a row that is internally digest-consistent but not minted by
+   *  the service — the projection replicated so the stale-digest layer
+   *  is bypassed and only deeper checks can catch it. */
+  function forgedRow(over: Record<string, unknown>, version = 0) {
+    const r: Record<string, unknown> = {
+      entity_type: CAP_GAP_ENTITY,
+      entity_id: "cap-gap:OBJ1",
+      schema_version: "pair.os.vnext.objective-capability-gap.v1",
+      objective_id: "OBJ1",
+      state: "OPEN",
+      label: "DRIVER_COST_HALTED",
+      gap_kind: "COST_CONTROL",
+      permanence: "transient",
+      owner_action: "OWNER_RESUME_COST_SPEND",
+      evidence: [{ at: "x", label: "DRIVER_COST_HALTED", fence: 1 }],
+      occurrences: 1,
+      opened_at: "x", resolved_at: null, updated_at: "x",
+      version,
+      ...over,
+    };
+    r.digest = digest({
+      schema: r.schema_version,
+      entity_id: r.entity_id,
+      objective_id: r.objective_id,
+      state: r.state,
+      label: r.label,
+      gap_kind: r.gap_kind,
+      permanence: r.permanence,
+      owner_action: r.owner_action,
+      evidence: r.evidence,
+      occurrences: r.occurrences,
+      opened_at: r.opened_at,
+      resolved_at: r.resolved_at,
+    });
+    return r;
+  }
+
+  it("G14 forged prev is overwritten — never laundered into canonical", () => {
+    const { store, svc } = rawGapStore();
+    const forged = forgedRow({
+      occurrences: 9000,
+      evidence: [{ at: "x", label: "DRIVER_PASS_FAULT", fence: -1,
+        planted: "forged-entry" }],
+    });
+    forged.digest = "stale-on-purpose"; // the weakest forger — no event, bad digest
+    store.put(CAP_GAP_ENTITY, "cap-gap:OBJ1", forged, 0);
+    expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED");
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
+      transient: false, fence: 9 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    expect(row.state).toBe("OPEN");
+    expect(row.occurrences).toBe(1); // forged count discarded, not extended
+    expect((row.evidence as Array<Record<string, unknown>>)).toHaveLength(1);
+    expect((row.evidence as Array<Record<string, unknown>>)[0]!.fence).toBe(9);
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("OPEN");
+    expect(g.occurrences).toBe(1);
+    const evs = (store.listEvents(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Array<Record<string, unknown>>)
+      .filter((e) => e.event_type === CAP_GAP_OPENED_EVENT);
+    expect((evs[0]!.metadata as Record<string, unknown>).prior_digest)
+      .toBe("stale-on-purpose"); // forensic trail preserved
+  });
+
+  it("G15 digest-recomputed state flip → event chain still exposes it", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
+      transient: false, fence: 1 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    // A store-level rewrite that recomputes BOTH hashes — the strongest
+    // forger short of writing events.
+    const forged = forgedRow({
+      state: "RESOLVED", resolved_at: "forged",
+      label: "DRIVER_AUTHORITY_LOST", gap_kind: "AUTHORITY",
+      permanence: "permanent", owner_action: "OWNER_RECHECK_OBJECTIVE_POLICY",
+      evidence: row.evidence, occurrences: row.occurrences,
+      opened_at: row.opened_at,
+    }, Number(row.version));
+    store.put(CAP_GAP_ENTITY, "cap-gap:OBJ1", forged, Number(row.version));
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("UNVERIFIED"); // last lifecycle event is OPENED — contradiction
+    expect(g.reason).toBe("FAIL_CLOSED_CAPABILITY_GAP_TAMPERED");
+    // And a resolve attempt cannot launder the forged RESOLVED further.
+    const before = (store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>).version;
+    svc.resolveGap("OBJ1");
+    expect((store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>).version)
+      .toBe(before);
+  });
+
+  it("G16 cross-objective row substitution → UNVERIFIED", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ_A", label: "DRIVER_CAP_EXHAUSTED",
+      transient: false, fence: 1 });
+    const a = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ_A") as Record<string, unknown>;
+    // Copy A's payload under B's key — internally consistent, wrong identity.
+    store.put(CAP_GAP_ENTITY, "cap-gap:OBJ_B", { ...a, version: 0 }, 0);
+    const g = svc.gapFor("OBJ_B")!;
+    expect(g.state).toBe("UNVERIFIED");
+    expect(g.label).toBeUndefined(); // A's gap never surfaces under B
+  });
+
+  it("G17 hostile gapFor seam impl → UNVERIFIED marker, never a 500", async () => {
+    const s = freshSvc("g17");
+    enable(s);
+    const hostile = new ObjectiveAutoDriverService({
+      store: s.store, objectives: s.objectives, policy: s.policy,
+      scheduler: s.scheduler,
+      runPass: async (input: { objective_id: string }) =>
+        ({ outcome: "WAITING", objective_id: input.objective_id }) as never,
+      executors: ["CODEX"],
+      billingFor: () => ({ mode: "SUBSCRIPTION",
+        profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }),
+      costHaltActive: () => false,
+      workerId: "p16e-w", bootId: "p16e-b", now: s.now, heartbeatMs: 60_000,
+      capabilityGaps: {
+        gapFor: () => { throw new Error("hostile impl"); },
+        recordGap: () => { throw new Error("hostile impl"); },
+        resolveGap: () => { throw new Error("hostile impl"); },
+      },
+    });
+    const st = hostile.statusReadOnly(s.oid, OWNER); // must not throw
+    const gap = st.capability_gap as Record<string, unknown>;
+    expect(gap.state).toBe("UNVERIFIED");
+  });
+
+  it("G18 raw corruption → UNVERIFIED marker; poisoned prev can't wedge", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    // Raw storage corruption — payload hash no longer matches.
+    (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } })
+      .db.prepare("UPDATE entities SET payload='{corrupt' WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
+    const g = svc.gapFor("OBJ1")!; // must not throw
+    expect(g.state).toBe("UNVERIFIED");
+    // NaN-poisoned occurrences — the old code threw NON_FINITE forever.
+    const poisoned = forgedRow({ occurrences: "bogus" });
+    store.put(CAP_GAP_ENTITY, "cap-gap:OBJ2", poisoned, 0);
+    svc.recordGap({ objective_id: "OBJ2", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 }); // must recover, not throw
+    expect(svc.gapFor("OBJ2")!.state).toBe("OPEN");
+  });
+
+  it("G19 untyped mid-pass fault → DRIVER_PASS_FAULT gap", async () => {
+    const s = freshSvc("g19");
+    enable(s);
+    const driver = mkDriver(s, async () => { throw new Error("planner exploded"); });
+    const out = await driver.tick();
+    expect(out.driven[0]!.outcome).toBe("FAULT");
+    const gap = s.gaps.gapFor(s.oid)!;
+    expect(gap.state).toBe("OPEN");
+    expect(gap.label).toBe("DRIVER_PASS_FAULT");
+    expect(gap.gap_kind).toBe("EXECUTION");
+    expect(gap.permanence).toBe("transient");
+    expect(gap.owner_action).toBe("OWNER_INSPECT_PASS_FAULT");
   });
 });

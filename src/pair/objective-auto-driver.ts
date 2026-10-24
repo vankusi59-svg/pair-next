@@ -46,7 +46,7 @@
 
 import { utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
-import { DriverDenial } from "./objective-driver-fault.js";
+import { DriverDenial, type DriverFaultLabel } from "./objective-driver-fault.js";
 import type { ObjectiveCapabilityGapService } from "./objective-capability-gap.js";
 import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -401,7 +401,7 @@ export class ObjectiveAutoDriverService {
         last_fence: st?.last_fence ?? null,
         admissions: (st?.admissions as unknown[])?.slice(-8) ?? [],
         denials: (st?.denials as unknown[])?.slice(-8) ?? [],
-        capability_gap: this.deps.capabilityGaps?.gapFor(objectiveId) ?? null,
+        capability_gap: this.gapForStatus(objectiveId),
         lease: lease
           ? { state: lease.state, fence: lease.fence, expires_at: lease.expires_at }
           : null,
@@ -427,7 +427,7 @@ export class ObjectiveAutoDriverService {
         last_fence: st?.last_fence ?? null,
         admissions: (st?.admissions as unknown[])?.slice(-8) ?? [],
         denials: (st?.denials as unknown[])?.slice(-8) ?? [],
-        capability_gap: this.deps.capabilityGaps?.gapFor(objectiveId) ?? null,
+        capability_gap: this.gapForStatus(objectiveId),
         lease: lease
           ? { state: lease.state, fence: lease.fence, expires_at: lease.expires_at }
           : null,
@@ -824,7 +824,11 @@ export class ObjectiveAutoDriverService {
         return { objective_id: objectiveId, denied: e.label, transient: e.transient };
       }
       // Unexpected admission fault — release into bounded retry, never
-      // quarantine an unproven failure.
+      // quarantine an unproven failure. The driver itself classifies it
+      // DRIVER_PASS_FAULT — project it so the advisory is not blind to
+      // genuine execution-layer breakage.
+      this.noteGap(objectiveId, { label: "DRIVER_PASS_FAULT", transient: true },
+        handle.fence);
       this.tryRelease(handle, opId);
       return { objective_id: objectiveId, denied: "DRIVER_PASS_FAULT",
         transient: true, fault: faultCode(e) };
@@ -861,6 +865,11 @@ export class ObjectiveAutoDriverService {
       if (e instanceof DriverDenial) {
         this.noteGap(objectiveId, e, handle.fence);
         if (!e.transient) this.tryQuarantine(objectiveId, e.label);
+      } else {
+        // Untyped mid-pass fault — the durable state row already labels
+        // it PASS_FAULT; project the same closed vocabulary into the gap.
+        this.noteGap(objectiveId, { label: "DRIVER_PASS_FAULT", transient: true },
+          handle.fence);
       }
       this.tryRelease(handle, opId);
       return {
@@ -919,14 +928,34 @@ export class ObjectiveAutoDriverService {
   /** Mid-pass DriverDenials never reach recordDenial (the admit catch
    *  owns it) but carry the same closed-vocabulary fault — the gap
    *  projection must see them or a mid-pass AUTHORITY_LOST would leave
-   *  the advisory surface blind to the real blocker. */
-  private noteGap(objectiveId: string, e: DriverDenial, fence: number): void {
+   *  the advisory surface blind to the real blocker. The unexpected-
+   *  fault paths also report through here as DRIVER_PASS_FAULT — the
+   *  same label the driver's own denial/result strings already use, so
+   *  the advisory covers every path the driver itself classifies. */
+  private noteGap(objectiveId: string,
+    e: { label: DriverFaultLabel; transient: boolean }, fence: number): void {
     try {
       this.deps.capabilityGaps?.recordGap({
         objective_id: objectiveId, label: e.label,
         transient: e.transient, fence,
       });
     } catch { /* advisory only — never mask the fault */ }
+  }
+
+  /** Status-read seam: gapFor must never throw into the owner status
+   *  read — a hostile or failing seam impl degrades to the same
+   *  UNVERIFIED marker the service itself uses, never a 500, never
+   *  fabricated data. */
+  private gapForStatus(objectiveId: string): Record<string, unknown> | null {
+    try {
+      return this.deps.capabilityGaps?.gapFor(objectiveId) ?? null;
+    } catch {
+      return {
+        state: "UNVERIFIED",
+        reason: "FAIL_CLOSED_CAPABILITY_GAP_TAMPERED",
+        objective_id: objectiveId,
+      };
+    }
   }
 
   private tryRelease(handle: LeaseHandle, opId: string): void {
