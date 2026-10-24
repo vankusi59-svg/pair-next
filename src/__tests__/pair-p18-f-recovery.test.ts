@@ -6,9 +6,9 @@
  * ACTIVE SUPERSEDES edges only). The requirement is satisfied iff ANY
  * objective reachable from the upstream — itself included — is
  * ACHIEVED. Every step uses the same STRICT seam: corrupt rows wedge,
- * forged/revoked/suspended edges never unlock. Cycles, ambiguous
- * branching and over-cap walks stay gated — owner-authored states fail
- * contained, never wedge the scheduler scan.
+ * forged/revoked/suspended edges never unlock. Cycles, over-cap
+ * neighborhoods and mid-walk budget exhaustion stay gated — transient
+ * and owner-authored states fail contained, never wedge the scan.
  *
  *   F1  baseline — failed upstream with no superseder still gates.
  *   F2  declared-but-undelivered replacement keeps the gate.
