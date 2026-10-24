@@ -1803,14 +1803,18 @@ export function createMissionControlServer(
           objectives: biz.objectives,
           relations: new ObjectiveRelationService(deps.store),
         });
-        // Bounded like the scheduler's read paths: a pathological
-        // store trips the budget loudly instead of hanging the route.
-        const portfolioBid = m[1]!;
-        const portfolio = deps.store.withReadBudget(
-          { entities: 1024, events: 512 },
-          () => portfolioSvc!.businessPortfolio(portfolioBid, portfolioActor),
-        );
-        return void json(res, 200, { portfolio });
+        // No read-budget wrap — deliberately identical availability
+        // bounds to /company, whose scope proof makes the same org-wide
+        // strict enumeration. The scheduler's {1024,512} budget is
+        // calibrated for per-objective reads in autonomous loops; here
+        // it would trip at a fraction of the intended bound (org-wide
+        // multiplicative charging) with no matching safety gain —
+        // every loop in this projection is progression-bounded and a
+        // corrupt row already fails closed loudly, so work is O(org
+        // size), never pathological.
+        return void json(res, 200, {
+          portfolio: portfolioSvc.businessPortfolio(m[1]!, portfolioActor),
+        });
       }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;

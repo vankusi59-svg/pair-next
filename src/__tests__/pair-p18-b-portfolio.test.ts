@@ -22,14 +22,17 @@
  *       objectives by (created_at, id).
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   ApprovalQueue,
   ArtifactAuthority,
   BusinessLayer,
+  createMissionControlServer,
   ExecutorRegistry,
   GovernedTaskGate,
   MissionControl,
@@ -62,6 +65,7 @@ type Stack = {
   dir: string;
   store: PairEvidenceStore;
   biz: BusinessLayer;
+  wf: WorkforceService;
   projectId: string;
   relations: ObjectiveRelationService;
   portfolio: ObjectivePortfolioService;
@@ -96,7 +100,8 @@ function fresh(name: string): Stack {
     planExpander: async (input) => ({ input, planner: { planner_run_id: "P", attempts: [], winner: { attempt_no: 1 } } }) });
   const project = service.createProject({ name: "p", root_location: workspace });
   const relations = new ObjectiveRelationService(store);
-  return { dir, store, biz, projectId: String(project.project_id), relations,
+  return { dir, store, biz, wf: new WorkforceService({ store, business: biz }),
+    projectId: String(project.project_id), relations,
     portfolio: new ObjectivePortfolioService({
       store, objectives: biz.objectives, relations }) };
 }
@@ -168,16 +173,16 @@ describe("P18-B — business portfolio projection", () => {
     const pa = byOid(v, a), pb = byOid(v, b);
     expect(pa.depends_on).toHaveLength(1);
     expect(pa.depends_on[0]!.relation_id).toBe(r.relation_id);
-    expect(pa.depends_on[0]!.objective_id).toBe(b);
+    expect(pa.depends_on[0]!.counterparty_objective_id).toBe(b);
     expect(pa.depends_on[0]!.satisfaction).toBe("PENDING");
     expect(pa.dependency.blocked).toBe(true);
     expect(pa.dependency.upstream_pending).toBe(1);
     // The upstream side sees its dependents.
     expect(pb.dependents).toHaveLength(1);
-    expect(pb.dependents[0]!.objective_id).toBe(a);
+    expect(pb.dependents[0]!.counterparty_objective_id).toBe(a);
     expect(pb.dependency.blocked).toBe(false);
     expect(v.edges.map((e) => String(e.relation_id))).toEqual([r.relation_id]);
-    expect(v.counts.objectives_blocked).toBe(1);
+    expect(v.counts.objectives_dependency_blocked).toBe(1);
     s.store.close();
   });
 
@@ -203,7 +208,7 @@ describe("P18-B — business portfolio projection", () => {
     s.relations.control({ relation_id: rAD.relation_id, action: "SUSPEND", actor: OWNER });
     const v = view(s, bid);
     const pa = byOid(v, a);
-    const sat = new Map(pa.depends_on.map((x) => [String(x.objective_id), String(x.satisfaction)]));
+    const sat = new Map(pa.depends_on.map((x) => [String(x.counterparty_objective_id), String(x.satisfaction)]));
     expect(sat.get(b)).toBe("SATISFIED");
     expect(sat.get(c)).toBe("FAILED");
     expect(sat.get(d)).toBe("SUSPENDED");
@@ -214,7 +219,7 @@ describe("P18-B — business portfolio projection", () => {
     s.relations.control({ relation_id: rAC.relation_id, action: "REVOKE", actor: OWNER });
     const v2 = view(s, bid);
     const pa2 = byOid(v2, a);
-    const sat2 = new Map(pa2.depends_on.map((x) => [String(x.objective_id), String(x.satisfaction)]));
+    const sat2 = new Map(pa2.depends_on.map((x) => [String(x.counterparty_objective_id), String(x.satisfaction)]));
     expect(sat2.get(c)).toBe("REVOKED");
     expect(pa2.dependency.blocked).toBe(false);
     expect(pa2.dependency.upstream_active).toBe(1);
@@ -236,14 +241,14 @@ describe("P18-B — business portfolio projection", () => {
     const v = view(s, bid);
     const pa = byOid(v, a), pb = byOid(v, b), pc = byOid(v, c);
     // CONFLICTS visible and counted symmetrically.
-    expect(pa.conflicts.map((x) => String(x.objective_id))).toEqual([b]);
-    expect(pb.conflicts.map((x) => String(x.objective_id))).toEqual([a]);
+    expect(pa.conflicts.map((x) => String(x.counterparty_objective_id))).toEqual([b]);
+    expect(pb.conflicts.map((x) => String(x.counterparty_objective_id))).toEqual([a]);
     expect(pa.active_conflicts).toBe(1);
     expect(pb.active_conflicts).toBe(1);
     expect(pa.conflicts[0]!.relation_id).toBe(rc.relation_id);
     // SUPERSEDES: c supersedes a.
-    expect(pc.supersedes.map((x) => String(x.objective_id))).toEqual([a]);
-    expect(pa.superseded_by.map((x) => String(x.objective_id))).toEqual([c]);
+    expect(pc.supersedes.map((x) => String(x.counterparty_objective_id))).toEqual([a]);
+    expect(pa.superseded_by.map((x) => String(x.counterparty_objective_id))).toEqual([c]);
     expect(pb.supersedes).toHaveLength(0);
     expect(v.counts.relations_by_kind.CONFLICTS).toBe(1);
     expect(v.counts.relations_by_kind.SUPERSEDES).toBe(1);
@@ -321,7 +326,7 @@ describe("P18-B — business portfolio projection", () => {
     const v = view(s, bid);
     expect(v.counts.objectives_owned).toBe(3);
     expect(v.counts.objectives_returned).toBe(3);
-    expect(v.counts.objectives_blocked).toBe(1); // a's upstream pending
+    expect(v.counts.objectives_dependency_blocked).toBe(1); // a's upstream pending
     expect(v.counts.relations_total).toBe(2);
     expect(v.counts.relations_by_kind.DEPENDS_ON).toBe(1);
     expect(v.counts.relations_by_kind.CONFLICTS).toBe(1);
@@ -349,6 +354,67 @@ describe("P18-B — business portfolio projection", () => {
     expect(ids).toEqual([...ids].sort());
     // Two identical reads produce byte-identical projections.
     expect(JSON.stringify(view(s, bid))).toBe(JSON.stringify(v));
+    s.store.close();
+  });
+
+  it("B9 route — owner 200 envelope, non-owner 403 code-only, operator-less 403", async () => {
+    const s = fresh("b9");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const server: Server = createMissionControlServer({
+      business: s.biz, store: s.store, workforce: s.wf, authToken: "tok-b9" });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const hdr = (op?: string) => ({
+      authorization: "Bearer tok-b9",
+      ...(op ? { "x-operator-id": op } : {}),
+    });
+    try {
+      const ok = await fetch(`http://127.0.0.1:${port}/api/vnext/businesses/${bid}/portfolio`,
+        { headers: hdr(OP) });
+      expect(ok.status).toBe(200);
+      const body = (await ok.json()) as { portfolio: { objectives: Row[]; edges: Row[] } };
+      expect(body.portfolio.objectives).toHaveLength(2);
+      expect(body.portfolio.edges).toHaveLength(1);
+      // Non-owner: code-only 403 — no scope internals in the response.
+      const deny = await fetch(`http://127.0.0.1:${port}/api/vnext/businesses/${bid}/portfolio`,
+        { headers: hdr("intruder") });
+      expect(deny.status).toBe(403);
+      const denyBody = (await deny.json()) as Row;
+      expect(denyBody.error).toBe("FAIL_CLOSED_PORTFOLIO_SCOPE");
+      expect(denyBody.detail).toBeUndefined();
+      // Operator-less: the header is the only authority source.
+      const noOp = await fetch(`http://127.0.0.1:${port}/api/vnext/businesses/${bid}/portfolio`,
+        { headers: hdr() });
+      expect(noOp.status).toBe(403);
+      expect(String(((await noOp.json()) as Row).error))
+        .toBe("FAIL_CLOSED_OPERATOR_ID_REQUIRED");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+      s.store.close();
+    }
+  });
+
+  it("B10 truncation — 205 owned: page 200, counts over the full set", () => {
+    const s = fresh("b10");
+    const bid = mkBusiness(s);
+    const ids: string[] = [];
+    for (let i = 0; i < 205; i++) ids.push(objId(mkObjective(s, bid)));
+    // Block the LAST-created objective — almost certainly beyond the
+    // 200-objective display page; its block must still count.
+    const last = ids[ids.length - 1]!;
+    const up = ids[ids.length - 2]!;
+    s.relations.create({
+      from_objective_id: last, to_objective_id: up, kind: "DEPENDS_ON", actor: OWNER });
+    const v = view(s, bid);
+    expect(v.counts.objectives_owned).toBe(205);
+    expect(v.counts.objectives_returned).toBe(200);
+    expect(v.objectives_truncated).toBe(true);
+    expect(v.counts.objectives_dependency_blocked).toBe(1);
+    expect(v.counts.relations_total).toBe(1);
     s.store.close();
   });
 });

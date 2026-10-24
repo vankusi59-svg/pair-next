@@ -14,6 +14,8 @@ const GLOSS: Record<string, string> = {
     "A stored record's identity does not match its canonical key.",
   FAIL_CLOSED_PORTFOLIO_SCOPE:
     "You don't have owner authority over any objective in this business.",
+  PORTFOLIO_DISABLED:
+    "The business portfolio requires the business layer and a canonical store — unavailable in this deployment.",
   FAIL_CLOSED_COCKPIT_PROOF:
     "Required canonical proof failed; claims are shown as unverified.",
   OBJECTIVE_TERMINAL: "The objective already reached a final state.",

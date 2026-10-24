@@ -32,6 +32,14 @@
  *    be satisfied without owner action (revoke / supersede);
  *  - state SUSPENDED / REVOKED render as their state — only ACTIVE
  *    edges derive blocked.
+ *
+ * Consistency bound: the read is not transactional — the strict
+ * objective enumeration and the relation re-proof are two snapshots.
+ * An owner amendment landing between them can render an objective the
+ * actor no longer owns (stale render of owner-authored data only): an
+ * EDGE can never leak through it, because proven relations require
+ * created_by === CURRENT owner of both endpoints at relation-read
+ * time. The same mixed-snapshot bound exists on the company cockpit.
  */
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -143,7 +151,7 @@ export class ObjectivePortfolioService {
       extra?: Record<string, unknown>,
     ): Record<string, unknown> => ({
       relation_id: r.relation_id,
-      objective_id: counterparty,
+      counterparty_objective_id: counterparty,
       state: r.state,
       ...extra,
     });
@@ -234,7 +242,7 @@ export class ObjectivePortfolioService {
       counts: {
         objectives_owned: ownedStrict.length,
         objectives_returned: summaries.length,
-        objectives_blocked: ownedStrict
+        objectives_dependency_blocked: ownedStrict
           .filter((o) => {
             const oid = String(o.objective_id);
             return (dependsOn.get(oid) ?? []).some((r) => {
