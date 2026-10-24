@@ -407,3 +407,98 @@ describe("P15.3W G — wiring fail-closed proofs", () => {
     s.store.close();
   });
 });
+
+/** Seed an arbitrary codex-cli model through the same canonical seam
+ *  seedDefaultCeoModel uses (catalog + provider qualify + probe receipt
+ *  + qualifyModel). */
+function seedQualifiedCeoModel(store: PairEvidenceStore, modelId: string): string {
+  const meId = ensureCodexCliCatalog(store, modelId, "t");
+  qualifyCodexProvider(store);
+  const mcat = new ModelEvidenceCatalog(store);
+  mcat.recordProbeReceipt({
+    probe_id: `PRB_ceo_env_${counter}`,
+    model_entry_id: meId,
+    provider_id: CODEX_CLI_PROVIDER_ID,
+    result: "PASS",
+    probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" },
+    latency_ms: 1,
+  });
+  const q = qualifyModel(store, meId, { capability_scope: ["text_inference"], actor: "t" });
+  if (!q.qualified) throw new Error(`model qualification failed: ${JSON.stringify(q.gates)}`);
+  return meId;
+}
+
+describe("P15.3W G-env — PAIR_CEO_MODEL operator override", () => {
+  const ENV = "PAIR_CEO_MODEL";
+  let saved: string | undefined;
+  function withEnv<T>(value: string | undefined, fn: () => T): T {
+    saved = process.env[ENV];
+    if (value === undefined) delete process.env[ENV];
+    else process.env[ENV] = value;
+    try { return fn(); }
+    finally {
+      if (saved === undefined) delete process.env[ENV];
+      else process.env[ENV] = saved;
+    }
+  }
+
+  it("env override resolves the configured codex-cli model entry", () => {
+    const s = freshStack("env1");
+    withEnv("gpt-5.6-sol", () => {
+      const me = seedQualifiedCeoModel(s.store, "gpt-5.6-sol");
+      const rt = createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: new FakeInvoker(decisionJson()),
+      });
+      expect(rt.model_entry_id).toBe(me);
+    });
+    s.store.close();
+  });
+
+  it("override beats the default even when both models are cataloged", () => {
+    const s = freshStack("env2");
+    withEnv("gpt-5.6-sol", () => {
+      const def = seedDefaultCeoModel(s.store);
+      const alt = seedQualifiedCeoModel(s.store, "gpt-5.6-sol");
+      const rt = createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: new FakeInvoker(decisionJson()),
+      });
+      expect(rt.model_entry_id).toBe(alt);
+      expect(rt.model_entry_id).not.toBe(def);
+    });
+    s.store.close();
+  });
+
+  it("override naming an uncataloged model fails closed with its own name", () => {
+    const s = freshStack("env3");
+    withEnv("gpt-9.9-nope", () => {
+      seedDefaultCeoModel(s.store); // default present — override must not fall back
+      expect(() => createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: new FakeInvoker(decisionJson()),
+      })).toThrowError(/FAIL_CLOSED_CEO_MODEL_UNRESOLVED.*gpt-9\.9-nope/);
+    });
+    s.store.close();
+  });
+
+  it("malformed env value fails closed FAIL_CLOSED_CEO_MODEL_CONFIG", () => {
+    const s = freshStack("env4");
+    withEnv("bad model with spaces", () => {
+      expect(() => createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: new FakeInvoker(decisionJson()),
+      })).toThrowError(/FAIL_CLOSED_CEO_MODEL_CONFIG/);
+    });
+    s.store.close();
+  });
+
+  it("unset/empty env keeps the default resolution unchanged", () => {
+    const s = freshStack("env5");
+    withEnv("   ", () => {
+      const me = seedDefaultCeoModel(s.store);
+      const rt = createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: new FakeInvoker(decisionJson()),
+      });
+      expect(rt.model_entry_id).toBe(me);
+    });
+    s.store.close();
+  });
+});
