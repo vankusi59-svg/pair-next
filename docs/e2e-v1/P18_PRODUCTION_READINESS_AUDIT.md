@@ -25,7 +25,7 @@ Sub-agent `b1ff8a87` (codex-reviewer, non-implementer) audited the repair diff a
 
 ## Production-readiness classification
 
-**Pending independent-audit verdict.** Gate evidence supports `P18_CONDITIONAL_PASS_WITH_GAPS` at minimum; `P18_PRODUCTION_READINESS_PASS` requires auditor VERIFIED with no unresolved HIGH/CRITICAL.
+**`P18_CONDITIONAL_PASS_WITH_GAPS`** — independent audit returned **SHIP** with zero HIGH/CRITICAL findings and hash-verified authentic evidence, satisfying the audit precondition. The conditional (not full PASS) classification reflects documented product gaps in `P18_REMAINING_GAPS.md`: P18 substrate (relations, duties) has no owner-facing HTTP/UI surface — authority exists but is operator-invisible; agnes qualification is liveness-based (QUALIFIED ≠ invocable); Mission Control UI lacks first-class scheduler/driver/admission visualizations. All seven gates passed on live evidence; none of the gaps weakens a canonical-authority, security, or fail-closed invariant.
 
 ## Method notes / limitations (honest)
 
