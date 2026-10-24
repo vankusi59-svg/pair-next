@@ -47,6 +47,9 @@
  *   R22 taxonomy + dedup_key validation — unparseable payload on the
  *       control path throws IntegrityError (not SyntaxError); non-
  *       string/oversized dedup_key rejected at mint.
+ *   R23 strict re-proof depth — event-tail and endpoint corruption
+ *       wedge strict writes too (dup mint / cycle admission / RESUME
+ *       on starved edges), while semantic unproven-ness stays null.
  */
 
 import { describe, expect, it } from "vitest";
@@ -786,6 +789,99 @@ describe("P18-A — objective_relation canonical entity", () => {
     expect((db.prepare(
       "SELECT COUNT(*) n FROM entities WHERE entity_type='objective_relation'")
       .get() as { n: number }).n).toBe(1);
+    s.store.close();
+  });
+
+  it("R23 strict depth — event/endpoint corruption wedges writes; semantic unproven stays null", () => {
+    const s = fresh("r23");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    const d = objId(mkObjective(s, bid));
+    const rAB = s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const rBC = s.relations.create({ from_objective_id: b, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    const rCD = s.relations.create({ from_objective_id: c, to_objective_id: d, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const count = () => (db.prepare(
+      "SELECT COUNT(*) n FROM entities WHERE entity_type='objective_relation'").get() as { n: number }).n;
+    const code = (fn: () => unknown) => {
+      try { fn(); return ""; } catch (e) {
+        return e instanceof IntegrityError ? e.code : "?";
+      }
+    };
+    const corruptEvent = (relId: string) => db.prepare(
+      "UPDATE events SET event_hash=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run("0".repeat(64), relId);
+    const repairEvent = (relId: string) => {
+      const ev = db.prepare(
+        "SELECT * FROM events WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(relId) as Row;
+      const meta = ev.metadata_json ? JSON.parse(String(ev.metadata_json)) : null;
+      const body = {
+        event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+        event_type: ev.event_type, old_state: ev.old_state, new_state: ev.new_state,
+        actor: ev.actor, correlation_id: ev.correlation_id, metadata: meta,
+        created_at: ev.created_at,
+      };
+      db.prepare("UPDATE events SET event_hash=? WHERE event_id=?")
+        .run(digest(body), ev.event_id);
+    };
+    // 1) Corrupt a→b's event tail (hash only — row itself is clean):
+    //    replay must wedge, not silently dedup-miss into a second row.
+    corruptEvent(rAB.relation_id);
+    expect(code(() => s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER })))
+      .toBe("FAIL_CLOSED_EVENT_HASH_MISMATCH");
+    expect(count()).toBe(3);
+    // Reads stay lenient — the event-corrupt row skips, others serve.
+    expect(s.relations.upstreamOf(c)).toEqual([d]);
+    // 2) Corrupt b→c's event too: the d→a cycle check must not walk
+    //    starved edges (a→b→c→d all real) — wedge, not admit.
+    corruptEvent(rBC.relation_id);
+    expect(code(() => s.relations.create({
+      from_objective_id: d, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER })))
+      .toBe("FAIL_CLOSED_EVENT_HASH_MISMATCH");
+    expect(count()).toBe(3);
+    // 3) Repair the events, then corrupt objective c's payload — every
+    //    relation touching c becomes unprovable; strict writes wedge
+    //    on the tampering (ENTITY, not EVENT, mismatch code).
+    repairEvent(rAB.relation_id); repairEvent(rBC.relation_id);
+    const objPayload = (db.prepare(
+      "SELECT payload FROM entities WHERE entity_type='objective' AND entity_id=?")
+      .get(c) as { payload: string }).payload;
+    db.prepare("UPDATE entities SET payload=? WHERE entity_type='objective' AND entity_id=?")
+      .run(objPayload.replace('"title"', '"xtitle"'), c);
+    expect(code(() => s.relations.create({
+      from_objective_id: a, to_objective_id: d, kind: "CONFLICTS", actor: OWNER })))
+      .toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    expect(count()).toBe(3);
+    // 4) Repair the objective; RESUME on c→d must also wedge — this
+    //    time corrupt b→c's event again to starve the strict edge set.
+    db.prepare("UPDATE entities SET payload=? WHERE entity_type='objective' AND entity_id=?")
+      .run(objPayload, c);
+    corruptEvent(rBC.relation_id);
+    s.relations.control({ relation_id: rCD.relation_id, action: "SUSPEND", actor: OWNER });
+    expect(code(() => s.relations.control({
+      relation_id: rCD.relation_id, action: "RESUME", actor: OWNER })))
+      .toBe("FAIL_CLOSED_EVENT_HASH_MISMATCH");
+    // 5) Semantic unproven-ness must NOT wedge: a fabricated row with
+    //    a valid digest but no events is skipped under strict too —
+    //    fabrications can't DoS mints (wedge still comes from b→c).
+    const fab: Row = {
+      relation_id: "REL_FAB", entity_id: "REL_FAB", entity_type: "objective_relation",
+      version: 1, schema: "pair.os.vnext.objective-relation.v1",
+      business_id: bid, from_objective_id: a, to_objective_id: d,
+      kind: "DEPENDS_ON", state: "ACTIVE", note: null, created_by: OWNER,
+      dedup_key: "x", created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z", relation_digest: "",
+    };
+    fab.relation_digest = relationDigest(fab);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_FAB", 1, JSON.stringify(fab), digest(fab), fab.created_at);
+    expect(code(() => s.relations.create({
+      from_objective_id: a, to_objective_id: d, kind: "DEPENDS_ON", actor: OWNER })))
+      .toBe("FAIL_CLOSED_EVENT_HASH_MISMATCH"); // b→c, not REL_FAB
     s.store.close();
   });
 });

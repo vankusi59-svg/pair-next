@@ -55,7 +55,7 @@
  */
 
 import { digest, newId, utcnow } from "./canonical.js";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, PairError } from "./errors.js";
 import {
   assertOwnerAuthorityRef,
   ObjectiveAuthorityService,
@@ -153,12 +153,30 @@ export class ObjectiveRelationService {
       // hash-consistent payload (a forged endpoint never validates).
       return this._objectives.get(id) as Row;
     } catch (e) {
-      // Budget trips are not "unresolvable" — they mean the read was
-      // cut short; propagate so callers fail loudly, not silently.
+      // Budget trips and endpoint CORRUPTION are not "unresolvable" —
+      // a hash-mismatched objective row is tampering evidence the
+      // caller's strict/lenient policy decides on, not a missing
+      // endpoint. Only genuine resolution failures convert.
       if (e instanceof IntegrityError &&
-          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
+          (e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT" ||
+           e.code === "FAIL_CLOSED_ENTITY_HASH_MISMATCH")) throw e;
+      // Store/DB faults (SqliteError & co.) are loud, not "unresolvable".
+      if (!(e instanceof PairError)) throw e;
       fail("FAIL_CLOSED_RELATION_OBJECTIVE", `objective ${id} does not resolve`);
     }
+  }
+
+  /** Fault taxonomy for provenRow: store/DB faults (non-IntegrityError)
+   *  and budget trips are ALWAYS loud — a fault is not "unproven".
+   *  Corruption codes (tampered row or event anchor) are loud on the
+   *  strict write path — a corrupted-but-real relation excluded from
+   *  dedup/acyclicity mints a duplicate or admits a cycle — while
+   *  lenient reads treat it as unproven and serve siblings. */
+  private rethrowFault(e: unknown, strict: boolean): void {
+    if (!(e instanceof IntegrityError)) throw e;
+    if (e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
+    if (strict && (e.code === "FAIL_CLOSED_ENTITY_HASH_MISMATCH" ||
+                   e.code === "FAIL_CLOSED_EVENT_HASH_MISMATCH")) throw e;
   }
 
   /** Re-prove a stored row end-to-end — same bound P16-E established:
@@ -167,7 +185,7 @@ export class ObjectiveRelationService {
    *  consistent with BOTH endpoints NOW, and its event tail must be a
    *  legal chain ending at the row's state. Anything else is unproven
    *  — skipped on reads, TAMPERED on control. */
-  private provenRow(row: Row): ObjectiveRelationRow | null {
+  private provenRow(row: Row, strict = false): ObjectiveRelationRow | null {
     if (String(row.schema) !== OBJECTIVE_RELATION_SCHEMA) return null;
     if (!RELATION_KINDS.has(row.kind as never)) return null;
     const state = String(row.state);
@@ -181,8 +199,6 @@ export class ObjectiveRelationService {
     // Re-prove the scope claim AND bilateral authority against CURRENT
     // canonical state — a forged business pairing or a relation whose
     // consenting owner no longer owns both endpoints never serves.
-    // Budget trips are NOT "unproven" — they mean the read was cut
-    // short; propagate rather than silently dropping the row.
     try {
       const from = this.objective(String(row.from_objective_id));
       const to = this.objective(String(row.to_objective_id));
@@ -192,8 +208,7 @@ export class ObjectiveRelationService {
       if (createdBy !== String(from.owner_authority_id)) return null;
       if (createdBy !== String(to.owner_authority_id)) return null;
     } catch (e) {
-      if (e instanceof IntegrityError &&
-          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
+      this.rethrowFault(e, strict);
       return null;
     }
     // A self-relation can never be minted — a fabricated one is never
@@ -209,13 +224,13 @@ export class ObjectiveRelationService {
       events = this.store.listEvents(
         OBJECTIVE_RELATION_ENTITY, String(row.relation_id)) as Row[];
     } catch (e) {
-      if (e instanceof IntegrityError &&
-          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
+      this.rethrowFault(e, strict);
       return null;
     }
     if (events.length === 0) return null;
     const first = events[0];
     if (first.event_type !== RELATION_CREATED_EVENT) return null;
+    if (first.old_state != null) return null; // genesis has no prior
     if (String(first.new_state ?? "") !== "ACTIVE") return null;
     const meta = (first.metadata ?? null) as Row | null;
     if (!meta) return null;
@@ -280,7 +295,7 @@ export class ObjectiveRelationService {
       }
       if (page.length === 0) break;
       for (const row of page) {
-        const proven = this.provenRow(row);
+        const proven = this.provenRow(row, strict);
         if (proven) out.push(proven);
       }
       if (page.length < pageSize) break;

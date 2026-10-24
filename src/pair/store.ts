@@ -548,7 +548,12 @@ export class PairEvidenceStore {
       Record<string, unknown>
     >;
     return rows.map((row) => {
-      const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
+      }
       if (digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
@@ -617,7 +622,12 @@ export class PairEvidenceStore {
       )
       .all(missionId) as Array<{ payload: string; payload_hash: string }>;
     return rows.map((row) => {
-      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
+      }
       if (digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
@@ -640,7 +650,15 @@ export class PairEvidenceStore {
       .prepare(`SELECT entity_type, entity_id, payload, payload_hash FROM ${table}`)
       .all() as Array<Record<string, unknown>>;
     for (const row of rows) {
-      const payload = JSON.parse(String(row.payload));
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(String(row.payload));
+      } catch {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+          `${row.entity_type}:${row.entity_id}`,
+        );
+      }
       if (digest(payload) !== row.payload_hash) {
         throw new IntegrityError(
           "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
