@@ -1,24 +1,26 @@
 {
-  "claim_id": "P16_D_CHAT_READ_GRANTS",
-  "title": "P16-D verified read grants — canonical authority for scoped operator/telegram operational-status reads",
+  "claim_id": "P16_E_CAPABILITY_GAP",
+  "title": "P16-E capability-gap advisory — DRIVER_* fault classification persisted as a canonical owner-visible projection",
   "affected_surfaces": [
-    "CONVERSATION",
-    "MISSION_CONTROL"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-p16-d-chat-read-grants.test.ts#P16-D",
-    "src/__tests__/pair-phase1-operational-chat.test.ts#Phase1",
-    "src/__tests__/pair-phase1-http-boundary.test.ts#HTTP",
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts#P15.8-A",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts#P15.8-B",
-    "src/__tests__/pair-p15-8d-web-chat.test.ts#P15.8-D",
-    "src/__tests__/pair-p15-8e-telegram.test.ts#P15.8-E"
+    "src/__tests__/pair-p16-e-capability-gap.test.ts#P16-E",
+    "src/__tests__/pair-p15-10c.test.ts#P15.10-C",
+    "src/__tests__/pair-p15-10c-r1.test.ts#P15.10-C-R1",
+    "src/__tests__/pair-p15-10c-r2.test.ts#P15.10-C-R2",
+    "src/__tests__/pair-p15-10c-r3.test.ts#P15.10-C-R3",
+    "src/__tests__/pair-p15-10c-r4.test.ts#P15.10-C-R4",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts#P15.10-A",
+    "src/__tests__/pair-p15-10b.test.ts#P15.10-B",
+    "src/__tests__/pair-p15-10d.test.ts#P15.10-D"
   ],
   "invariants": [
-    "INV_CONV_001",
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P16-D: the Phase-5 verified-identity seam for scoped chat reads. NEW conversation-read-grant.ts — canonical conversation_read_grant entity (schema pair.os.vnext.conversation-read-grant.v1): grant row binds principal_ref (telegram:<chat>|operator:<id>) to an explicit scope {objective_ids, business_ids, own_footprint} + operator_ref + expires_at + ENABLED→DISABLED|REVOKED terminal lifecycle + grant_digest pin + GRANTED/DISABLED/REVOKED event anchors + dedup-key idempotent mint (same semantics replay, different fail-closed). Mint lanes: admin credential (any declared scope) or operator claim (x-operator-id → operator:<id> — the SAME claim authority vnext owner actions already use; may vouch only its own operator_ref and only scope provable via owner_authority_id/BUSINESS_CREATED — foreign vouching fails closed). operational-query.ts: deps.readGrants? seam — verified = isAdmin || granted scope resolved via scopeForPrincipal (ENABLED+unexpired, strict re-proof skips forged rows — tampered grants can never vouch); scopeForGrants = declared ids + own_footprint-derived scopeForActorRef + binding-chain missions; grant-resolution failure denies + integrity note (fail closed). Read path writes nothing (status() is read-only, expired_pending flag instead of lazy mutation). mission-control-server.ts: /api/conversations/read-grants* POST mint/control + GET status inside adminBoundary (operator lane = MC-token claim canonicalized fail-closed; status visibility scoped — operators see only own grants). Granted principals get scoped sections only — providers/executors stay INSUFFICIENT_AUTHORITY (a grant can never become admin, never write, never mint missions). Ungranted/expired/revoked/forged principals stay UNVERIFIED_IDENTITY — default-deny unchanged. serve-mission-control.mjs wires the canonical service into both seams. Codex-only; no retries/fallback; no second authority.",
+  "description": "P16-E: owner-visible capability-gap advisory (DRIVER_* fault classification → persisted projection). NEW objective-capability-gap.ts — canonical objective_capability_gap entity, ONE row per objective: every durable DriverDenial (closed DRIVER_* vocabulary only, else FAIL_CLOSED_CAPABILITY_GAP_LABEL) classifies into {gap_kind: AUTHORITY|COST_CONTROL|CAPACITY|BILLING_PROOF|SUBSCRIPTION|ADMISSION|EXECUTION, permanence, owner_action: OWNER_* closed advisory — names a channel, never a command} + bounded evidence ring (8; at/fence/label, never raw error text) + occurrences + opened_at/resolved_at + digest pin (updated_at excluded — clock noise must not fork semantic state) + OPENED/RESOLVED event anchors (pins_digest/prior_digest/reopened/reclassified). recordGap idempotent per (objective,label,fence); label change on OPEN reclassifies in place; RESOLVED reopens on new denial; resolveGap state-idempotent. gapFor = ZERO-write advisory read — tampered row surfaces UNVERIFIED marker (FAIL_CLOSED_CAPABILITY_GAP_TAMPERED), never renders canonical, never throws into the status read it rides inside. objective-auto-driver.ts: deps.capabilityGaps? seam — recordDenial + noteGap (mid-pass denials) + resolveGap on SETTLED + capability_gap in status()/statusReadOnly(); every call try{}-wrapped like recordDenial — projection fault can NEVER mask the denial or block the settle; advisory never gates a drive, never writes on read. serve-mission-control.mjs wires the service; gap rides the existing owner-gated /auto-driver status + cockpit auto_driver.status — no new route, no new authority. UI ObjectiveDetail: capability-gap row (OPEN → kind badge + owner_action; UNVERIFIED → warn marker; else hidden). Codex-only; advisory-only; zero enforcement change.",
   "risk_override": "HIGH"
 }

@@ -282,5 +282,26 @@ export interface AutoDriverStatus {
   last_fence: number | null;
   admissions: AutoDriverAdmission[];
   denials: AutoDriverDenial[];
+  /** P16-E — capability-gap advisory projection (absent when the driver
+   *  runs without the gap service wired). OPEN = a durable DRIVER_*
+   *  denial classified to an owner-actionable kind; UNVERIFIED = the
+   *  canonical row failed re-proof and must not be trusted. */
+  capability_gap?: CapabilityGap | null;
   lease: { state: string; fence: number | null; expires_at: number | null } | null;
+}
+
+export interface CapabilityGap {
+  state: string;
+  reason?: string | null;
+  objective_id?: string;
+  label?: string | null;
+  gap_kind?: string | null;
+  permanence?: string | null;
+  owner_action?: string | null;
+  occurrences?: number | null;
+  opened_at?: string | null;
+  resolved_at?: string | null;
+  updated_at?: string | null;
+  evidence?: Array<Record<string, unknown>>;
+  [k: string]: unknown;
 }

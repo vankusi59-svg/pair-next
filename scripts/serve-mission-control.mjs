@@ -115,6 +115,7 @@ import {
   MissionDraftService,
   TelegramConversationService,
   ObjectiveAutoPolicyService,
+  ObjectiveCapabilityGapService,
   AUTONOMOUS_EXECUTOR_IDS,
   createObjectiveAutoReconcile,
   createObjectiveAutoDriver,
@@ -580,6 +581,11 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
     // recovery; a restart never re-invokes an invocation already made.
     reconcileStaleAttempts: (objectiveId) =>
       resolveObjectiveCeoOps().ceoCycle.reconcileStaleAttempts(objectiveId),
+    // P16-E — capability-gap advisory: every durable DRIVER_* denial
+    // projects into a canonical, owner-visible objective_capability_gap
+    // row; a settled pass closes it. Observability-only — never masks
+    // the denial/settle it annotates.
+    capabilityGaps: new ObjectiveCapabilityGapService(store),
     onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
   });
   // Phase C — deferred: the driver only mints missions through the
