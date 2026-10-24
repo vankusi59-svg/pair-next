@@ -399,6 +399,7 @@ export const PACKS = {
     "pair-p18-a-objective-relation.test.ts",
     "pair-p18-b-portfolio.test.ts",
     "pair-p18-c-parallel-gating.test.ts",
+    "pair-p18-d-cross-objective-handoff.test.ts",
   ],
   TELEGRAM_INGRESS: [
     "pair-p15-8e-telegram.test.ts",
