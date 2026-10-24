@@ -1,18 +1,17 @@
 {
-  "claim_id": "P18_D_DELIVERABLE_HANDOFF",
-  "title": "P18-D cross-objective deliverable handoff — eligible external input sources extend to direct ACTIVE DEPENDS_ON upstream objectives",
+  "claim_id": "P18_E_ORG_AGENT_DUTY",
+  "title": "P18-E canonical org_agent_duty — an org_agent's declared objective coverage inside one business",
   "affected_surfaces": [
-    "ARTIFACT",
     "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL"
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-d-cross-objective-handoff.test.ts#P18-D"
+    "src/__tests__/pair-p18-e-org-agent-duty.test.ts#P18-E"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P18-D: cross-objective artifact handoff over the canonical relation substrate. ArtifactHandoffResolver's eligibleSourcesForWorkItemScope() previously authorized only the consumer's own objective (work_item → allocation → objective → same-objective siblings → bound missions → ACCEPTED artifacts). It now builds an authorized-objective set = {consumer objective} ∪ direct ACTIVE DEPENDS_ON upstreams via ObjectiveRelationService.admissionView(objectiveId).upstream — the SAME strict read seam the P18-C scheduler gate uses (corrupt rows wedge loudly; forged/unproven rows can never authorize). Every authorized objective is re-proven: canonical get + business_id equality against the consumer allocation (cross-business authorization impossible). Only DEPENDS_ON authorizes — CONFLICTS/SUPERSEDES never appear in admissionView.upstream; SUSPENDED/REVOKED do not gate or authorize; no transitive traversal (each hop requires its own bilateral-owner edge). All downstream proofs unchanged: per-allocation full authority re-proof, bound-mission provenance, ACCEPTED-artifact + anchored PASS validation, exact artifact identity + CAS byte re-verification, and the single canonical listEligibleExternalInputSources seam consumed by pin/resolve/dispatch re-proofs. Planner-supplied fields stay non-authoritative. Codex-only.",
+  "description": "P18-E: new canonical entity org_agent_duty — declares that a specific org_agent's responsibility covers a specific objective set (the staffing fact P18-F recovery/company-E2E consumes to prove a mandate legitimately spans objectives). Multi-lateral authority: actor=operator:<ref> must equal owner_authority_id of EVERY covered objective (the P18-A bilateral rule extended to N). business_id derived from canonical objectives (cross-business sets can never mint); org_agent must resolve and belong to the derived business. Digest pins all canonical fields; OCC on version; event tail re-proved (DUTY_CREATED identity pins incl. objective_ids set + legal STATE hops to row state). provenRow strict/lenient split identical to P18-A: corruption wedges strict write paths and drops per-row on lenient reads; semantic unproven-ness (foreign created_by, amended owner, missing agent, unsorted/duplicate objective_ids, key-borrowed clones) never serves. Reads are O(degree) via dual pointer index (O:{objective}:{duty} + A:{agent}:{duty}, proof-agnostic, resumable chunked rebuild, built-only-when-complete marker) with identical strict global fallback before the marker. coveringDuties(agent, objs) requires ONE proven ACTIVE duty covering the whole set — union-of-duties is deliberately not coverage. INERT: no scheduler/allocation/UI consumer yet — later seams call covers()/coveringDuties(). Codex-only.",
   "risk_override": "HIGH"
 }

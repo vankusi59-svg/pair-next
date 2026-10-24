@@ -83,6 +83,7 @@ const SURFACE_FILES = {
   "src/pair/scoped-memory.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-relation.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-portfolio.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/org-agent-duty.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-cockpit.ts": ["BUSINESS_OBJECTIVE"],
   "src/memory/semantic.ts": ["BUSINESS_OBJECTIVE"],
   "src/memory/procedural.ts": ["BUSINESS_OBJECTIVE"],
@@ -400,6 +401,7 @@ export const PACKS = {
     "pair-p18-b-portfolio.test.ts",
     "pair-p18-c-parallel-gating.test.ts",
     "pair-p18-d-cross-objective-handoff.test.ts",
+    "pair-p18-e-org-agent-duty.test.ts",
   ],
   TELEGRAM_INGRESS: [
     "pair-p15-8e-telegram.test.ts",
