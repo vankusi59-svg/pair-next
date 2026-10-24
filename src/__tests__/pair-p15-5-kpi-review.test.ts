@@ -806,9 +806,14 @@ describe("P15.5 — staleness / crash / concurrency (§13/§17/§18)", () => {
       };
     });
     const review = reviewStack(s, inv);
+    /* P16-C — the CEO observation now binds the ReasoningBrief, so the
+       mid-flight allocation is visible to the CYCLE's own drift check
+       and the attempt settles STALE there (a strictly earlier, still
+       fail-closed boundary) before P15.5's staleness guard can fire.
+       The protection invariant is unchanged: zero P15.5 commit. */
     await expect(
       review.runReview({ objective_id: oid, actor: OP }),
-    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_STALE_REVIEW" });
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_CEO_OBSERVATION_STALE" });
     expect(rowCount(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY)).toBe(0);
     expect(rowCount(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY)).toBe(0);
     s.store.close();
