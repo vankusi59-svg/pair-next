@@ -1,26 +1,25 @@
 {
-  "claim_id": "P16_E_CAPABILITY_GAP",
-  "title": "P16-E capability-gap advisory — DRIVER_* fault classification persisted as a canonical owner-visible projection",
+  "claim_id": "P17_SCOPE_TENANCY",
+  "title": "P17 business/objective tenancy for experience + memory — scoped Brain consumption replaces SCOPE_BINDING_ABSENT",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "UI"
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p16-e-capability-gap.test.ts#P16-E",
-    "src/__tests__/pair-p15-10c.test.ts#P15.10-C",
-    "src/__tests__/pair-p15-10c-r1.test.ts#P15.10-C-R1",
-    "src/__tests__/pair-p15-10c-r2.test.ts#P15.10-C-R2",
-    "src/__tests__/pair-p15-10c-r3.test.ts#P15.10-C-R3",
-    "src/__tests__/pair-p15-10c-r4.test.ts#P15.10-C-R4",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts#P15.10-A",
-    "src/__tests__/pair-p15-10b.test.ts#P15.10-B",
-    "src/__tests__/pair-p15-10d.test.ts#P15.10-D"
+    "src/__tests__/pair-p17-scope-tenancy.test.ts#P17",
+    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
+    "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
+    "src/__tests__/pair-p16-c-ceo-brief.test.ts#P16-C",
+    "src/__tests__/pair-p4.test.ts#P4",
+    "src/__tests__/pair-p7.test.ts#P7",
+    "src/__tests__/pair-p8.test.ts#P8",
+    "src/__tests__/pair-p9.test.ts#P9"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P16-E: owner-visible capability-gap advisory (DRIVER_* fault classification → persisted projection). NEW objective-capability-gap.ts — canonical objective_capability_gap entity, ONE row per objective: every durable DriverDenial (closed DRIVER_* vocabulary only, else FAIL_CLOSED_CAPABILITY_GAP_LABEL) classifies into {gap_kind, permanence, owner_action: OWNER_* closed advisory — names a channel, never a command} + bounded evidence ring (8; at/fence/label, never raw error text) + occurrences + opened/resolved_at + digest pin (incl. entity_id+objective_id; updated_at excluded) + OPENED/RESOLVED event anchors (pins_digest/prior_digest/reopened/reclassified). recordGap idempotent per (objective,label,fence); label change on OPEN reclassifies; RESOLVED reopens on new denial; resolveGap state-idempotent. Write+read re-proof (mirrors read-grant validRows): digest-valid + identity-bound + lifecycle-event-consistent — a digest-RECOMPUTED state flip or event-less forge can never extend the projection; forged rows are overwritten by honest fresh mints (prior_digest forensic anchor), never laundered. gapFor = ZERO-write advisory — ANY unverifiable state → UNVERIFIED marker (FAIL_CLOSED_CAPABILITY_GAP_TAMPERED), never canonical, never throws into the status read (driver call sites also wrapped for hostile impls). objective-auto-driver.ts: deps.capabilityGaps? seam — recordDenial + noteGap (mid-pass denials + DRIVER_PASS_FAULT at untyped fault paths) + resolveGap on SETTLED + capability_gap in status()/statusReadOnly(); every call try{}-wrapped — a projection fault can NEVER mask a denial or block a settle; advisory never gates a drive, never writes on read. serve-mission-control.mjs wires the service; gap rides the existing owner-gated /auto-driver status + cockpit — no new route, no new authority. UI ObjectiveDetail: capability-gap row (OPEN → badge + owner_action; UNVERIFIED → warn marker; else hidden). Codex-only; advisory-only; zero enforcement change.",
+  "description": "P17: tenancy scope for the two advisory surfaces Brain excluded via SCOPE_BINDING_ABSENT. experience.ts v2: createCandidate scope fields canonically validated at write (objective resolves + business derived from the objective's own, foreign pairing → FAIL_CLOSED_EXPERIENCE_SCOPE; business-only must resolve; both null = UNSCOPED). retrieve() tenancy admission BEFORE ranking — objective-exact + business-shared only; unscoped/foreign/raw-forged malformed pairs never admitted. scopedFor() = scoped retrieve + honest exclusion counts; findBySeriesKey scope-strict (tenancy is dedup identity). experience-extraction.ts derives scope evidence-only: mission.bound_open_id→binding→work_item→root→objective_workstream_binding; unresolvable links degrade to business/unscoped, never fabricate. MIGRATION_V13 scope columns on model-writable semantic/procedural memory (idempotent; legacy rows stay UNSCOPED). NEW ScopedMemoryReader: SQL-level bounded admission (32/table), deterministic order, 512B content cap, honest exclusion counts; missing V13 columns → all unscoped. brain-context.ts consumes deps.experience/deps.scopedMemory (unwired → *_NOT_WIRED expected gaps). reasoning-brief.ts: EXPERIENCE fact (PROJECTED, canonical advisory rows) + MEMORY fact (UNVERIFIED, model-writable content never proven) — aggregates only. Deps forwarded through ceo-runtime/operating-loop/adaptive-review; serve-mission-control wires ScopedMemoryReader(automaton.raw)+experience under auto-driver composition. Advisory-only: permission_effect NONE, no authority channel, no gate bypass. Codex-only; no enforcement beyond existing seams.",
   "risk_override": "HIGH"
 }

@@ -40,6 +40,7 @@ import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
 import type { CeoPlanningCycleService } from "./ceo-planning-cycle.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import type { BrainContextDeps } from "./brain-context.js";
 import { ObjectiveKpiVerificationService } from "./objective-kpi-verification.js";
 import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
 import {
@@ -823,6 +824,10 @@ export function createDefaultObjectiveOperatingService(deps: {
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
+  /** P17 — optional scoped advisory surfaces forwarded into the
+   *  default BrainContext inside the CEO cycle. */
+  experience?: BrainContextDeps["experience"];
+  scopedMemory?: BrainContextDeps["scopedMemory"];
 }): { service: ObjectiveOperatingService; model_entry_id: string;
   ceoCycle: CeoPlanningCycleService;
   kpiVerification: ObjectiveKpiVerificationService } {
@@ -831,6 +836,8 @@ export function createDefaultObjectiveOperatingService(deps: {
     business: deps.business,
     workforce: deps.workforce,
     invoker: deps.invoker,
+    experience: deps.experience,
+    scopedMemory: deps.scopedMemory,
   });
   const review = new ObjectiveAdaptiveReviewService({
     store: deps.store,

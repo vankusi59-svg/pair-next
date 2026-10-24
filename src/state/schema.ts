@@ -702,3 +702,20 @@ export const MIGRATION_V12_KNOWLEDGE_SOURCE_KIND = `
 export const MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS = `
   ALTER TABLE knowledge_store ADD COLUMN evidence_refs TEXT NOT NULL DEFAULT '[]';
 `;
+
+// === P17: tenancy scope on model-writable memory tables ===
+// A memory row may carry a business/objective binding; NULL = UNSCOPED.
+// Scoped readers (P17 Brain consumption) admit only rows bound to the
+// queried scope — unscoped and foreign rows never cross the boundary.
+export const MIGRATION_V13_SEMANTIC_SCOPE_BUSINESS = `
+  ALTER TABLE semantic_memory ADD COLUMN scope_business_id TEXT;
+`;
+export const MIGRATION_V13_SEMANTIC_SCOPE_OBJECTIVE = `
+  ALTER TABLE semantic_memory ADD COLUMN scope_objective_id TEXT;
+`;
+export const MIGRATION_V13_PROCEDURAL_SCOPE_BUSINESS = `
+  ALTER TABLE procedural_memory ADD COLUMN scope_business_id TEXT;
+`;
+export const MIGRATION_V13_PROCEDURAL_SCOPE_OBJECTIVE = `
+  ALTER TABLE procedural_memory ADD COLUMN scope_objective_id TEXT;
+`;

@@ -74,6 +74,7 @@ import {
 } from "./workforce-allocation.js";
 import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import type { BrainContextDeps } from "./brain-context.js";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -1669,6 +1670,10 @@ export function createDefaultAdaptiveReview(deps: {
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
+  /** P17 — optional scoped advisory surfaces forwarded into the
+   *  default BrainContext inside the CEO cycle. */
+  experience?: BrainContextDeps["experience"];
+  scopedMemory?: BrainContextDeps["scopedMemory"];
 }): { service: ObjectiveAdaptiveReviewService; model_entry_id: string } {
   const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle(deps);
   return {

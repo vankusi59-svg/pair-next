@@ -24,21 +24,39 @@ export class ProceduralMemoryManager {
     name: string;
     description: string;
     steps: ProceduralStep[];
+    /** P17 tenancy binding — writer-asserted; absent = UNSCOPED. */
+    scopeBusinessId?: string | null;
+    scopeObjectiveId?: string | null;
   }): string {
     const id = ulid();
     try {
+      // Scope columns arrive via MIGRATION_V13; tolerate legacy schemas.
+      const cols = new Set(
+        (this.db.prepare("PRAGMA table_info(procedural_memory)").all() as Array<{ name: string }>)
+          .map((c) => c.name),
+      );
+      const hasScope = cols.has("scope_business_id");
+      const columnList = `id, name, description, steps${hasScope ? ", scope_business_id, scope_objective_id" : ""}`;
+      const updateTail = hasScope
+        ? `,
+           scope_business_id = excluded.scope_business_id,
+           scope_objective_id = excluded.scope_objective_id`
+        : "";
       this.db.prepare(
-        `INSERT INTO procedural_memory (id, name, description, steps)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO procedural_memory (${columnList})
+         VALUES (${columnList.split(",").map(() => "?").join(", ")})
          ON CONFLICT(name) DO UPDATE SET
            description = excluded.description,
-           steps = excluded.steps,
+           steps = excluded.steps${updateTail},
            updated_at = datetime('now')`,
       ).run(
-        id,
-        entry.name,
-        entry.description,
-        JSON.stringify(entry.steps),
+        ...[
+          id,
+          entry.name,
+          entry.description,
+          JSON.stringify(entry.steps),
+          ...(hasScope ? [entry.scopeBusinessId ?? null, entry.scopeObjectiveId ?? null] : []),
+        ],
       );
     } catch (error) {
       logger.error("Failed to save", error instanceof Error ? error : undefined);

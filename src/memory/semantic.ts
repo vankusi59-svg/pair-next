@@ -33,29 +33,46 @@ export class SemanticMemoryManager {
     sourceKind?: string;
     /** Canonical Layer-B evidence IDs backing this fact (empty for model output). */
     evidenceRefs?: string[];
+    /** P17 tenancy binding — the WRITER asserts the scope it knows.
+     *  Layer-A rows are non-authoritative; an absent scope is UNSCOPED
+     *  and never visible to a scoped reader. */
+    scopeBusinessId?: string | null;
+    scopeObjectiveId?: string | null;
   }): string {
     const id = ulid();
     const trustClass = entry.trustClass ?? "MODEL_HYPOTHESIS";
     const sourceKind = entry.sourceKind ?? "MODEL";
     const evidenceRefs = JSON.stringify(entry.evidenceRefs ?? []);
-    // Trust columns arrive via MIGRATION_V12; tolerate legacy schemas
-    // (e.g. minimal test fixtures) that lack them.
+    const scopeBusinessId = entry.scopeBusinessId ?? null;
+    const scopeObjectiveId = entry.scopeObjectiveId ?? null;
+    // Trust columns arrive via MIGRATION_V12, scope columns via
+    // MIGRATION_V13; tolerate legacy schemas that lack them.
     const cols = new Set(
       (this.db.prepare("PRAGMA table_info(semantic_memory)").all() as Array<{ name: string }>).map(
         (c) => c.name,
       ),
     );
     const hasTrust = cols.has("trust_class");
+    const hasScope = cols.has("scope_business_id");
     try {
-      const columnList = hasTrust
-        ? "id, category, key, value, confidence, source, embedding_key, trust_class, source_kind, evidence_refs"
-        : "id, category, key, value, confidence, source, embedding_key";
-      const updateTail = hasTrust
-        ? `,
+      const columnList = [
+        "id, category, key, value, confidence, source, embedding_key",
+        hasTrust ? ", trust_class, source_kind, evidence_refs" : "",
+        hasScope ? ", scope_business_id, scope_objective_id" : "",
+      ].join("");
+      const updateTail = [
+        hasTrust
+          ? `,
            trust_class = excluded.trust_class,
            source_kind = excluded.source_kind,
            evidence_refs = excluded.evidence_refs`
-        : "";
+          : "",
+        hasScope
+          ? `,
+           scope_business_id = excluded.scope_business_id,
+           scope_objective_id = excluded.scope_objective_id`
+          : "",
+      ].join("");
       this.db.prepare(
         `INSERT INTO semantic_memory (${columnList})
          VALUES (${columnList.split(",").map(() => "?").join(", ")})
@@ -66,28 +83,17 @@ export class SemanticMemoryManager {
            embedding_key = excluded.embedding_key${updateTail},
            updated_at = datetime('now')`,
       ).run(
-        ...(hasTrust
-          ? [
-              id,
-              entry.category,
-              entry.key,
-              entry.value,
-              entry.confidence ?? 1.0,
-              entry.source,
-              entry.embeddingKey ?? null,
-              trustClass,
-              sourceKind,
-              evidenceRefs,
-            ]
-          : [
-              id,
-              entry.category,
-              entry.key,
-              entry.value,
-              entry.confidence ?? 1.0,
-              entry.source,
-              entry.embeddingKey ?? null,
-            ]),
+        ...[
+          id,
+          entry.category,
+          entry.key,
+          entry.value,
+          entry.confidence ?? 1.0,
+          entry.source,
+          entry.embeddingKey ?? null,
+          ...(hasTrust ? [trustClass, sourceKind, evidenceRefs] : []),
+          ...(hasScope ? [scopeBusinessId, scopeObjectiveId] : []),
+        ],
       );
 
       // On upsert conflict, the DB keeps the original row's id, not the new one.

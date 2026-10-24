@@ -19,8 +19,8 @@
  *        FAIL_CLOSED_*_PROOF_LIMIT error — never silent truncation.
  *   B7 — no-write invariant: the event/entity log is byte-identical
  *        before and after contextFor.
- *   B8 — sections carry provenance (sources/digests), and unscoped
- *        memory/experience report the typed SCOPE_BINDING_ABSENT gap
+ *   B8 — sections carry provenance (sources/digests), and unwired
+ *        memory/experience seams report typed *_NOT_WIRED gaps (P17)
  *        rather than smuggling cross-scope data.
  *
  * Harness mirrors pair-p15-9a-company-cockpit.test.ts — real canonical
@@ -508,10 +508,13 @@ describe("P16-A BrainContextService.contextFor", () => {
       expect(Array.isArray(sec.unavailable), name).toBe(true);
       expect(Array.isArray(sec.integrity), name).toBe(true);
     }
-    // Memory + experience are excluded by design — typed gap, not data.
+    // Memory + experience seams are unwired in this composition —
+    // typed wiring gaps, not data (P17: scoped reads exist; they must
+    // be opted into).
     expect(c.sections.memory!.value).toBeNull();
     expect(c.sections.experience!.value).toBeNull();
-    expect(c.unavailable.some((u) => u.startsWith("SCOPE_BINDING_ABSENT"))).toBe(true);
+    expect(c.unavailable.some((u) => u.startsWith("MEMORY_NOT_WIRED"))).toBe(true);
+    expect(c.unavailable.some((u) => u.startsWith("EXPERIENCE_NOT_WIRED"))).toBe(true);
     // Unwired autonomy seams report the typed gap too (deps omitted).
     expect(c.unavailable).toContain("AUTO_POLICY_NOT_WIRED");
     expect(c.unavailable).toContain("AUTO_DRIVER_NOT_WIRED");

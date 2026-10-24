@@ -13,7 +13,7 @@
  *         CEO_INITIALIZE_WORKSTREAMS; bound → CEO_PRIORITIZE_EXISTING;
  *         WAIT is always a candidate; a terminal objective emits none.
  *   RB4 — missing_information maps unavailable/integrity gaps; expected
- *         absences (BINDING_ABSENT, SCOPE_BINDING_ABSENT, *_NOT_WIRED)
+ *         absences (BINDING_ABSENT, *_NOT_WIRED incl. P17 scoped seams)
  *         do not degrade confidence.
  *   RB5 — owner gate + scope check inherit fail-closed verbatim.
  *   RB6 — no-write invariant: briefFor leaves the canonical log
@@ -456,9 +456,12 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
   it("RB4 expected gaps do not degrade; integrity notes do", () => {
     const { s, oid, binding } = seeded("rb4", ["a"]);
     const b = brief(s).briefFor(oid, OWNER);
-    // Unscoped memory/experience gaps are EXPECTED — reported as
-    // missing_information but the envelope stays confident.
-    expect(b.missing_information.some((g) => g.code === "SCOPE_BINDING_ABSENT")).toBe(true);
+    // Unwired memory/experience seams are EXPECTED wiring gaps —
+    // reported as missing_information but the envelope stays confident
+    // (P17: scoped reads exist; an unwired composition degrades to
+    // typed *_NOT_WIRED codes, never fabricated data).
+    expect(b.missing_information.some((g) => g.code === "MEMORY_NOT_WIRED")).toBe(true);
+    expect(b.missing_information.some((g) => g.code === "EXPERIENCE_NOT_WIRED")).toBe(true);
     expect(b.confidence).toBe("HIGH");
     // Forge an artifact CAS link → integrity note → LOW confidence.
     const art = s.store.list<Row>("artifact");

@@ -56,6 +56,11 @@ export interface ExtractedObservation {
   providers?: string[];
   models?: string[];
   provenance: string;
+  /** P17 tenancy binding derived from the evidence chain — a
+   *  candidate aggregates ONLY within its own scope (the dedup fold
+   *  matches on series_key AND scope together). */
+  scopeBusinessId?: string | null;
+  scopeObjectiveId?: string | null;
 }
 
 export class ExperienceExtractor {
@@ -68,13 +73,77 @@ export class ExperienceExtractor {
     return this.service.store;
   }
 
+  /* P17 — canonical scope derivation. The chain is evidence-only:
+   *   mission.bound_open_id → work_open_binding → work_item →
+   *   parent chain → root → objective_workstream_binding → objective.
+   * Any link that fails to resolve degrades to business-only (or
+   * unscoped) — never throws, never fabricates an objective claim:
+   * an under-scoped row is simply invisible to tighter reads. */
+  private workItemRoot(workItemId: string): string | null {
+    let id = workItemId;
+    for (let depth = 0; depth < 64; depth++) {
+      const item = this.store.tryGet("work_item", id) as Record<string, unknown> | null;
+      if (!item) return null;
+      const parent = item.parent_work_item_id != null ? String(item.parent_work_item_id) : "";
+      if (!parent) return id;
+      id = parent;
+    }
+    return null; // cyclic/deeper-than-cap — unproven, degrade
+  }
+
+  missionScope(missionId: string): {
+    scope_business_id: string | null;
+    scope_objective_id: string | null;
+  } {
+    const none = { scope_business_id: null, scope_objective_id: null };
+    try {
+      const mission = this.store.tryGet("mission", missionId) as Record<string, unknown> | null;
+      if (!mission) return none;
+      let businessId = mission.business_id != null ? String(mission.business_id) : null;
+      const openId = mission.bound_open_id != null ? String(mission.bound_open_id) : "";
+      if (openId) {
+        const ob = this.store.tryGet("work_open_binding", openId) as Record<string, unknown> | null;
+        if (ob && String(ob.mission_id ?? "") === String(mission.mission_id)) {
+          businessId = String(ob.business_id ?? businessId ?? "") || businessId;
+          const wid = ob.work_item_id != null ? String(ob.work_item_id) : "";
+          const root = wid ? this.workItemRoot(wid) : null;
+          if (root) {
+            const ws = (this.store.list("objective_workstream_binding") as Array<Record<string, unknown>>)
+              .find((b) => String(b.root_work_item_id) === root);
+            if (ws) {
+              return {
+                scope_business_id: String(ws.business_id ?? businessId ?? "") || businessId,
+                scope_objective_id: String(ws.objective_id),
+              };
+            }
+          }
+        }
+      }
+      return { scope_business_id: businessId, scope_objective_id: null };
+    } catch {
+      return none;
+    }
+  }
+
+  private executionScope(exec: Record<string, unknown>, task: Record<string, unknown> | null) {
+    const missionId = String(exec.mission_id ?? task?.mission_id ?? "");
+    return missionId ? this.missionScope(missionId) : { scope_business_id: null, scope_objective_id: null };
+  }
+
   /**
-   * Create or fold a candidate. Same series_key + new evidence → aggregate;
-   * already-recorded evidence ref → semantic no-op; MODEL_GENERATED origin →
-   * created then auto-quarantined by the service (never advisory).
+   * Create or fold a candidate. Same series_key + SAME tenancy scope +
+   * new evidence → aggregate; already-recorded evidence ref → semantic
+   * no-op; MODEL_GENERATED origin → created then auto-quarantined by
+   * the service (never advisory). A foreign-scope same-signature
+   * observation never folds into this scope's series — tenancy is
+   * part of the dedup identity.
    */
   fold(obs: ExtractedObservation): Record<string, unknown> {
-    const existing = this.experience.findBySeriesKey(obs.seriesKey);
+    const scope = {
+      scope_business_id: obs.scopeBusinessId ?? null,
+      scope_objective_id: obs.scopeObjectiveId ?? null,
+    };
+    const existing = this.experience.findBySeriesKey(obs.seriesKey, scope);
     if (existing) {
       return this.experience.foldObservation(String(existing.experience_id), {
         evidence_ref: obs.evidenceRef,
@@ -102,6 +171,7 @@ export class ExperienceExtractor {
       observed_executors: obs.executors,
       observed_providers: obs.providers,
       observed_models: obs.models,
+      ...scope,
     });
   }
 
@@ -127,6 +197,7 @@ export class ExperienceExtractor {
       ((task?.required_capabilities as string[]) ?? []).map(String).sort();
     const envFp = environmentFingerprint(opts.environment ?? {});
     const envs = opts.environment ? [envFp] : [];
+    const scope = this.executionScope(exec, task);
     const out: Record<string, unknown>[] = [];
 
     out.push(
@@ -157,6 +228,8 @@ export class ExperienceExtractor {
         environments: envs,
         executors: [executorId],
         provenance: "terminal_execution",
+        scopeBusinessId: scope.scope_business_id,
+        scopeObjectiveId: scope.scope_objective_id,
       }),
     );
 
@@ -201,6 +274,8 @@ export class ExperienceExtractor {
           providers: provider ? [String(provider)] : [],
           models: model ? [String(model)] : [],
           provenance: "terminal_execution",
+          scopeBusinessId: scope.scope_business_id,
+          scopeObjectiveId: scope.scope_objective_id,
         }),
       );
     }
@@ -239,6 +314,8 @@ export class ExperienceExtractor {
           environments: envs,
           executors: [executorId],
           provenance: "route_outcome",
+          scopeBusinessId: scope.scope_business_id,
+          scopeObjectiveId: scope.scope_objective_id,
         }),
       );
     }
@@ -261,6 +338,7 @@ export class ExperienceExtractor {
       String(err.class ?? err.message ?? exec.result_state ?? "UNKNOWN"),
     );
     const envFp = environmentFingerprint(opts.environment ?? {});
+    const scope = this.executionScope(exec, task);
     const signature = digest({
       error_class: errorClass,
       executor: executorId,
@@ -289,6 +367,8 @@ export class ExperienceExtractor {
       environments: opts.environment ? [envFp] : [],
       executors: [executorId],
       provenance: "terminal_failure",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 
@@ -317,6 +397,7 @@ export class ExperienceExtractor {
       );
     }
     const envFp = environmentFingerprint(opts.environment ?? {});
+    const scope = this.executionScope(ok, this.store.tryGet("task", String(ok.task_id)));
     const seriesKey = digest({
       type: "REMEDIATION_PAIR",
       executor: String(fail.executor_id),
@@ -341,6 +422,8 @@ export class ExperienceExtractor {
       environments: opts.environment ? [envFp] : [],
       executors: [String(fail.executor_id)],
       provenance: "verified_remediation",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 
@@ -370,6 +453,7 @@ export class ExperienceExtractor {
         depends_on: t.depends_on,
       }));
     const seriesKey = digest({ type: "PLAN_TEMPLATE", tasks });
+    const scope = this.missionScope(missionId);
     return this.fold({
       type: "PLAN_TEMPLATE",
       seriesKey,
@@ -383,6 +467,8 @@ export class ExperienceExtractor {
       },
       outcome: "SUCCESS",
       provenance: "verified_plan_revision",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 }
