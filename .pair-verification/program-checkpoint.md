@@ -60,3 +60,11 @@ governed; brief staleness check via context_digest pin. Also: PR #134 (P15.9+P16
 - R3 minors fixed in hygiene commit: empty-key/null-sentinel collision (M1″), digest() non-canonical patch 500 (M2″), dedup-window + authz-order doc notes (M3″/M4″), amend-patch owner gate test (M5″), vacuous all-undefined patch rejection (M6″), UI op-signature ':' collision → JSON.stringify (M7″), api.ts dead source field (M8″)
 - Full suite PASS_WITH_KNOWN_BASELINE maintained; win32 baselines identical on BASE
 - Next: verify:change on final diff → feature branch + PR → P16-B ReasoningBrief
+
+## P16-C — CEO consumes ReasoningBrief (COMPLETE 2026-10-24)
+- PR #136 `feat/p16-c-ceo-brief-consumption` → `feat/p16-b-reasoning-brief` (stacked on #135). HEAD `4360a67`.
+- Seam: `CeoObservationDeps.brain_brief?` attaches `briefObservationView` inside `observation_digest` — cycle identity/replay/drift all bind brief content. Read identity = assertOwnerAuthorityRef-validated canonical owner.
+- Degradation contract (R1-MAJOR fix): seam IntegrityErrors → deterministic `BRAIN_BRIEF_UNAVAILABLE` marker (code-only) — advisory surface can NEVER wedge runCycle/replay; non-IntegrityError propagates.
+- Contract shift: mid-flight mutation visible only via brief → STALE at cycle boundary (was P15_5_STALE_REVIEW at review layer); p15-5 test 18 updated, zero-commit invariant unchanged.
+- verify:change --base adf68c0 → READY_FOR_INDEPENDENT_AUDIT. Tests 14/14 + regression green. Review: R1 NEEDS_FIX→repaired, R2 PASS, R3 PASS.
+- P16 remaining: P16-D verified-identity (operator/telegram scoped chat reads — Phase-5 seam, UNVERIFIED_IDENTITY stays default-deny by design).
