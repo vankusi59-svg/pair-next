@@ -656,6 +656,13 @@ export class ObjectiveRelationService {
           }
           throw e;
         }
+        // Storage-key↔payload binding — get() verifies the hash but not
+        // that payload.entity_id equals the key (entityPage binds it for
+        // scans); a pointer must never resolve to a key-borrowed row
+        // where the global path would wedge.
+        if (String(edge.entity_id ?? "") !== relId) {
+          fail("FAIL_CLOSED_RELATION_INDEX", `key-borrowed edge ${key}`);
+        }
         const proven = this.provenRow(edge, true);
         if (!proven) { after = key; continue; }
         if (proven.state === "ACTIVE") {
