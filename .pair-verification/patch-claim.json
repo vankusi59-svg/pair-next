@@ -1,21 +1,24 @@
 {
-  "claim_id": "P16_C_CEO_BRIEF_CONSUMPTION",
-  "title": "P16-C CEO consumes ReasoningBrief — advisory projection bound inside observation_digest",
+  "claim_id": "P16_D_CHAT_READ_GRANTS",
+  "title": "P16-D verified read grants — canonical authority for scoped operator/telegram operational-status reads",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE"
+    "CONVERSATION",
+    "MISSION_CONTROL"
   ],
   "required_tests": [
-    "src/__tests__/pair-p16-c-ceo-brief.test.ts#P16-C",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts#P15.5",
-    "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts#P15.3",
-    "src/__tests__/pair-p15-3w-ceo-runtime-wiring.test.ts#P15.3W",
-    "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
-    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A"
+    "src/__tests__/pair-p16-d-chat-read-grants.test.ts#P16-D",
+    "src/__tests__/pair-phase1-operational-chat.test.ts#Phase1",
+    "src/__tests__/pair-phase1-http-boundary.test.ts#HTTP",
+    "src/__tests__/pair-p15-8a-conversation-authority.test.ts#P15.8-A",
+    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts#P15.8-B",
+    "src/__tests__/pair-p15-8d-web-chat.test.ts#P15.8-D",
+    "src/__tests__/pair-p15-8e-telegram.test.ts#P15.8-E"
   ],
   "invariants": [
+    "INV_CONV_001",
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P16-C: CEO observation carries the advisory ReasoningBrief — canonical observation stays the ONLY authority. ceo-planning-cycle.ts: CeoObservationDeps.brain_brief? seam; buildCeoObservation attaches the projection under observation.brain_brief INSIDE observation_digest so cycle identity/replay/post-invocation drift all bind brief content; read identity is the strict-verified owner_authority_id (invoker actor stays on attempt provenance, C6); seam IntegrityErrors degrade to a deterministic BRAIN_BRIEF_UNAVAILABLE marker (error code only) inside the digest — the seam's stronger KPI/budget re-proof can never wedge the cycle or replay on legitimately-degraded objectives like lapsed verifier grants (C4a/C12); non-IntegrityError propagates fail-closed pre-claim (C4b); owner_authority_id re-validated via assertOwnerAuthorityRef. reasoning-brief.ts: briefObservationView shares the ONE digest projection — exactly brief_digest-pinned fields + brief_digest; volatile fields cannot leak; digest(view − brief_digest) === brief_digest (C7). ceo-decision.ts: prompt names advisory boundary — options name authority channels, never commands (C1/C10). ceo-runtime.ts: injectable + default wiring. Reads only — identical event/entity footprint (C5); unchanged validator rejects malformed output (C3); bound-objective facts through PRIORITIZE (C11); mid-flight policy mutation settles STALE only when wired (C9). Replay: zero extra calls (C2). CONTRACT SHIFT: p15-5 test 18 — mid-flight allocation now stales at the earlier cycle boundary (FAIL_CLOSED_CEO_OBSERVATION_STALE vs FAIL_CLOSED_P15_5_STALE_REVIEW); zero-commit invariant unchanged. No retries/fallback/second authority; Codex-only.",
+  "description": "P16-D: the Phase-5 verified-identity seam for scoped chat reads. NEW conversation-read-grant.ts — canonical conversation_read_grant entity (schema pair.os.vnext.conversation-read-grant.v1): grant row binds principal_ref (telegram:<chat>|operator:<id>) to an explicit scope {objective_ids, business_ids, own_footprint} + operator_ref + expires_at + ENABLED→DISABLED|REVOKED terminal lifecycle + grant_digest pin + GRANTED/DISABLED/REVOKED event anchors + dedup-key idempotent mint (same semantics replay, different fail-closed). Mint lanes: admin credential (any declared scope) or operator claim (x-operator-id → operator:<id> — the SAME claim authority vnext owner actions already use; may vouch only its own operator_ref and only scope provable via owner_authority_id/BUSINESS_CREATED — foreign vouching fails closed). operational-query.ts: deps.readGrants? seam — verified = isAdmin || granted scope resolved via scopeForPrincipal (ENABLED+unexpired, strict re-proof skips forged rows — tampered grants can never vouch); scopeForGrants = declared ids + own_footprint-derived scopeForActorRef + binding-chain missions; grant-resolution failure denies + integrity note (fail closed). Read path writes nothing (status() is read-only, expired_pending flag instead of lazy mutation). mission-control-server.ts: /api/conversations/read-grants* POST mint/control + GET status inside adminBoundary (operator lane = MC-token claim canonicalized fail-closed; status visibility scoped — operators see only own grants). Granted principals get scoped sections only — providers/executors stay INSUFFICIENT_AUTHORITY (a grant can never become admin, never write, never mint missions). Ungranted/expired/revoked/forged principals stay UNVERIFIED_IDENTITY — default-deny unchanged. serve-mission-control.mjs wires the canonical service into both seams. Codex-only; no retries/fallback; no second authority.",
   "risk_override": "HIGH"
 }

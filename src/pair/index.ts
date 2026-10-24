@@ -100,6 +100,7 @@ export * from "./objective-auto-driver.js";
 export * from "./objective-cockpit.js";
 export * from "./brain-context.js";
 export * from "./reasoning-brief.js";
+export * from "./conversation-read-grant.js";
 export * from "./operational-query.js";
 
 export * from "./objective-kpi-verifier-authority.js";
