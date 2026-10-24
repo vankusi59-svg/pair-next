@@ -239,13 +239,14 @@ export class ObjectiveCapabilityGapService {
       ? last.event_type === CAP_GAP_OPENED_EVENT
       : last.event_type === CAP_GAP_RESOLVED_EVENT;
     if (!stateOk) return false;
-    // R3 — pin the label to the lifecycle anchor too: every label change
-    // emits OPENED carrying the new label, same-label bumps keep it, and
-    // RESOLVED carries the resolved label. A rows-only forge keeping
-    // `state` consistent can therefore never rewrite the classification
-    // — the append-only event chain holds the truth.
+    // R3 — pin label AND permanence to the lifecycle anchor: every
+    // label/permanence change emits OPENED carrying the new values,
+    // same-classification bumps keep them, and RESOLVED carries the
+    // resolved label + permanence. A rows-only forge keeping `state`
+    // consistent can therefore never rewrite the classification — the
+    // append-only event chain holds the truth.
     const meta = last.metadata as Record<string, unknown> | null | undefined;
-    return !!meta && meta.label === row.label;
+    return !!meta && meta.label === row.label && meta.permanence === row.permanence;
   }
 
   /** The WRITE-side re-proof: a row only extends the projection when it
@@ -308,8 +309,8 @@ export class ObjectiveCapabilityGapService {
       let prev: Row | null = null;
       try { prev = this.readRow(objective_id); }
       catch { prev = null; }
-      let cv = this.colVersion(objective_id);
-      cv = this.normalizeUnmatchable(objective_id, cv, cv !== 0 || prev != null);
+      const cv0 = this.colVersion(objective_id);
+      const cv = this.normalizeUnmatchable(objective_id, cv0, cv0 !== 0 || prev != null);
       const proven = this.provenRow(objective_id, prev, cv);
       const prevVersion = cv;
       // Idempotent replay: identical tail evidence (same label at the
@@ -348,7 +349,10 @@ export class ObjectiveCapabilityGapService {
       } as Record<string, unknown>;
       row.digest = capGapDigest(row);
       const stored = this.store.put(CAP_GAP_ENTITY, this.rowId(objective_id), row, prevVersion);
-      if (!proven || clsChanged || reopening) {
+      // permanence flips journal too — the event-consistency pin reads
+      // the newest lifecycle event, so a same-label transient→permanent
+      // recurrence would otherwise wedge UNVERIFIED forever.
+      if (!proven || clsChanged || reopening || proven.permanence !== row.permanence) {
         this.store.event({
           entity_type: CAP_GAP_ENTITY, entity_id: this.rowId(objective_id),
           event_type: CAP_GAP_OPENED_EVENT,
@@ -363,9 +367,10 @@ export class ObjectiveCapabilityGapService {
             reopened: reopening === true,
             reclassified: clsChanged === true,
             prior_digest: this.priorDigest(prev),
-            // "a storage row existed" — the column version is truth even
-            // when the payload bytes are unreadable.
-            prior_row_present: prev != null || prevVersion > 0,
+            // "a storage row existed" — the PRE-normalize column read is
+            // truth even when the payload bytes are unreadable or the
+            // column itself is unmatchable (NaN !== 0 → a row existed).
+            prior_row_present: prev != null || cv0 !== 0,
           },
         });
       }
@@ -411,6 +416,7 @@ export class ObjectiveCapabilityGapService {
           revision: (stored as Row).version,
           pins_digest: digest(stored),
           label: proven.label,
+          permanence: proven.permanence,
           prior_digest: this.priorDigest(prev),
         },
       });

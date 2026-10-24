@@ -737,4 +737,38 @@ describe("P16-E — capability-gap advisory projection", () => {
     const g = svc.gapFor("OBJ1")!;
     expect(g.state).toBe("UNVERIFIED"); // evidence.at must be ISO, not prose
   });
+
+  it("G27 R4: same-label permanence flip journals OPENED — stays canonical", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    // Same label, different transient flag — permanence flips. Without a
+    // journaled OPENED the event pin would wedge the row UNVERIFIED.
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: false, fence: 2 });
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("OPEN");
+    expect(g.permanence).toBe("permanent");
+    expect(g.occurrences).toBe(2);
+    const evs = (store.listEvents(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Array<Record<string, unknown>>)
+      .filter((e) => e.event_type === CAP_GAP_OPENED_EVENT);
+    expect(evs).toHaveLength(2); // permanence flip re-anchored the tail
+    expect((evs[1]!.metadata as Record<string, unknown>).permanence).toBe("permanent");
+  });
+
+  it("G28 R4: forged permanence (state-consistent) → UNVERIFIED", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: false, fence: 1 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    // permanent→transient downplay forge: rows-only, digest recomputed,
+    // state stays OPEN — only the event permanence-pin can catch it.
+    const forged = forgedRow({
+      permanence: "transient",
+      evidence: [{ at: row.opened_at, label: "DRIVER_COST_HALTED", fence: 1 }],
+      opened_at: row.opened_at, updated_at: row.updated_at,
+    }, Number(row.version));
+    rawSqlPut(store, "cap-gap:OBJ1", forged);
+    expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED");
+  });
 });
