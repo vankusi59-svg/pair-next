@@ -962,6 +962,32 @@ export function ObjectiveDetail() {
             <span className="note">{c.auto_driver ? `status: ${JSON.stringify(c.auto_driver.status)}` : "not configured"}</span>
           )}
         </div>
+        {(() => {
+          const gap = drvSt.kind === "ready" ? drvSt.data.capability_gap : null;
+          if (!gap) return null;
+          if (gap.state === "UNVERIFIED") {
+            return (
+              <div className="nrow">
+                <span className="tt">capability gap</span>
+                <StatusBadge tone="warn" label="UNVERIFIED" />
+                <span className="note">canonical gap row failed re-proof — advisory hidden, never trusted</span>
+              </div>
+            );
+          }
+          if (gap.state !== "OPEN") return null;
+          return (
+            <div className="nrow">
+              <span className="tt">capability gap</span>
+              <StatusBadge tone={gap.permanence === "transient" ? "warn" : "danger"} label={String(gap.gap_kind ?? gap.label)} />
+              <span className="note">
+                {String(gap.label)} · {String(gap.permanence)}
+                {gap.occurrences != null && Number(gap.occurrences) > 1 ? ` · ×${Number(gap.occurrences)}` : ""}
+                {gap.opened_at ? ` · since ${String(gap.opened_at).slice(0, 16).replace("T", " ")}` : ""}
+              </span>
+              <span className="note">{String(gap.owner_action ?? "")}</span>
+            </div>
+          );
+        })()}
         {pol?.configured && "halt" in pol && pol.halt ? (
           <div className="nrow">
             <span className="tt">halt</span>

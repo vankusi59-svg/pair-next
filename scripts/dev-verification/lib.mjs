@@ -59,6 +59,8 @@ const SURFACE_FILES = {
   "src/pair/business.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-authority.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-auto-policy.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/objective-auto-driver.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/objective-capability-gap.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-workstream.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-operating-loop.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-adaptive-review.ts": ["BUSINESS_OBJECTIVE"],
