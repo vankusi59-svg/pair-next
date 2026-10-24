@@ -81,6 +81,7 @@ const SURFACE_FILES = {
   "src/pair/brain-context.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/reasoning-brief.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/scoped-memory.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/objective-relation.ts": ["BUSINESS_OBJECTIVE"],
   "src/memory/semantic.ts": ["BUSINESS_OBJECTIVE"],
   "src/memory/procedural.ts": ["BUSINESS_OBJECTIVE"],
   "src/state/schema.ts": ["BUSINESS_OBJECTIVE"],
@@ -391,6 +392,7 @@ export const PACKS = {
     "pair-p16-a-brain-context.test.ts",
     "pair-p16-b-reasoning-brief.test.ts",
     "pair-p17-scope-tenancy.test.ts",
+    "pair-p18-a-objective-relation.test.ts",
   ],
   TELEGRAM_INGRESS: [
     "pair-p15-8e-telegram.test.ts",

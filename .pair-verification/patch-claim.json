@@ -1,25 +1,16 @@
 {
-  "claim_id": "P17_SCOPE_TENANCY",
-  "title": "P17 business/objective tenancy for experience + memory — scoped Brain consumption replaces SCOPE_BINDING_ABSENT",
+  "claim_id": "P18_A_OBJECTIVE_RELATION",
+  "title": "P18-A canonical objective_relation — the coordination layer's atomic fact between objectives in one business",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "DEV_INFRA"
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-p17-scope-tenancy.test.ts#P17",
-    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
-    "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
-    "src/__tests__/pair-p16-c-ceo-brief.test.ts#P16-C",
-    "src/__tests__/pair-p4.test.ts#P4",
-    "src/__tests__/pair-p7.test.ts#P7",
-    "src/__tests__/pair-p8.test.ts#P8",
-    "src/__tests__/pair-p9.test.ts#P9"
+    "src/__tests__/pair-p18-a-objective-relation.test.ts#P18-A"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P17: tenancy scope for the advisory surfaces Brain excluded via SCOPE_BINDING_ABSENT. experience.ts v2: createCandidate scope fields canonically validated at write (objective resolves, business derived from objective's own, foreign pairing → FAIL_CLOSED_EXPERIENCE_SCOPE; both null = UNSCOPED). retrieve() SYMMETRIC tenancy admission before ranking: objective query → objective+business-shared (business canonically derived when omitted, unresolvable → nothing); business query → business-shared only; unscoped query → UNSCOPED only — scope-bound rows invisible outside scope on EVERY read. scopedFor() adds honest counts (unscoped/out_of_scope/ineligible). findBySeriesKey scope-strict; fold normalizes obs scope first. deriveMissionScope (exported): mission.bound_open_id→binding(mission+business cross-checked)→work_item→root's OWN canonical objective_id/business_id. Routing+planner advisors resolve mission tenancy → retrieve — foreign-scope rows can never advise another scope's mission (T11/T12). MIGRATION_V13 scope columns on model-writable memory; writers require both columns, upserts COALESCE-preserve scope. NEW ScopedMemoryReader: SQL-bounded admission (32/table), deterministic order, 512B cap, honest counts; missing V13 → all unscoped. brain-context consumes deps seams (unwired → *_NOT_WIRED); brief emits EXPERIENCE (PROJECTED)+MEMORY (UNVERIFIED) only on real content. Deps forwarded through ceo-runtime/loop/adaptive-review; serve-mission-control wires ScopedMemoryReader(automaton.raw)+experience. Advisory-only: permission_effect NONE. Codex-only.",
+  "description": "P18-A: canonical objective_relation + ObjectiveRelationService — substrate for portfolio/parallel/handoff/duties/recovery. Closed kind vocabulary (DEPENDS_ON, CONFLICTS, SUPERSEDES); ACTIVE→SUSPENDED⇄ACTIVE→REVOKED terminal+idempotent; closed action vocabulary. Bilateral authority: actor = operator:<ref> = owner_authority_id of BOTH endpoints at mint/control AND created_by re-checked against CURRENT owners at re-proof. business_id derived from canonical objectives; strict ObjectiveAuthorityService.get endpoints. DEPENDS_ON acyclicity at mint AND RESUME over non-REVOKED edges. Idempotent mint per (from,to,kind) — CONFLICTS symmetric; dedup after authority. create()/control() inside store.immediate — check+put+event atomic, cross-connection serialized. STRICT/LENIENT re-proof split: writes (dedup + cycle edges) enumerate strict — any corruption (entity hash/key/version, event tail, endpoint payload, store fault) propagates loudly so a corrupted-but-real row can never silently truncate the canonical set into a dup mint or cycle admission; reads enumerate lenient — corrupt rows isolate-and-skip, siblings still serve; semantic unproven-ness (fabricated rows, broken/forged chains, amended owners) returns null in both modes so fabrications can't DoS mints. Budget trips (PROOF_LIMIT) always propagate. Re-proof: digest + entityPage storage-key binding + strict endpoints + business + bilateral current-owner + FULL event tail (CREATED first, pinned new_state=ACTIVE + identity pins + old_state=null, legal chained STATE hops, ends at row state). upstreamOf/conflictsWith dedup'd, deterministic code-unit order. dedup_key+note validated/bounded. store.ts: JSON.parse wraps → IntegrityError-with-key on entityPage/get/list/verifiedEvent/listEvidence/planRevisions/listAllRaw (was bare SyntaxError). P18-A inert: no admission/scheduling/UI consumer. Codex-only.",
   "risk_override": "HIGH"
 }
