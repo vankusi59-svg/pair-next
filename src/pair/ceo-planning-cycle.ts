@@ -152,6 +152,24 @@ export interface CeoObservationDeps {
    *  BusinessLayer.proveWorkItemDone. A mutable status claim is NEVER
    *  completion authority; the observation only exposes the proof bit. */
   proveWorkItemDone: (row: Row) => boolean;
+  /** P16-C — optional advisory-context read seam. When wired it is
+   *  called with (objective_id, canonical owner actor) during
+   *  observation composition and its return is attached verbatim under
+   *  observation.brain_brief — INSIDE observation_digest, so cycle
+   *  identity, replay, and the post-invocation drift check all bind
+   *  the advisory content. Production wiring composes
+   *  ReasoningBriefService.briefFor → briefObservationView, which emits
+   *  exactly the digest-stable fields brief_digest pins; a wired
+   *  projection MUST be deterministic on canonical state. Errors
+   *  propagate fail-closed like every other observation read — the
+   *  model is never invoked over an observation that cannot compose.
+   *  The brief is ADVISORY-ONLY: it carries named options, never
+   *  commands; validation and commit authority stay with
+   *  assertCanonicalCeoDecision + the canonical workstream services. */
+  brain_brief?: (
+    objectiveId: string,
+    ownerActor: string,
+  ) => Record<string, unknown>;
 }
 
 /**
@@ -235,6 +253,17 @@ export function buildCeoObservation(
       : null,
     workstreams,
   };
+  // P16-C — advisory brief projection (ADVISORY_ONLY — named context,
+  //  never authority). Read identity is the strict-verified canonical
+  //  owner_authority_id from the row above: the reasoner consumes the
+  //  OWNER's governed view of its objective, while the invoker's
+  //  identity stays on attempt/decision provenance rows. Errors from
+  //  the seam propagate fail-closed — an observation that cannot
+  //  compose is never reasoned over.
+  if (deps.brain_brief) {
+    (observation as Record<string, unknown>).brain_brief =
+      deps.brain_brief(objectiveId, String(obj.owner_authority_id));
+  }
   return { observation, observation_digest: digest(observation) };
 }
 

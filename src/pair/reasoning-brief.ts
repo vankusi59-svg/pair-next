@@ -192,6 +192,52 @@ function gapOf(entry: string): BriefGap {
     : { code: entry.slice(0, i), detail: entry.slice(i + 1) };
 }
 
+/* The ONE digest-stable projection of a brief — brief_digest digests
+   exactly this, and P16-C attaches it (plus brief_digest) inside the
+   CEO observation. Sharing the projection makes the "observation binds
+   canonical brief content" invariant impossible to violate: volatile
+   fields (asof/actor/reasoner eligibility) and clock-derived AUTO_POLICY
+   fact fields (effective/expiry_pending) can never reach an observation
+   through this seam. */
+function briefDigestProjection(
+  brief: Omit<ReasoningBrief, "brief_digest">,
+): Record<string, unknown> {
+  return {
+    schema_version: brief.schema_version,
+    kind: brief.kind,
+    objective_id: brief.objective_id,
+    business_id: brief.business_id,
+    context_digest: brief.context_digest,
+    authority: brief.authority,
+    // Digest the volatile-stripped projection of AUTO_POLICY facts —
+    // the live clock fields stay visible in the emitted fact value.
+    facts: brief.facts.map((f) =>
+      f.predicate === "AUTO_POLICY"
+        ? { ...f, value: stripPolicyVolatile(f.value) }
+        : f),
+    hypotheses: brief.hypotheses,
+    options: brief.options,
+    missing_information: brief.missing_information,
+    confidence: brief.confidence,
+    // Out-of-scope-by-construction: eligibility gates read MODEL-CATALOG
+    // state (outside context_digest's scope) — only the configured
+    // binding is canonical brief content.
+    reasoner: { model_entry_id: brief.reasoner.model_entry_id },
+  };
+}
+
+/** P16-C — the advisory projection the CEO observation carries under
+ *  observation.brain_brief. Emits EXACTLY the fields brief_digest pins
+ *  plus brief_digest itself (digest-stable derived content): a consumer
+ *  can strip `brief_digest` and re-digest to verify the binding, and no
+ *  wiring can leak volatile brief fields into an observation through
+ *  this view. */
+export function briefObservationView(
+  brief: ReasoningBrief,
+): Record<string, unknown> {
+  return { ...briefDigestProjection(brief), brief_digest: brief.brief_digest };
+}
+
 export class ReasoningBriefService {
   constructor(
     private readonly store: PairEvidenceStore,
@@ -253,27 +299,7 @@ export class ReasoningBriefService {
     };
     return {
       ...brief,
-      brief_digest: digest({
-        schema_version: REASONING_BRIEF_SCHEMA,
-        kind: "REASONING_BRIEF",
-        objective_id: brief.objective_id,
-        business_id: brief.business_id,
-        context_digest: brief.context_digest,
-        // Digest the volatile-stripped projection of AUTO_POLICY
-        // facts — the live clock fields stay visible in the value.
-        facts: brief.facts.map((f) =>
-          f.predicate === "AUTO_POLICY"
-            ? { ...f, value: stripPolicyVolatile(f.value) }
-            : f),
-        hypotheses: brief.hypotheses,
-        options: brief.options,
-        missing_information: brief.missing_information,
-        confidence: brief.confidence,
-        // Out-of-scope-by-construction: eligibility gates read MODEL-
-        // CATALOG state (outside context_digest's scope) — only the
-        // configured binding is canonical brief content.
-        reasoner: { model_entry_id: reasoner.model_entry_id },
-      }),
+      brief_digest: digest(briefDigestProjection(brief)),
     };
   }
 

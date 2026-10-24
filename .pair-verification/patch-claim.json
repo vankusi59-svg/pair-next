@@ -1,18 +1,21 @@
 {
-  "claim_id": "P16_B_REASONING_BRIEF",
-  "title": "P16-B Strategic ReasoningBrief — deterministic advisory contract",
+  "claim_id": "P16_C_CEO_BRIEF_CONSUMPTION",
+  "title": "P16-C CEO consumes ReasoningBrief — advisory projection bound inside observation_digest",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
+    "src/__tests__/pair-p16-c-ceo-brief.test.ts#P16-C",
+    "src/__tests__/pair-p15-5-kpi-review.test.ts#P15.5",
+    "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts#P15.3",
+    "src/__tests__/pair-p15-3w-ceo-runtime-wiring.test.ts#P15.3W",
     "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
-    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
-    "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
+    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P16-B: src/pair/reasoning-brief.ts — ReasoningBriefService.briefFor composes the Strategic ReasoningBrief DETERMINISTICALLY from BrainContextService.contextFor (ONE read path: owner gate, scope, read budget, nested-budget refusal, fail-closed strict reads inherited; RB5/RB9). facts[] carry provenance tiers + section names — tier derives from the context's OWN integrity notes (KPI_PROGRESS_UNPROVEN:<id>/BUDGET_LEDGER_UNPROVEN), NOT the cockpit obsOk flag which conflates 'observation composed' with 'claims re-proven' (R1-M3; RB2/RB11). brief_digest pins canonical content only: asof/actor excluded, reasoner gates excluded (model-catalog state lives outside context_digest scope — a catalog mutation must not move the digest while context stands still), AUTO_POLICY facts digested as volatile-stripped projections (effective/expiry_pending stay visible in value) — verified stable across a REAL policy expiry instant while DISABLED row state moves it (R1-M1; RB10). Hypothesis/option gating uses canonical row fields only (state/configured/halt — never volatile). Binding truth: null+obsError → UNVERIFIED 'unobservable' never 'absent' — no PRE_DECOMPOSITION, no INITIALIZE/PRIORITIZE under observation_error (R1-M6 + brain-context BINDING_UNOBSERVABLE/WORKSTREAMS_UNOBSERVABLE labels; RB11). Terminal → zero options (RB3). POLICY_CONTROL names every legal owner recovery move — DISABLED→enable, PAUSED→resume (with lapsed-window caveat), EXPIRED→configure, HALTED→reset_halt, REVOKED→none (RB13). OWNER_GATE_BLOCKS_AUTONOMY requires a wired autoDriver (no driver to block when absent; RB13). reasoner = BOTH canonical gates in cycle order: resolveCeoModelTransport THEN assertCeoModelUsable, IntegrityError→UNRESOLVED/UNQUALIFIED+failure_code, non-IntegrityError propagates (R1-M4/M8; RB7). BRIEF_TRUNCATED markers appended after caps (R1-M2; RB12). Expected gaps exact-matched (R1-M5). ZERO writes (RB6); ADVISORY_ONLY; no second authority. Stacked on P16-A; CEO wiring is P16-C.",
+  "description": "P16-C: CEO observation carries the advisory ReasoningBrief — canonical observation stays the ONLY authority. ceo-planning-cycle.ts: CeoObservationDeps.brain_brief? seam; buildCeoObservation attaches the projection under observation.brain_brief INSIDE observation_digest so cycle identity/replay/post-invocation drift all bind brief content; read identity is the strict-verified owner_authority_id (invoker actor stays on attempt provenance, C6); seam errors fail closed pre-claim (C4). reasoning-brief.ts: briefObservationView shares the ONE digest projection — emits exactly brief_digest-pinned fields + brief_digest; volatile fields (asof/actor/eligibility/effective/expiry_pending) cannot leak; digest(view − brief_digest) === brief_digest (C7). ceo-decision.ts: prompt names the advisory boundary — options name existing authority channels, never commands; decision contract unchanged (C1/C10). ceo-runtime.ts: brain_brief? injection + default BrainContext→ReasoningBrief→view bound to the resolved model entry. Reads only — identical event/entity footprint (C5); malformed decisions rejected by unchanged validator (C3); mid-flight policy mutation invisible to old observation fields settles STALE only when wired (C9). Replay: zero extra invocations (C2). KNOWN CONTRACT SHIFT: p15-5 test 18 — a mid-flight workstream allocation is now visible to the cycle's own drift check via the brief, so the attempt settles FAIL_CLOSED_CEO_OBSERVATION_STALE at the strictly-earlier cycle boundary instead of the review's FAIL_CLOSED_P15_5_STALE_REVIEW; the invariant (zero P15.5 commit) is unchanged. No retries/fallback/second authority; Codex-only transport unchanged.",
   "risk_override": "HIGH"
 }
