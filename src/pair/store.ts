@@ -237,7 +237,14 @@ export class PairEvidenceStore {
       .all(...args) as Record<string, unknown>[];
     this.charge("entities", rows.length);
     return rows.map(row => {
-      const payload = JSON.parse(String(row.payload)) as T & { version: number };
+      let payload: T & { version: number };
+      try {
+        payload = JSON.parse(String(row.payload)) as T & { version: number };
+      } catch {
+        // An unparseable payload is corruption like any other — carry
+        // the key so paged consumers can isolate-and-skip it.
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
+      }
       if (digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
           payload.entity_type !== input.entity_type || payload.version !== row.version) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));

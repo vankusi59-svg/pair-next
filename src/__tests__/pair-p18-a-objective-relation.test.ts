@@ -32,6 +32,13 @@
  *   R13 owner amend post-mint — created_by must equal CURRENT
  *       bilateral owner; an amended endpoint drops the relation.
  *   R14 cross-connection mint — the immediate tx serializes dedup.
+ *   R15 read-budget trips propagate loudly — never silently truncate
+ *       the proven set into a duplicate mint or a cycle-check bypass.
+ *   R16 corrupt payload row — isolate-and-skip serves legit siblings.
+ *   R17 corrupt event anchor — fails only ITS row, not the service.
+ *   R18 CONFLICTS symmetric dedup — reverse pair converges.
+ *   R19 fabricated self-relation / CREATED-state rewrite / TEXT
+ *       version column → unproven or TAMPERED.
  */
 
 import { describe, expect, it } from "vitest";
@@ -495,6 +502,185 @@ describe("P18-A — objective_relation canonical entity", () => {
       from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
     expect(r2.relation_id).toBe(r1.relation_id);
     expect(s.store.list("objective_relation")).toHaveLength(1);
+    s.store.close();
+  });
+
+  it("R15 read-budget trips propagate — no silent truncation, no duplicate mint", () => {
+    const s = fresh("r15");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    // A starved entity budget must NOT silently truncate the proven
+    // set (which would defeat dedup → a second canonical row) — the
+    // trip is loud, and nothing commits. entities:2 is exhausted by
+    // the two endpoint reads alone; entityPage's charge then trips.
+    let code = "";
+    try {
+      s.store.withReadBudget(
+        { entities: 2, events: 10_000 },
+        () => s.relations.create({
+          from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER }));
+    } catch (e) {
+      code = e instanceof IntegrityError ? e.code : "non-integrity";
+    }
+    expect(code).toBe("FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT");
+    expect(s.store.list("objective_relation")).toHaveLength(1);
+    // Reads under a starved budget are loud too — never a silently
+    // truncated proven set.
+    code = "";
+    try {
+      s.store.withReadBudget(
+        { entities: 1, events: 10_000 },
+        () => s.relations.relationsFor(a));
+    } catch (e) {
+      code = e instanceof IntegrityError ? e.code : "non-integrity";
+    }
+    expect(code).toBe("FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT");
+    // And the cycle check can't be starved either: a→b→c exists, so
+    // c→a must fail loudly or correctly — never silently mint.
+    s.relations.create({ from_objective_id: b, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    expect(() => s.store.withReadBudget(
+      { entities: 2, events: 10_000 },
+      () => s.relations.create({
+        from_objective_id: c, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER })))
+      .toThrowError(IntegrityError);
+    expect(s.store.list("objective_relation")).toHaveLength(2);
+    s.store.close();
+  });
+
+  it("R16 corrupt payload row — isolate-and-skip still serves legit siblings", () => {
+    const s = fresh("r16");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    const legit = s.relations.create({
+      from_objective_id: a, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Unparseable payload — sorts before the REL_* ids.
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_0_CORRUPT", 1, "{not json", "0".repeat(64), "2026-01-01T00:00:00.000Z");
+    // Hash-valid but identity-lying payload on another key.
+    const bad = { relation_id: "REL_1_BAD", schema: "x", entity_id: "REL_1_BAD", version: 1 };
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_1_BAD", 1, JSON.stringify(bad), digest(bad), "2026-01-01T00:00:00.000Z");
+    // The two corrupt rows are isolated and skipped; the legit row
+    // sorts after them (REL- prefixed id > REL_0/REL_1? — assert the
+    // service answer regardless of order: exactly the legit row).
+    const got = s.relations.relationsFor(a);
+    expect(got).toHaveLength(1);
+    expect(String(got[0].relation_id)).toBe(legit.relation_id);
+    s.store.close();
+  });
+
+  it("R17 corrupt event anchor — fails only ITS row closed", () => {
+    const s = fresh("r17");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    const poisoned = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const healthy = s.relations.create({
+      from_objective_id: a, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Corrupt the poisoned relation's CREATED event hash.
+    db.prepare("UPDATE events SET event_hash=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run("0".repeat(64), poisoned.relation_id);
+    // Its row is unproven; the sibling still serves.
+    const got = s.relations.relationsFor(a);
+    expect(got.map((r) => String(r.relation_id))).toEqual([healthy.relation_id]);
+    expect(() => s.relations.control({
+      relation_id: poisoned.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    s.store.close();
+  });
+
+  it("R18 CONFLICTS is symmetric — reverse pair dedups to the same row", () => {
+    const s = fresh("r18");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r1 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "CONFLICTS", actor: OWNER });
+    // (B,A,CONFLICTS) is the same canonical fact — converge, not dup.
+    const r2 = s.relations.create({
+      from_objective_id: b, to_objective_id: a, kind: "CONFLICTS", actor: OWNER });
+    expect(r2.relation_id).toBe(r1.relation_id);
+    expect(s.store.list("objective_relation")).toHaveLength(1);
+    // DEPENDS_ON stays directional (different fact, not a dedup case
+    // — but the reverse direction would need acyclicity anyway).
+    s.store.close();
+  });
+
+  it("R19 fabrication guards — self-relation, CREATED-state rewrite, TEXT version", () => {
+    const s = fresh("r19");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const forgedEvent = (entityId: string, newState: string | null, metadata: Row) => {
+      const body: Row = {
+        event_id: `EVT_${entityId}`, entity_type: "objective_relation",
+        entity_id: entityId, event_type: "OBJECTIVE_RELATION_CREATED",
+        old_state: null, new_state: newState, actor: OWNER,
+        correlation_id: null, metadata,
+        created_at: "2026-01-01T00:00:00.000Z",
+      };
+      db.prepare("INSERT INTO events (event_id, entity_type, entity_id, event_type, old_state, new_state, actor, correlation_id, metadata_json, created_at, event_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .run(body.event_id, body.entity_type, body.entity_id, body.event_type,
+          body.old_state, body.new_state, body.actor, body.correlation_id,
+          JSON.stringify(metadata), body.created_at, digest(body));
+    };
+    // 1) Fully-fabricated self-relation — valid digest AND a forged
+    //    CREATED anchor (event-writer bound). Only the self-endpoint
+    //    re-check drops it.
+    const self: Row = {
+      relation_id: "REL_SELF", entity_id: "REL_SELF", entity_type: "objective_relation",
+      version: 1, schema: "pair.os.vnext.objective-relation.v1",
+      business_id: bid, from_objective_id: a, to_objective_id: a,
+      kind: "DEPENDS_ON", state: "ACTIVE", note: null, created_by: OWNER,
+      dedup_key: "x", created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z", relation_digest: "",
+    };
+    self.relation_digest = relationDigest(self);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_SELF", 1, JSON.stringify(self), digest(self), self.created_at);
+    forgedEvent("REL_SELF", "ACTIVE",
+      { business_id: bid, from_objective_id: a, to_objective_id: a, kind: "DEPENDS_ON" });
+    expect(s.relations.upstreamOf(a)).toEqual([b]); // self-edge excluded
+    // 2) Payload version rewritten to TEXT (CAS feeds off this field —
+    //    strict typeof must refuse before the coercion path). Do this
+    //    while the legit row's event tail is still clean.
+    const p2 = JSON.parse(
+      (db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(r.relation_id) as { payload: string }).payload);
+    p2.version = "1";
+    p2.relation_digest = relationDigest(p2);
+    db.prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run(JSON.stringify(p2), digest(p2), r.relation_id);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // 3) CREATED anchor's new_state rewritten (hash recomputed) on the
+    //    legit relation — the pin must reject it.
+    const ev = db.prepare(
+      "SELECT * FROM events WHERE entity_type='objective_relation' AND entity_id=?")
+      .get(r.relation_id) as Row;
+    const meta = ev.metadata_json ? JSON.parse(String(ev.metadata_json)) : null;
+    const body = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state, new_state: "REVOKED",
+      actor: ev.actor, correlation_id: ev.correlation_id, metadata: meta,
+      created_at: ev.created_at,
+    };
+    db.prepare("UPDATE events SET new_state=?, event_hash=? WHERE event_id=?")
+      .run("REVOKED", digest(body), ev.event_id);
+    expect(s.relations.relationsFor(a)).toHaveLength(0); // forged CREATED → unproven
     s.store.close();
   });
 });

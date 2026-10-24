@@ -42,7 +42,11 @@
  * silently drops out of the proven set until re-minted under the new
  * owner. CYCLE_DEPTH_CAP bounds total walk WORK (edges visited), not
  * path depth — a pathological graph denser than the cap fails mints/
- * resumes closed rather than scanning forever.
+ * resumes closed rather than scanning forever. `dedup_key` is stored
+ * and digest-pinned for audit but replay dedup is keyed on the
+ * canonical (from,to,kind) triple — CONFLICTS dedups symmetrically.
+ * Reads are O(relation rows + their event tails); a store read-budget
+ * trip propagates loudly rather than truncating the proven set.
  *
  * What a relation is NOT (P18-A boundary): minting one changes nothing
  * executable by itself — no admission gate, no scheduling effect, no
@@ -122,6 +126,14 @@ export function relationDigest(r: Record<string, unknown>): string {
  *  (REVOKED is terminal: nothing may leave it). */
 const RELATION_PAGE = 256;
 
+/** Deterministic code-unit ordering — localeCompare output is
+ *  environment-dependent, which would make canonical listings
+ *  non-reproducible across machines. */
+function byId(a: unknown, b: unknown): number {
+  const x = String(a), y = String(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
 const LEGAL_TRANSITIONS = new Set([
   "ACTIVE>SUSPENDED",
   "SUSPENDED>ACTIVE",
@@ -139,7 +151,11 @@ export class ObjectiveRelationService {
       // Strict read — schema + objective_digest re-proof, not a bare
       // hash-consistent payload (a forged endpoint never validates).
       return this._objectives.get(id) as Row;
-    } catch {
+    } catch (e) {
+      // Budget trips are not "unresolvable" — they mean the read was
+      // cut short; propagate so callers fail loudly, not silently.
+      if (e instanceof IntegrityError &&
+          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
       fail("FAIL_CLOSED_RELATION_OBJECTIVE", `objective ${id} does not resolve`);
     }
   }
@@ -164,6 +180,8 @@ export class ObjectiveRelationService {
     // Re-prove the scope claim AND bilateral authority against CURRENT
     // canonical state — a forged business pairing or a relation whose
     // consenting owner no longer owns both endpoints never serves.
+    // Budget trips are NOT "unproven" — they mean the read was cut
+    // short; propagate rather than silently dropping the row.
     try {
       const from = this.objective(String(row.from_objective_id));
       const to = this.objective(String(row.to_objective_id));
@@ -172,18 +190,32 @@ export class ObjectiveRelationService {
       const createdBy = String(row.created_by ?? "");
       if (createdBy !== String(from.owner_authority_id)) return null;
       if (createdBy !== String(to.owner_authority_id)) return null;
-    } catch {
+    } catch (e) {
+      if (e instanceof IntegrityError &&
+          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
       return null;
     }
+    // A self-relation can never be minted — a fabricated one is never
+    // served either.
+    if (String(row.from_objective_id) === String(row.to_objective_id)) return null;
     // Event tail must be a legal chain: CREATED first (with identity
     // pins matching the row), then STATE hops that are legal
     // transitions chaining from the prior new_state, ending at the
-    // row's current state.
-    const events = this.store.listEvents(
-      OBJECTIVE_RELATION_ENTITY, String(row.relation_id)) as Row[];
+    // row's current state. A corrupt anchor fails THIS row closed —
+    // it must not wedge unrelated relations.
+    let events: Row[];
+    try {
+      events = this.store.listEvents(
+        OBJECTIVE_RELATION_ENTITY, String(row.relation_id)) as Row[];
+    } catch (e) {
+      if (e instanceof IntegrityError &&
+          e.code === "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT") throw e;
+      return null;
+    }
     if (events.length === 0) return null;
     const first = events[0];
     if (first.event_type !== RELATION_CREATED_EVENT) return null;
+    if (String(first.new_state ?? "") !== "ACTIVE") return null;
     const meta = (first.metadata ?? null) as Row | null;
     if (!meta) return null;
     if (String(meta.business_id ?? "") !== String(row.business_id)) return null;
@@ -221,11 +253,17 @@ export class ObjectiveRelationService {
           limit: pageSize,
         }) as Row[];
       } catch (e) {
+        // Only a hash-mismatch carries the offending key in .detail —
+        // anything else (read-budget trips, API misuse) must propagate:
+        // silently treating it as "one bad row" would truncate the
+        // proven set and defeat dedup/acyclicity upstream.
+        if (!(e instanceof IntegrityError) ||
+            e.code !== "FAIL_CLOSED_ENTITY_HASH_MISMATCH") throw e;
         // A bad row kills its whole page — don't drop the legit rows
         // sharing it: shrink to single-row pages to isolate, then skip
         // the offender (its key is in err.detail).
         if (pageSize > 1) { pageSize = 1; continue; }
-        const bad = e instanceof IntegrityError ? String(e.detail) : "";
+        const bad = String(e.detail ?? "");
         if (!bad || bad <= after) throw e;
         after = bad;
         pageSize = RELATION_PAGE;
@@ -322,11 +360,16 @@ export class ObjectiveRelationService {
         this.assertAcyclic(edges, fromId, toId);
       }
       // Idempotent replay — checked AFTER authority so a replay can't
-      // oracle the relation's existence to a foreign owner.
-      const existing = proven.find(
-        (r) => r.from_objective_id === fromId &&
-          r.to_objective_id === toId && r.kind === kind &&
-          r.state !== "REVOKED");
+      // oracle the relation's existence to a foreign owner. CONFLICTS
+      // is a symmetric fact: (B,A,CONFLICTS) IS (A,B,CONFLICTS) — the
+      // reverse pair must converge to the same canonical row, never
+      // mint a second.
+      const existing = proven.find((r) => {
+        if (r.kind !== kind || r.state === "REVOKED") return false;
+        if (r.from_objective_id === fromId && r.to_objective_id === toId) return true;
+        return kind === "CONFLICTS" &&
+          r.from_objective_id === toId && r.to_objective_id === fromId;
+      });
       if (existing) return existing;
 
       const now = utcnow();
@@ -338,7 +381,8 @@ export class ObjectiveRelationService {
         to_objective_id: toId,
         kind: kind as RelationKind,
         state: "ACTIVE",
-        note: input.note != null ? String(input.note).slice(0, NOTE_CAP) : null,
+        note: input.note != null
+          ? [...String(input.note)].slice(0, NOTE_CAP).join("") : null,
         created_by: actor,
         dedup_key: input.dedup_key ?? digest({ fromId, toId, kind }),
         created_at: now,
@@ -346,7 +390,8 @@ export class ObjectiveRelationService {
         relation_digest: "",
       };
       row.relation_digest = relationDigest(row);
-      this.store.put(OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...row }, 0);
+      const saved = this.store.put(
+        OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...row }, 0);
       this.store.event({
         entity_type: OBJECTIVE_RELATION_ENTITY,
         entity_id: row.relation_id,
@@ -360,7 +405,9 @@ export class ObjectiveRelationService {
           kind,
         },
       });
-      return row;
+      // Return the stored row — put injects entity_id/version; dedup
+      // replays and control() return the same shape.
+      return saved as ObjectiveRelationRow;
     });
   }
 
@@ -420,9 +467,9 @@ export class ObjectiveRelationService {
             r.kind === "DEPENDS_ON" && r.state !== "REVOKED");
         this.assertAcyclic(edges, row.from_objective_id, row.to_objective_id);
       }
-      const colVersion = Number(
-        (stored as { version?: unknown }).version ?? NaN);
-      if (!Number.isInteger(colVersion) || colVersion < 1) {
+      const colVersion = (stored as { version?: unknown }).version;
+      if (typeof colVersion !== "number" ||
+          !Number.isInteger(colVersion) || colVersion < 1) {
         fail("FAIL_CLOSED_RELATION_TAMPERED", "version column unmatchable");
       }
       const updated: ObjectiveRelationRow = {
@@ -451,14 +498,14 @@ export class ObjectiveRelationService {
     return this.allProven()
       .filter((r) => r.from_objective_id === objectiveId ||
         r.to_objective_id === objectiveId)
-      .sort((a, b) => String(a.relation_id).localeCompare(String(b.relation_id)));
+      .sort((a, b) => byId(a.relation_id, b.relation_id));
   }
 
   /** All proven relations inside the business — the portfolio seam. */
   relationsForBusiness(businessId: string): ObjectiveRelationRow[] {
     return this.allProven()
       .filter((r) => r.business_id === businessId)
-      .sort((a, b) => String(a.relation_id).localeCompare(String(b.relation_id)));
+      .sort((a, b) => byId(a.relation_id, b.relation_id));
   }
 
   /** ACTIVE DEPENDS_ON upstream objectives of `objectiveId` — the
