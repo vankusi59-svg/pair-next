@@ -1410,6 +1410,77 @@ export function createMissionControlServer(
         }
         throw new IntegrityError("FAIL_CLOSED_KPI_VERIFY", `action ${action} unsupported`);
       }
+      /* ----- P15.9 Step-0 — owner-scoped measurement / evidence /
+         amendment. These HTTP seams were absent: the P15.1 authority
+         methods recordProgress / attachEvidence / amend existed but
+         were unreachable over the wire (curl-only for kpi-verification,
+         nothing for the rest). Owner proof comes ONLY from the trusted
+         x-operator-id header — a body-declared owner field is never
+         authority. The verifier inside the evidence is always the
+         header-derived actor itself (operator:<id>): the P15.1
+         assertOwnerVerifier gate then requires actor ===
+         owner_authority_id, so a non-owner fails closed inside the
+         service. All semantics (scope, terminal, ledger idempotency,
+         CAS version, AMENDABLE_KEYS, budget re-proof) stay in
+         ObjectiveAuthorityService — the route only authenticates and
+         passes schema-checked inputs through. accountBudget is
+         deliberately NOT exposed: the service does not assertOwner for
+         it (it is the canonical cost-pipeline seam), so an HTTP seam
+         would weaken the call discipline for zero owner-facing need. */
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/(progress|evidence|amend)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const rawOwnerActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawOwnerActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const ownerActor = rawOwnerActor.startsWith("operator:")
+          ? rawOwnerActor
+          : `operator:${rawOwnerActor}`;
+        const ownerAction = m[2]!;
+        const businessId = String(body.business_id ?? "");
+        if (ownerAction === "amend") {
+          if (!body.patch || typeof body.patch !== "object" || Array.isArray(body.patch)) {
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_AMEND",
+              "patch must be a non-null object (keys restricted by AMENDABLE_KEYS in the authority service)",
+            );
+          }
+          return void json(res, 200, biz.objectives.amend(m[1]!, {
+            business_id: businessId,
+            patch: body.patch as Record<string, unknown>,
+            reason: body.reason === undefined ? undefined : String(body.reason),
+            actor: ownerActor,
+          }));
+        }
+        /* progress + evidence share the owner-verifier evidence shape:
+           the verifier is ALWAYS the header-derived actor — a
+           body-supplied verifier can never substitute authority. The
+           evidence_key is the idempotency anchor (ledger dedup +
+           conflict semantics live in the service). */
+        const evidence = {
+          evidence_key: String(body.evidence_key ?? "") || crypto.randomUUID(),
+          verifier: ownerActor,
+          source: String(body.source ?? "") || "owner-console",
+        };
+        const note = body.note === undefined ? undefined : String(body.note);
+        if (ownerAction === "progress") {
+          return void json(res, 200, biz.objectives.recordProgress(m[1]!, {
+            business_id: businessId,
+            kpi_id: String(body.kpi_id ?? ""),
+            value: Number(body.value),
+            evidence,
+            note,
+            actor: ownerActor,
+          }));
+        }
+        return void json(res, 200, biz.objectives.attachEvidence(m[1]!, {
+          business_id: businessId,
+          evidence,
+          note,
+          actor: ownerActor,
+        }));
+      }
       // ----- P15.10-B — owner-scoped RECONCILE_ONLY scheduler status -----
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-scheduler$/);
       if (m && method === "GET") {

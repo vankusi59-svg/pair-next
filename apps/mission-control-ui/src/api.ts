@@ -175,6 +175,58 @@ export const api = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* P15.9 Step-0 — owner-scoped measurement / evidence / amendment
+     seams. Owner proof derives from x-operator-id at the edge only;
+     the UI never sends an owner/verifier field — the server sets the
+     evidence verifier to the header-derived actor and the authority
+     service enforces actor === owner_authority_id. evidence_key /
+     idempotency_key are minted per operation and replayed verbatim on
+     retry (ledger dedup keeps an ambiguous retry from double-minting). */
+  objectiveRecordProgressApp: (
+    id: string,
+    body: {
+      business_id: string; kpi_id: string; value: number;
+      evidence_key?: string; source?: string; note?: string;
+    },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/progress`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  objectiveAttachEvidenceApp: (
+    id: string,
+    body: { business_id: string; evidence_key?: string; source?: string; note?: string },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/evidence`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  objectiveAmendApp: (
+    id: string,
+    body: { business_id: string; patch: Record<string, unknown>; reason?: string },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/amend`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  /* P15.10-D KPI-verifier grant plane (route already existed; this is
+     the first UI caller). action: grant | status | revoke | disable.
+     Grant wakes the scheduler inside the same store.immediate commit. */
+  objectiveKpiVerificationApp: (
+    id: string,
+    body: {
+      action: "grant" | "status" | "revoke" | "disable";
+      kpi_id?: string;
+      rule?: Record<string, unknown>;
+      expires_at?: string;
+      authorization_id?: string;
+      idempotency_key?: string;
+    },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/kpi-verification`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
   createObjectiveApp: (input: import("./types").VnextObjectiveInput) =>
     req<import("./types").CanonicalObjective>("/vnext/objectives", {
       method: "POST",

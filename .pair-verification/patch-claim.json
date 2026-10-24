@@ -1,18 +1,21 @@
 {
-  "claim_id": "KPI_VERIFIER_GRANT_REARMS_EVIDENCE_WAIT",
-  "title": "Atomic KPI verifier grant wakes eligible evidence wait",
+  "claim_id": "P15_9_OWNER_ACTION_SEAMS_PLUS_P16_A_BRAIN_CONTEXT",
+  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10c.test.ts#KVA grant wake for settled KPI evidence queue",
-    "src/__tests__/pair-p15-10d.test.ts#P15.10-D",
-    "src/__tests__/pair-p15-10d.test.ts#A2 no KVA",
-    "src/__tests__/pair-p15-10c-r2.test.ts#P15.10-C R3"
+    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
+    "src/__tests__/pair-p15-9a-company-cockpit.test.ts#P15.9-A1",
+    "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
   ],
   "invariants": [
+    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "HIGH-risk scheduler/KPI endpoint repair vs BASE e0885f7de03e2a961680a3b72e458fb398bb4a62. (1) WAITING_EVIDENCE/VERIFIED_KPI_EVIDENCE deadlock: owner-scoped canonical KPI grant wakes a settled quiet queue atomically inside the same store.immediate as the grant; scheduler.notifyKpiVerifierGrant re-proves queue state, authority binding, no active lease, KVA identity+schema+digest+effective state, then writes a receipt-bound (kpi-verifier-grant:<authorization_id>) idempotent wake + pending_generation bump. Healthy/quarantined/blocked/active/non-KPI waits and malformed/forged/revoked/expired/foreign grants never wake; grant never mints progress — KVR comes only from the pass verifier. (2) Precision defect found by the real e2e: the pass's OWN verifier write (advance->recordProgress) bumps objective row.version, which raw-version pins treated as drift -> mid-pass DRIVER_AUTHORITY_LOST. Pins in claimable/requireCurrent/requireRebind/currentLease now bind authority identity only (policy_version, terms_digest_binding, terms_current = live objective_digest, owner, business, effective); terms/status/owner drift still fails closed, runtime progress/spend writes do not count as drift. No lease lifecycle/heartbeat/retry/sign-off changes; objective_version kept for diagnostics. AUDIT R1 CLOSURE — regression-only, zero production diff: new R3 tests in pair-p15-10c-r2 prove every commit boundary still fails closed without the raw version pin: external recordProgress mid-CEO-await -> attempt STALE, zero decision rows (R1-KPI); external accountBudget mid-await -> same (R1-BUD); pass's own runtime write -> gate holds, settle commits (R1-SELF); owner amend mid-pass -> DRIVER_AUTHORITY_LOST, no settle (R1-AMEND); drift between PRIORITIZE review and allocation -> bounded WAITING via observation re-proof, zero WAL (R1-DISP); pause/resume covered by R2-F1a. No bypass confirmed.",
+  "description": "Step 0 (P15.9): owner-scoped POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Owner proof is ONLY the trusted x-operator-id header (canonicalized once to operator:<id>); a body-declared owner/verifier is never authority — the evidence verifier is always the header-derived actor so assertOwnerVerifier enforces actor === owner_authority_id in the service. All semantics stay inside ObjectiveAuthorityService. accountBudget is deliberately NOT exposed (no assertOwner — cost-pipeline seam). UI: api.ts wrappers + ObjectiveDetail owner actions (measurement/evidence/amend) with exact-body idempotent retry + KPI-verifier grants card; grant+wake atomicity unchanged. Measurement is owner-attested via the owner-verifier seam — UI never mints verified state or sends a verifier field. Step 1 (P16-A ms1): brain-context.ts BrainContextService.contextFor — the Brain's only canonical read surface. Read-only by construction: strict reads delegate to the existing ObjectiveCockpitService composition; zero puts/events/model calls (B7). Owner-gated FAIL_CLOSED_BRAIN_AUTHORITY/SCOPE; tamper propagates strict-read errors (B2); broken CAS artifacts drop+report, never trusted (B4); business isolation (B5). Bounded via store.withReadBudget — typed PROOF_LIMIT on exhaustion, never silent truncation (B6). Deterministic context_digest stable iff canonical state unchanged, asof excluded (B1). Unscoped memory/experience report typed SCOPE_BINDING_ABSENT gaps (P17 prerequisite). Library-only — no server/UI Brain wiring this milestone.",
   "risk_override": "HIGH"
 }
