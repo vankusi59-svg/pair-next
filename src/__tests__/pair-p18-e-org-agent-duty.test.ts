@@ -15,6 +15,17 @@
  *   E10 dangling/mis-bound index pointers wedge FAIL_CLOSED_DUTY_INDEX.
  *   E11 unsorted/duplicate objective_ids in a stored row → unproven.
  *   E12 REVOKED duty still enumerated but never covers.
+ *   E13 colon endpoint ids are unkeyable — rejected at mint, reads
+ *       and provenRow (a colon-agent row can never wedge a prefix
+ *       sibling; R1-F1).
+ *   E14 corrupt index marker → lenient reads fall back to the strict
+ *       global enumeration and still serve; strict writes wedge on
+ *       the marker CAS (R1-F2).
+ *   E15 corrupt INDEX pointer row → lenient reads isolate+skip and
+ *       serve siblings; strict writes propagate (R1-F3 parity).
+ *   E16 non-array covers() input returns false — no raw TypeError
+ *       (R1-F6); INDEX_CHUNK boundary — marker builds only after the
+ *       complete bound set is indexed.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -343,6 +354,119 @@ describe("P18-E — org-agent duties spanning objectives", () => {
     expect(listed.map((x) => x.duty_id)).toEqual([d.duty_id]);
     expect(listed[0]!.state).toBe("REVOKED");
     expect(duties.coveringDuties(agent, [objA])).toHaveLength(0);
+    store.close();
+  });
+
+  it("E13 colon endpoint ids are unkeyable — boundary rejects", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA, businessId } = mkScope(store);
+    // A colon-id org_agent can exist as a raw row — the duty boundary
+    // must refuse to key it (its pointers would land inside another
+    // endpoint's prefix range and wedge that endpoint forever).
+    const colonAgent = mkAgent(store, businessId).replace("AGT_", "a:b_");
+    store.put("org_agent", colonAgent, {
+      agent_id: colonAgent, business_id: businessId, title: "c",
+      department: "ops", role: "", reports_to: null,
+      executor_binding: null, capabilities: [],
+      status: "ACTIVE", context_notes: [],
+      created_at: utcnow(), version: 0,
+    }, 0);
+    expectFail(() => duties.create({
+      org_agent_id: colonAgent, objective_ids: [objA], actor: OWNER,
+    }), "FAIL_CLOSED_DUTY_FIELDS");
+    expectFail(() => duties.dutiesForAgent(colonAgent),
+      "FAIL_CLOSED_DUTY_FIELDS");
+    // A normal agent is unaffected.
+    duties.create({ org_agent_id: agent, objective_ids: [objA], actor: OWNER });
+    expect(duties.dutiesForAgent(agent)).toHaveLength(1);
+    // A stored row with a colon endpoint can never prove — forge one.
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    const rid = `DUT_colon_${n}`;
+    const payload: Record<string, unknown> = {
+      schema: "pair.os.vnext.org-agent-duty.v1",
+      duty_id: rid, business_id: businessId, org_agent_id: colonAgent,
+      objective_ids: [objA], state: "ACTIVE", note: null,
+      created_by: OWNER, dedup_key: `ck${n}`,
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      entity_type: "org_agent_duty", entity_id: rid, version: 1,
+    };
+    payload.duty_digest = dutyDigest(payload);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("org_agent_duty", rid, 1, JSON.stringify(payload), digest(payload),
+        "2026-01-01T00:00:00.000Z");
+    expect(duties.dutiesForObjective(objA).map((x) => x.duty_id))
+      .not.toContain(rid);
+    store.close();
+  });
+
+  it("E14 corrupt marker → lenient reads fall back; writes wedge loudly", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA } = mkScope(store);
+    const d = duties.create({
+      org_agent_id: agent, objective_ids: [objA], actor: OWNER });
+    duties.ensureIndex();
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    db.prepare("UPDATE entities SET payload='corrupt' WHERE entity_type='org_agent_duty_index_state'").run();
+    // Lenient reads treat the unreadable marker as unbuilt and fall
+    // back to the complete strict global enumeration — still served.
+    expect(duties.dutiesForObjective(objA).map((x) => x.duty_id))
+      .toEqual([d.duty_id]);
+    expect(duties.dutiesForAgent(agent)).toHaveLength(1);
+    // Writes cannot silently proceed on inconsistent derived state —
+    // the marker put CAS-conflicts loudly.
+    expectFail(() => duties.create({
+      org_agent_id: agent, objective_ids: [objA], actor: OWNER,
+    }), "FAIL_CLOSED");
+    store.close();
+  });
+
+  it("E15 corrupt index pointer — lenient skips, strict propagates", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA, objB } = mkScope(store);
+    const d1 = duties.create({
+      org_agent_id: agent, objective_ids: [objA], actor: OWNER });
+    const d2 = duties.create({
+      org_agent_id: agent, objective_ids: [objB], actor: OWNER });
+    duties.ensureIndex();
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Corrupt ONE pointer row under the agent's prefix.
+    db.prepare("UPDATE entities SET payload='corrupt' WHERE entity_type='org_agent_duty_index' AND entity_id=?")
+      .run(`A:${agent}:${d1.duty_id}`);
+    // Lenient read isolates the corrupt pointer — sibling duty serves.
+    expect(duties.dutiesForAgent(agent).map((x) => x.duty_id))
+      .toEqual([d2.duty_id]);
+    // Strict dedup (create) propagates the corruption loudly.
+    expectFail(() => duties.create({
+      org_agent_id: agent, objective_ids: [objA, objB], actor: OWNER,
+    }), "FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    store.close();
+  });
+
+  it("E16 non-array covers() returns false; chunk boundary builds late", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA, businessId } = mkScope(store);
+    expect(duties.covers(agent, "not-an-array" as never)).toBe(false);
+    expect(duties.covers(agent, null as never)).toBe(false);
+    expect(duties.covers(agent, undefined as never)).toBe(false);
+    // INDEX_CHUNK=64 boundary: marker must report built only after the
+    // COMPLETE bound set is indexed — mint 66 duties (same business)
+    // to cross a chunk, then reads must serve every endpoint.
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    const agents: string[] = [];
+    for (let i = 0; i < 66; i++) {
+      const a = mkAgent(store, businessId);
+      agents.push(a);
+      duties.create({ org_agent_id: a, objective_ids: [objA], actor: OWNER });
+    }
+    const marker = db.prepare(
+      "SELECT payload FROM entities WHERE entity_type='org_agent_duty_index_state'")
+      .get() as { payload: string };
+    expect(JSON.parse(marker.payload).built).toBe(true);
+    // Every minted duty is reachable — a chunk-cut early 'built' would
+    // silently drop the tail.
+    expect(duties.dutiesForObjective(objA)).toHaveLength(66);
+    expect(duties.dutiesForAgent(agents[65]!)).toHaveLength(1);
     store.close();
   });
 });

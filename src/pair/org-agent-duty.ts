@@ -39,7 +39,16 @@
  * the owner must re-mint under the new authority. Deleting a covered
  * objective unproves the duty (semantic drop). A corrupt duty row
  * wedges strict write paths and fails closed on reads (siblings still
- * serve). DELETE+verbatim-restore of a row AND its event tail is
+ * serve); a corrupt index-marker or index-pointer row is treated as
+ * unbuilt/skipped under lenient reads (the strict global fallback is
+ * complete). A raw-write DELETE of a pointer row can hide a proven
+ * duty from that endpoint's index scan — dedup completeness rests on
+ * the atomic pointer-mint invariant, the same raw-write bound P18-A
+ * documents (the row remains discoverable via its other endpoints'
+ * pointers and the global fallback). org_agent.status is deliberately
+ * NOT part of the proof — status is runtime-mutable, not authority;
+ * executability gates live at the assignment/binding seams. DELETE+
+ * verbatim-restore of a row AND its event tail is
  * fabrication-indistinguishable — the store is the integrity boundary.
  *
  * Reads are O(degree) via the dual pointer index once built
@@ -131,6 +140,19 @@ const LEGAL_TRANSITIONS = new Set([
   "SUSPENDED>REVOKED",
 ]);
 
+/** Index keys are `:`-delimited — an endpoint id containing a colon is
+ *  unkeyable (a colon-agent's pointers would land inside another
+ *  endpoint's prefix range and wedge it forever). Canonical OBJ_/AGT_
+ *  ids never contain one; raw-SQL agent rows can. The boundary rejects
+ *  colon endpoints at mint AND at reads, and provenRow drops any stored
+ *  row carrying one — that shape could never have been minted. */
+function assertEndpointKey(field: string, id: string): void {
+  if (!id || id.includes(":")) {
+    fail("FAIL_CLOSED_DUTY_FIELDS",
+      `${field} must be non-empty and contain no ':' (index-keyed)`);
+  }
+}
+
 export class OrgAgentDutyService {
   private _objectives?: ObjectiveAuthorityService;
   constructor(private readonly store: PairEvidenceStore) {}
@@ -211,6 +233,10 @@ export class OrgAgentDutyService {
     for (let i = 0; i < ids.length; i++) {
       if (String(ids[i]) !== normalized[i]) return null;
     }
+    // Colon endpoints are unkeyable at the index boundary — a stored
+    // row carrying one could never have been minted: unproven.
+    if (normalized.some((v) => v.includes(":"))) return null;
+    if (String(row.org_agent_id ?? "").includes(":")) return null;
     try {
       const createdBy = String(row.created_by ?? "");
       for (const oid of normalized) {
@@ -323,8 +349,18 @@ export class OrgAgentDutyService {
     return row && typeof row === "object" ? row : null;
   }
 
+  /** The marker gates a DERIVED index — an unreadable marker row is
+   *  treated as unbuilt so reads fall back to the identical strict
+   *  global enumeration instead of wedging (the fallback is complete;
+   *  nothing is lost). Non-corruption faults still propagate. */
   private indexBuilt(): boolean {
-    return this.indexMarker()?.built === true;
+    try {
+      return this.indexMarker()?.built === true;
+    } catch (e) {
+      if (e instanceof IntegrityError &&
+          e.code === "FAIL_CLOSED_ENTITY_HASH_MISMATCH") return false;
+      throw e;
+    }
   }
 
   /** Idempotent pointer write — one index row per (kind, endpoint, duty). */
@@ -351,7 +387,17 @@ export class OrgAgentDutyService {
    *  indexed, never on a chunk-cut short page. Idempotent; a no-op
    *  once built. Call inside a store.immediate writer. */
   ensureIndex(): void {
-    const marker = this.indexMarker();
+    let marker: Row | null;
+    try {
+      marker = this.indexMarker();
+    } catch (e) {
+      // Corrupt marker → rebuild from scratch; the terminal marker put
+      // CAS-conflicts loudly on the still-corrupt physical row.
+      if (e instanceof IntegrityError &&
+          e.code === "FAIL_CLOSED_ENTITY_HASH_MISMATCH") {
+        marker = null;
+      } else throw e;
+    }
     if (marker?.built === true) return;
     let after = String(marker?.cursor ?? "");
     let processed = 0;
@@ -399,13 +445,31 @@ export class OrgAgentDutyService {
     const out = new Map<string, OrgAgentDutyRow>();
     const pfx = `${prefix}:${endpoint}:`;
     let after = pfx;
+    let pageSize = DUTY_PAGE;
     for (;;) {
-      const page = this.store.entityPage<Row>({
-        entity_type: DUTY_INDEX_ENTITY,
-        after_id: after,
-        limit: DUTY_PAGE,
-        upper_id: pfx + String.fromCharCode(0xffff),
-      }) as Row[];
+      let page: Row[];
+      try {
+        page = this.store.entityPage<Row>({
+          entity_type: DUTY_INDEX_ENTITY,
+          after_id: after,
+          limit: pageSize,
+          upper_id: pfx + String.fromCharCode(0xffff),
+        }) as Row[];
+      } catch (e) {
+        // Corrupt pointer row: strict propagates (dedup can't silently
+        // miss); lenient isolates with single-row pages and skips the
+        // offender via err.detail — parity with allProven's handling of
+        // corrupt duty rows so both paths serve the same answer.
+        if (!(e instanceof IntegrityError) ||
+            e.code !== "FAIL_CLOSED_ENTITY_HASH_MISMATCH") throw e;
+        if (strict) throw e;
+        if (pageSize > 1) { pageSize = 1; continue; }
+        const bad = String(e.detail ?? "");
+        if (!bad || bad === after) throw e;
+        after = bad;
+        pageSize = DUTY_PAGE;
+        continue;
+      }
       if (!page.length) break;
       for (const ptr of page) {
         const key = String(ptr.entity_id);
@@ -455,13 +519,14 @@ export class OrgAgentDutyService {
         if (proven) out.set(String(proven.duty_id), proven);
         after = key;
       }
-      if (page.length < DUTY_PAGE) break;
+      if (page.length < pageSize) break;
     }
     return [...out.values()].sort((a, b) => byId(a.duty_id, b.duty_id));
   }
 
   private provenForEndpoint(prefix: "O" | "A", endpoint: string,
     strict: boolean): OrgAgentDutyRow[] {
+    assertEndpointKey("endpoint", endpoint);
     if (this.indexBuilt()) return this.provenViaIndex(prefix, endpoint, strict);
     return this.allProven(strict).filter((d) =>
       prefix === "O"
@@ -484,6 +549,7 @@ export class OrgAgentDutyService {
     const actor = assertOwnerAuthorityRef("actor", input.actor);
     const agentId = String(input.org_agent_id ?? "");
     if (!agentId) fail("FAIL_CLOSED_DUTY_FIELDS", "org_agent_id required");
+    assertEndpointKey("org_agent_id", agentId);
     const rawIds = Array.isArray(input.objective_ids)
       ? input.objective_ids : null;
     if (!rawIds || !rawIds.length) {
@@ -493,6 +559,7 @@ export class OrgAgentDutyService {
     if (objectiveIds.some((v) => !v)) {
       fail("FAIL_CLOSED_DUTY_FIELDS", "objective_ids contains empty id");
     }
+    for (const oid of objectiveIds) assertEndpointKey("objective_ids", oid);
     if (objectiveIds.length > DUTY_OBJECTIVE_CAP) {
       fail("FAIL_CLOSED_DUTY_FIELDS",
         `objective_ids exceeds cap ${DUTY_OBJECTIVE_CAP}`);
@@ -679,6 +746,8 @@ export class OrgAgentDutyService {
    *  deliberately NOT coverage — two narrow duties never combine into
    *  a mandate nobody granted. */
   coveringDuties(agentId: string, objectiveIds: string[]): OrgAgentDutyRow[] {
+    // A non-set covers nothing — typed edge, never a raw TypeError.
+    if (!Array.isArray(objectiveIds)) return [];
     const wanted = [...new Set(objectiveIds.map(String))];
     if (!wanted.length) return [];
     return this.dutiesForAgent(agentId).filter((d) =>
