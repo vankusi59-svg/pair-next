@@ -294,7 +294,15 @@ export class BrainContextService {
     );
 
     const obsUnavailable: string[] = [];
-    if (c.binding === null) obsUnavailable.push("BINDING_ABSENT:pre-INITIALIZE");
+    if (c.binding === null) {
+      // null is "absent" only when the strict observation COMPOSED —
+      // under observation_error the binding is unobservable, and
+      // claiming pre-INITIALIZE would misreport a bound objective.
+      obsUnavailable.push(
+        obsError === null
+          ? "BINDING_ABSENT:pre-INITIALIZE"
+          : `BINDING_UNOBSERVABLE:${obsError}`);
+    }
     if (obsError !== null) obsUnavailable.push(`OBSERVATION_ERROR:${obsError}`);
     sections.observation = section(
       ["buildReviewObservation", "objective_workstream.getBinding"],

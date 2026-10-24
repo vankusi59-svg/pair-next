@@ -47,6 +47,8 @@ import {
   MissionScheduler,
   MissionSupervisor,
   ModelEvidenceCatalog,
+  ObjectiveAutoPolicyService,
+  ObjectiveKpiVerificationService,
   ObjectiveWorkstreamService,
   PairControlPlane,
   PairEvidenceStore,
@@ -99,6 +101,7 @@ type FullStack = {
   authority: ArtifactAuthority; service: PairControlPlane;
   control: MissionControl; projectId: string;
   brain: BrainContextService;
+  kpiSvc: ObjectiveKpiVerificationService;
 };
 
 function freshFullStack(name: string): FullStack {
@@ -155,8 +158,11 @@ function freshFullStack(name: string): FullStack {
     objectives: biz.objectives, workstreams,
     artifacts: authority,
   });
+  const kpiSvc = new ObjectiveKpiVerificationService({
+    store, objectives: biz.objectives, workstreams, business: biz,
+    artifacts: authority });
   return { dir, store, biz, wf, workstreams, alloc, authority, service,
-    control, projectId: String(project.project_id), brain };
+    control, projectId: String(project.project_id), brain, kpiSvc };
 }
 
 function mkBusiness(s: FullStack) {
@@ -258,6 +264,13 @@ function brief(s: FullStack, modelEntryId?: string) {
     brain: s.brain, model_entry_id: modelEntryId });
 }
 
+function grantBundle(s: FullStack, oid: string, rule: Record<string, unknown>) {
+  return s.kpiSvc.grant(oid, {
+    actor: OWNER, kpi_id: KPI,
+    rule: { rule_type: "DELIVERABLE_BUNDLE", ...rule },
+    expires_at: FUTURE, idempotency_key: `kv-${counter++}` });
+}
+
 /** Canonically QUALIFIED codex-cli model — mirrors p15-3's fixture. */
 function mkQualifiedModel(s: FullStack): string {
   const mcat = new ModelEvidenceCatalog(s.store);
@@ -338,11 +351,13 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
       expect(f.sections.every((n) => n in s.brain.contextFor(oid, OWNER).sections))
         .toBe(true);
     }
-    // Pre-binding: the KPI row exists but its claim has no observation
-    // re-proof — UNVERIFIED, never smoothed over.
+    // Pre-binding: proveClaims re-proved the (vacuous) claim chain —
+    // PROVEN. The assessment field inside the value stays UNVERIFIED:
+    // met-ness was never observationally verified. Two honest axes.
     const kpi = b.facts.find((f) => f.predicate === "KPI_MEASUREMENT")!;
     expect(kpi.subject).toBe(KPI);
-    expect(kpi.provenance).toBe("UNVERIFIED");
+    expect(kpi.provenance).toBe("PROVEN");
+    expect((kpi.value as Row).assessment).toBe("UNVERIFIED");
     const status = b.facts.find((f) => f.predicate === "OBJECTIVE_STATUS")!;
     expect(status.provenance).toBe("CANONICAL");
     s.store.close();
@@ -459,6 +474,16 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
     expect(b2.reasoner.transport!.provider_id).toBe("codex-cli");
     expect(b2.reasoner.transport!.protocol_family).toBe("CODEX_CLI");
     expect(b2.brief_digest).not.toBe(b0.brief_digest); // configured binding IS content
+    // UNQUALIFIED — an existing entry that fails a usability gate
+    // reports the failure_code; transport still resolves.
+    const mcat = new ModelEvidenceCatalog(s.store);
+    const { entry: unq } = mcat.upsertModelClaim({
+      provider_id: "codex-cli", provider_family: "codex-cli",
+      model_id: "codex-unqualified", capability_hints: ["text_inference"] });
+    const b3 = brief(s, String(unq.model_entry_id)).briefFor(oid, OWNER);
+    expect(b3.reasoner.eligibility).toBe("UNQUALIFIED");
+    expect(b3.reasoner.failure_code).toMatch(/FAIL_CLOSED_CEO_/);
+    expect(b3.reasoner.transport).not.toBeNull();
     s.store.close();
   });
 
@@ -497,6 +522,108 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
         brief(s).briefFor(oid, OWNER)),
     ).toThrowError(expect.objectContaining({ code: "FAIL_CLOSED_BRAIN_BUDGET" }));
     expect(() => brief(s).briefFor(oid, OWNER)).not.toThrow();
+    s.store.close();
+  });
+
+  it("RB10 volatile policy fields never move brief_digest across a real expiry instant", () => {
+    const { s, oid } = seeded("rb10", []);
+    /* M1 regression — a REAL ObjectiveAutoPolicyService whose
+       expires_at passes between reads flips effective/expiry_pending
+       (visible in the AUTO_POLICY fact VALUE) but must NOT move
+       brief_digest: the digest pins canonical state only. */
+    const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives);
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
+        max_ceo_calls: 4 },
+      idempotency_key: `cfg-rb10-${counter}`,
+    });
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: 1, idempotency_key: `en-rb10-${counter}`,
+    });
+    const liveBrain = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: policy });
+    const b1 = new ReasoningBriefService(s.store, { brain: liveBrain })
+      .briefFor(oid, OWNER);
+    const ap1 = (b1.facts.find((f) => f.predicate === "AUTO_POLICY")!
+      .value as Row);
+    expect(ap1.expiry_pending).toBe(false);
+    // Clock jumps past expiry — same canonical rows.
+    const stalePolicy = new ObjectiveAutoPolicyService(
+      s.store, s.biz.objectives, () => Date.now() + 120_000);
+    const staleBrain = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: stalePolicy });
+    const b2 = new ReasoningBriefService(s.store, { brain: staleBrain })
+      .briefFor(oid, OWNER);
+    const ap2 = (b2.facts.find((f) => f.predicate === "AUTO_POLICY")!
+      .value as Row);
+    expect(ap2.expiry_pending).toBe(true); // live status IS visible…
+    expect(b2.brief_digest).toBe(b1.brief_digest); // …never digested
+    // A canonically DISABLED policy DOES change the digest — row state
+    // is real content, not clock noise.
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "disable",
+      policy_version: 2, idempotency_key: `dis-rb10-${counter}`,
+    });
+    const b3 = new ReasoningBriefService(s.store, { brain: liveBrain })
+      .briefFor(oid, OWNER);
+    expect(b3.brief_digest).not.toBe(b1.brief_digest);
+    expect(b3.hypotheses.some((h) => h.id === "POLICY_NOT_ENABLED")).toBe(true);
+    s.store.close();
+  });
+
+  it("RB11 legitimate grant end → obsError: BINDING unobservable, claims UNVERIFIED, no decomposition options", () => {
+    const { s, oid, bid, binding } = seeded("rb11", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding!, "a");
+    s.kpiSvc.advance(oid); // delegated verified progress via the grant
+    // Objective goes terminal → the verifier grant legitimately ends;
+    // the strict observation degrades to a labeled error.
+    s.biz.objectives.transitionStatus(oid, {
+      business_id: bid, to: "ACHIEVED", actor: OWNER,
+      reason: "owner accepted targets" });
+    const b = brief(s).briefFor(oid, OWNER);
+    // The binding is UNOBSERVABLE — never "absent". No decomposition
+    // hypothesis may claim it missing.
+    const bindingFact = b.facts.find((f) => f.predicate === "BINDING")!;
+    expect(bindingFact.value).toBeNull();
+    expect(bindingFact.provenance).toBe("UNVERIFIED");
+    expect(b.hypotheses.some((h) => h.id === "PRE_DECOMPOSITION")).toBe(false);
+    expect(b.facts.some((f) => f.predicate === "OBSERVATION_FAILED")).toBe(true);
+    // Claims that can no longer be re-proven degrade honestly.
+    expect(b.facts.find((f) => f.predicate === "KPI_MEASUREMENT")!.provenance)
+      .toBe("UNVERIFIED");
+    expect(b.facts.find((f) => f.predicate === "OBJECTIVE_BUDGET")!.provenance)
+      .toBe("UNVERIFIED");
+    expect(b.confidence).toBe("LOW");
+    expect(b.missing_information.some((g) => g.code === "BINDING_UNOBSERVABLE")).toBe(true);
+    // Terminal → zero options regardless of observation state.
+    expect(b.options).toEqual([]);
+    s.store.close();
+  });
+
+  it("RB12 bound overflow is reported by marker, never silently truncated", () => {
+    const s = freshFullStack("rb12");
+    const bid = mkBusiness(s);
+    const o = s.biz.objectives.create({
+      business_id: bid, title: "many-kpis", statement: "x",
+      // 40 KPIs > BRIEF_MAX_FACTS — the cap must leave a marker.
+      kpis: Array.from({ length: 40 }, (_, i) => ({
+        kpi_id: `KPI_${i}`, name: `k${i}`, unit: "count",
+        direction: "AT_LEAST", baseline: 0, target: 1 })),
+      deadline: FUTURE, budget_ceiling_microusd: 500_000,
+      dedup_key: `dk-${counter++}`, operator_id: OP });
+    const oid = String(o.objective_id);
+    const b = brief(s).briefFor(oid, OWNER);
+    expect(b.facts.length).toBeLessThanOrEqual(32);
+    const marker = b.missing_information.find((g) => g.code === "BRIEF_TRUNCATED");
+    expect(marker).toBeTruthy();
+    expect(marker!.detail).toContain("facts:");
     s.store.close();
   });
 });

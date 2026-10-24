@@ -26,16 +26,16 @@
  *    could not verify degrade to UNVERIFIED — never smoothed over.
  *  - INHERITED GATES: owner/scope/budget/fail-closed come from
  *    BrainContextService.contextFor verbatim — there is exactly ONE
- *    read path. The brief adds ZERO canonical reads for composition;
- *    the reasoner projection performs a constant ~6-tryGet catalog
- *    read (model_entry + provider + fixed receipt gates), outside the
- *    context budget by construction, never a list scan.
+ *    read path. The brief adds ZERO canonical reads for composition.
+ *    The reasoner projection is a bounded catalog read outside the
+ *    context budget BY DESIGN: model_entry + provider + fixed receipt
+ *    gates + the model_role_assignment table — bounded by table size,
+ *    never unbounded user data.
  */
 
 import { digest, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
-import type { Row } from "./routine-mirror.js";
 import { BrainContextService } from "./brain-context.js";
 import { TERMINAL_OBJECTIVE_STATUSES, type ObjectiveStatus } from "./objective-authority.js";
 import { assertCeoModelUsable } from "./ceo-planning-cycle.js";
@@ -153,17 +153,34 @@ export interface ReasoningBriefOpts {
 
 /* Expected absences are canonical state, not reliability gaps — they
    name surfaces not yet wired (memory/experience tenancy) or pre-
-   lifecycle states (no binding yet), so they don't degrade confidence. */
-const EXPECTED_GAP_PREFIXES = [
+   lifecycle states (no binding yet), so they don't degrade confidence.
+   EXACT match on the code (gapOf already isolates it from detail) —
+   a prefix match would silently classify any future same-prefix code
+   as expected. */
+const EXPECTED_GAP_CODES = new Set([
   "BINDING_ABSENT",
   "SCOPE_BINDING_ABSENT",
   "ARTIFACT_AUTHORITY_NOT_WIRED",
   "AUTO_POLICY_NOT_WIRED",
   "AUTO_DRIVER_NOT_WIRED",
-];
+]);
 
 function isExpectedGap(code: string): boolean {
-  return EXPECTED_GAP_PREFIXES.some((p) => code.startsWith(p));
+  return EXPECTED_GAP_CODES.has(code);
+}
+
+/* Clock-derived auto-policy fields — statusReadOnly computes them
+   from now() (effective/expiry_pending flip at a policy-expiry
+   instant on byte-identical canonical rows). The fact VALUE keeps
+   them visible for consumers; the brief_digest strips them exactly
+   like P16-A's stripVolatile, so a clock flip can never fake a
+   state change. */
+const VOLATILE_POLICY_KEYS = new Set(["effective", "expiry_pending"]);
+
+function stripPolicyVolatile(v: unknown): unknown {
+  const o = { ...(v as Record<string, unknown>) };
+  for (const k of VOLATILE_POLICY_KEYS) delete o[k];
+  return o;
 }
 
 /** Split "CODE:detail" entries into typed gaps (detail optional). */
@@ -199,17 +216,23 @@ export class ReasoningBriefService {
     const confidence = this.confidence(ctx, facts, missing);
     const reasoner = this.reasoner();
 
-    // Deterministic bounds — truncations are reported, never silent.
-    const overflow: BriefGap[] = [];
+    /* Deterministic bounds — truncations are REPORTED, never silent.
+       Markers are appended AFTER the data cap so they can never be
+       truncated away, and a missing_information overflow emits its own
+       marker computed at slice time (not pushed into a consumed list). */
+    const markers: BriefGap[] = [];
     const cap = <T>(list: T[], max: number, name: string): T[] => {
       if (list.length <= max) return list;
-      overflow.push({ code: "BRIEF_TRUNCATED", detail: `${name}:${list.length - max} dropped` });
+      markers.push({ code: "BRIEF_TRUNCATED", detail: `${name}:${list.length - max} dropped` });
       return list.slice(0, max);
     };
     const factsB = cap(facts, BRIEF_MAX_FACTS, "facts");
     const hypB = cap(hypotheses, BRIEF_MAX_HYPOTHESES, "hypotheses");
     const optB = cap(options, BRIEF_MAX_OPTIONS, "options");
-    const gapB = cap([...missing, ...overflow], BRIEF_MAX_GAPS, "missing_information");
+    const gapB = [
+      ...cap(missing, BRIEF_MAX_GAPS, "missing_information"),
+      ...markers,
+    ];
 
     const brief: Omit<ReasoningBrief, "brief_digest"> = {
       schema_version: REASONING_BRIEF_SCHEMA,
@@ -235,7 +258,12 @@ export class ReasoningBriefService {
         objective_id: brief.objective_id,
         business_id: brief.business_id,
         context_digest: brief.context_digest,
-        facts: brief.facts,
+        // Digest the volatile-stripped projection of AUTO_POLICY
+        // facts — the live clock fields stay visible in the value.
+        facts: brief.facts.map((f) =>
+          f.predicate === "AUTO_POLICY"
+            ? { ...f, value: stripPolicyVolatile(f.value) }
+            : f),
         hypotheses: brief.hypotheses,
         options: brief.options,
         missing_information: brief.missing_information,
@@ -273,6 +301,20 @@ export class ReasoningBriefService {
       provenance: "CANONICAL",
       sections: ["objective"],
     });
+    /* Provenance tiers derive from the context's OWN integrity
+       signal: proveClaims() re-proves the KPI progress + budget
+       ledger chains directly — independent of whether the strict
+       observation composed. The cockpit's obsOk-derived
+       canonically_proven flag means "observation composed", which
+       conflates the two — a pre-INITIALIZE objective whose claims
+       re-proof passed would be misread UNVERIFIED. */
+    const unprovenKpiIds = new Set(
+      ctx.integrity
+        .filter((i) => i.startsWith("KPI_PROGRESS_UNPROVEN:"))
+        .map((i) => i.slice("KPI_PROGRESS_UNPROVEN:".length)),
+    );
+    const budgetUnproven = ctx.integrity.includes("BUDGET_LEDGER_UNPROVEN");
+
     const budget = (o.budget ?? {}) as Record<string, unknown>;
     out.push({
       predicate: "OBJECTIVE_BUDGET",
@@ -281,12 +323,16 @@ export class ReasoningBriefService {
         ceiling_microusd: budget.ceiling_microusd,
         consumed_microusd: budget.consumed_microusd,
       },
-      // The spend claim is PROVEN only when the ledger re-proof ran.
-      provenance: budget.canonically_proven === true ? "PROVEN" : "UNVERIFIED",
+      // The spend claim is PROVEN when the ledger re-proof ran — the
+      // cockpit flag additionally requires observation composition.
+      provenance: budgetUnproven ? "UNVERIFIED" : "PROVEN",
       sections: ["objective"],
     });
 
-    // -- binding presence (canonical row or typed absence) --
+    // -- binding presence: null is only "absent" when the strict
+    //    observation COMPOSED; under observation_error it is
+    //    unobservable — never reported as canonically absent. --
+    const obsError = observation.observation_error as string | null;
     const binding = observation.binding as Record<string, unknown> | null;
     out.push({
       predicate: "BINDING",
@@ -294,7 +340,7 @@ export class ReasoningBriefService {
       value: binding
         ? { binding_id: binding.binding_id, binding_digest: binding.binding_digest }
         : null,
-      provenance: "CANONICAL",
+      provenance: obsError === null ? "CANONICAL" : "UNVERIFIED",
       sections: ["observation"],
     });
 
@@ -311,11 +357,10 @@ export class ReasoningBriefService {
           current: k.current,
           assessment: k.assessment,
         },
-        provenance: k.canonically_proven === true ? "PROVEN" : "UNVERIFIED",
+        provenance: unprovenKpiIds.has(String(k.kpi_id)) ? "UNVERIFIED" : "PROVEN",
         sections: ["objective"],
       });
     }
-    const obsError = val("observation").observation_error as string | null;
     if (obsError !== null) {
       out.push({
         predicate: "OBSERVATION_FAILED",
@@ -438,7 +483,12 @@ export class ReasoningBriefService {
     const workstreams = (observation.workstreams ?? []) as Array<Record<string, unknown>>;
     const obsError = observation.observation_error as string | null;
 
-    if (!has("BINDING") || facts.find((f) => f.predicate === "BINDING")?.value === null) {
+    // Binding absence is only a claim when the observation COMPOSED —
+    // under observation_error the binding is unobservable, not absent.
+    if (
+      obsError === null &&
+      (!has("BINDING") || facts.find((f) => f.predicate === "BINDING")?.value === null)
+    ) {
       out.push({
         id: "PRE_DECOMPOSITION",
         detail: "objective has no canonical workstream binding — no operational progress is possible until INITIALIZE commits one",
@@ -469,15 +519,19 @@ export class ReasoningBriefService {
         rests_on: [],
       });
     }
-    if (policy && policy.configured === true && policy.effective !== true) {
+    /* Canonical gating ONLY — state/configured/halt are stored row
+       fields; effective/expiry_pending are clock-derived projections
+       that must never move the digest (a lapsed window is still
+       row-ENABLED until the lazy EXPIRED commit makes it canonical). */
+    if (policy && policy.configured === true && policy.state !== "ENABLED") {
       out.push({
-        id: "POLICY_NOT_EFFECTIVE",
-        detail: `auto-policy is configured (state ${String(policy.state)}) but not effective${policy.expiry_pending === true ? " — authorization window lapsed, lazy EXPIRED pending" : ""}`,
+        id: "POLICY_NOT_ENABLED",
+        detail: `auto-policy is configured but state is ${String(policy.state)} — no autonomous passes are authorized`,
         rests_on: ["AUTO_POLICY"],
       });
     }
     if (
-      policy?.effective === true &&
+      policy?.state === "ENABLED" &&
       lifecycle.owner_action_required === true
     ) {
       out.push({
@@ -515,8 +569,14 @@ export class ReasoningBriefService {
       (f) => f.predicate === "KPI_MEASUREMENT" && f.provenance === "UNVERIFIED",
     );
 
+    const obsErrorOpt = ((ctx.sections.observation?.value ?? {}) as Record<string, unknown>)
+      .observation_error as string | null;
     if (!terminal) {
-      if (!hasBinding) {
+      // INITIALIZE/PRIORITIZE need an observable binding truth — under
+      // observation_error "absent" is unknowable, not true.
+      if (obsErrorOpt !== null) {
+        // unobservable — no decomposition option is honest
+      } else if (!hasBinding) {
         out.push({
           id: "CEO_INITIALIZE_WORKSTREAMS",
           kind: "CEO_DECISION",
@@ -626,7 +686,13 @@ export class ReasoningBriefService {
         failure_code: null,
       };
     }
-    let transport: BriefReasoner["transport"] = null;
+    /* The canonical CEO gate is BOTH calls in THIS order — the cycle
+       resolves transport before usability (ceo-planning-cycle
+       :759-761). A resolved-but-ineligible entry reports UNQUALIFIED
+       with its transport identity; an unresolvable entry is
+       UNRESOLVED. Non-IntegrityError failures (corrupt store, bugs)
+       propagate fail-closed — never masked as an eligibility answer. */
+    let transport: BriefReasoner["transport"];
     try {
       const t = resolveCeoModelTransport(this.store, id);
       transport = {
@@ -635,14 +701,21 @@ export class ReasoningBriefService {
         model_id: t.model_id,
         protocol_family: t.protocol_family,
       };
-    } catch {
-      transport = null;
+    } catch (err) {
+      if (!(err instanceof IntegrityError)) throw err;
+      return {
+        model_entry_id: id,
+        eligibility: "UNRESOLVED",
+        transport: null,
+        failure_code: String(err.code),
+      };
     }
     try {
       assertCeoModelUsable(this.store, id);
       return { model_entry_id: id, eligibility: "QUALIFIED", transport, failure_code: null };
     } catch (err) {
-      const code = err instanceof IntegrityError ? String(err.code) : "REASONER_CHECK_FAILED";
+      if (!(err instanceof IntegrityError)) throw err;
+      const code = String(err.code);
       return {
         model_entry_id: id,
         eligibility: code.includes("UNRESOLVED") ? "UNRESOLVED" : "UNQUALIFIED",
