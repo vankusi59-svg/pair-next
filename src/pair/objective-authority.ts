@@ -303,7 +303,7 @@ function normalizeKpis(
 
 /** Terms identity — the digest domain. Mutable progress/budget/status
  *  fields are deliberately outside it. */
-function termsOf(row: Row): Record<string, unknown> {
+export function termsOf(row: Row): Record<string, unknown> {
   const budget = (row.budget ?? {}) as Record<string, unknown>;
   return {
     title: row.title,

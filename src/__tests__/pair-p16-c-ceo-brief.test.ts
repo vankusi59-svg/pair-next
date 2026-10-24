@@ -45,6 +45,10 @@
  *         objective_digest): the seam's stronger re-proof fails →
  *         typed marker, cycle commits AND replays — the advisory
  *         surface never wedges replay either.
+ *   C13 — forged non-operator owner_authority_id → marker +
+ *         seam never invoked (assertOwnerAuthorityRef pins the read
+ *         identity before the seam's owner gate could pass
+ *         tautologically on the row's own value).
  *
  * Harness mirrors pair-p15-3 (FakeInvoker + mkModel/mkProvider) over
  * the real P16-B stack (freshFullStack + ReasoningBriefService).
@@ -83,8 +87,10 @@ import {
   buildCeoUserPrompt,
   CeoPlanningCycleService,
   digest,
+  objectiveDigest,
   providerEntryId,
   qualifyModel,
+  termsOf,
   ReasoningBriefService,
   type CeoDecisionInvoker,
   type CeoInvokeInput,
@@ -627,6 +633,47 @@ describe("P16-C — CEO consumes ReasoningBrief", () => {
     const r2 = await svc.runCycle({ objective_id: s.oid, actor: OP });
     expect(r2.replayed).toBe(true);
     expect(s.invoker.calls).toBe(1);
+    s.store.close();
+  });
+
+  it("C13 forged owner ref → marker + seam never invoked (no tautological gate)", async () => {
+    /* A hash-consistent row carrying a non-operator owner_authority_id
+       passes objectives.get (assertCanonicalRow checks string shape
+       only). assertOwnerAuthorityRef at the seam re-validates before
+       the value becomes the read identity — without it the seam's
+       owner gate would pass tautologically on the row's own value. */
+    const s = ceoStack("c13", CEO_WAIT);
+    sqlRewriteEntity(s.store, "objective", s.oid, (b) => {
+      b.owner_authority_id = "agent:forged";
+      // owner_authority_id is inside termsOf — the forge stays
+      // digest-consistent only when the self-digest is recomputed,
+      // exactly like the repo's own tamper fixtures.
+      b.objective_digest = objectiveDigest({
+        objective_id: String(b.objective_id),
+        business_id: String(b.business_id),
+        terms_version: Number(b.terms_version),
+        terms: termsOf(b as Row),
+        create_semantic_digest: String(b.create_semantic_digest),
+      });
+    });
+    let seamCalled = false;
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.biz.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: (row) => s.biz.proveWorkItemDone(row as never),
+      invoker: s.invoker, model_entry_id: s.me,
+      brain_brief: (oid, actor) => {
+        seamCalled = true;
+        return briefSeam(s, s.me)(oid, actor);
+      },
+    });
+    const r = await svc.runCycle({ objective_id: s.oid, actor: OP });
+    expect(String(r.decision.state)).toBe("COMMITTED");
+    expect(seamCalled).toBe(false);
+    const obs = JSON.parse(
+      s.invoker.inputs[0]!.user_prompt.split("\n")[1]!) as Record<string, unknown>;
+    const bb = obs.brain_brief as Record<string, unknown>;
+    expect(bb.kind).toBe("BRAIN_BRIEF_UNAVAILABLE");
+    expect(bb.reason).toBe("FAIL_CLOSED_OBJECTIVE_FIELD");
     s.store.close();
   });
 });
