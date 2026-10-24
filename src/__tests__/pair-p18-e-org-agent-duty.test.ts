@@ -469,4 +469,47 @@ describe("P18-E — org-agent duties spanning objectives", () => {
     expect(duties.dutiesForAgent(agents[65]!)).toHaveLength(1);
     store.close();
   });
+
+  it("E17 ensureIndex never mints poison pointers for unkeyable rows", () => {
+    const { store, duties } = mkCtx();
+    const { agent, objA, businessId } = mkScope(store);
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Raw-SQL row with a colon agent id — unmintable (provenRow drops
+    // it), and ensureIndex must not project its endpoints: a pointer
+    // `A:{agent}:evil:{duty}` would wedge the innocent agent's range.
+    const rid = `DUT_pois_${n}`;
+    const payload: Record<string, unknown> = {
+      schema: "pair.os.vnext.org-agent-duty.v1",
+      duty_id: rid, business_id: businessId,
+      org_agent_id: `${agent}:evil`,
+      objective_ids: [objA], state: "ACTIVE", note: null,
+      created_by: OWNER, dedup_key: `pk${n}`,
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      entity_type: "org_agent_duty", entity_id: rid, version: 1,
+    };
+    payload.duty_digest = dutyDigest(payload);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("org_agent_duty", rid, 1, JSON.stringify(payload), digest(payload),
+        "2026-01-01T00:00:00.000Z");
+    // Rebuild must skip the unkeyable endpoint entirely.
+    duties.ensureIndex();
+    const ptrs = db.prepare(
+      "SELECT entity_id FROM entities WHERE entity_type='org_agent_duty_index'")
+      .all() as Array<{ entity_id: string }>;
+    // The colon endpoint is skipped — no poison key inside `A:{agent}:`.
+    // (The keyable O:objA endpoint still gets a pointer — it names the
+    // real row, which provenRow drops at read: a dead pointer, never
+    // a wedge.)
+    expect(ptrs.some((p) => p.entity_id === `A:${agent}:evil:${rid}`))
+      .toBe(false);
+    expect(ptrs.some((p) => p.entity_id === `O:${objA}:${rid}`)).toBe(true);
+    // The innocent agent reads, covers and mints normally.
+    expect(duties.dutiesForAgent(agent)).toHaveLength(0);
+    expect(duties.covers(agent, [objA])).toBe(false);
+    const d = duties.create({
+      org_agent_id: agent, objective_ids: [objA], actor: OWNER });
+    expect(d.state).toBe("ACTIVE");
+    store.close();
+  });
 });

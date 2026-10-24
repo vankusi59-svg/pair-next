@@ -146,10 +146,14 @@ const LEGAL_TRANSITIONS = new Set([
  *  ids never contain one; raw-SQL agent rows can. The boundary rejects
  *  colon endpoints at mint AND at reads, and provenRow drops any stored
  *  row carrying one — that shape could never have been minted. */
-function assertEndpointKey(field: string, id: string): void {
-  if (!id || id.includes(":")) {
+function keyable(id: unknown): boolean {
+  return typeof id === "string" && id !== "" && !id.includes(":");
+}
+
+function assertEndpointKey(field: string, id: unknown): void {
+  if (!keyable(id)) {
     fail("FAIL_CLOSED_DUTY_FIELDS",
-      `${field} must be non-empty and contain no ':' (index-keyed)`);
+      `${field} must be a non-empty ':'-free string (index-keyed)`);
   }
 }
 
@@ -416,9 +420,17 @@ export class OrgAgentDutyService {
         // semantically unproven at read time (dead pointer, no auth).
         const dutyId = String(row.entity_id);
         after = dutyId;
+        // Unkeyable endpoints (colons — never mintable, never
+        // re-provable) get NO pointers: indexing them would mint
+        // poison keys inside an innocent endpoint's prefix range and
+        // wedge that endpoint permanently. Temporarily-unproven rows
+        // keep their pointers; never-provable shapes keep nothing.
         const ids = Array.isArray(row.objective_ids) ? row.objective_ids : [];
-        for (const oid of ids) this.indexEdge("O", String(oid), dutyId);
-        this.indexEdge("A", String(row.org_agent_id ?? ""), dutyId);
+        for (const oid of ids) {
+          if (keyable(oid)) this.indexEdge("O", String(oid), dutyId);
+        }
+        const agentEp = row.org_agent_id;
+        if (keyable(agentEp)) this.indexEdge("A", String(agentEp), dutyId);
         processed++;
         if (processed >= INDEX_CHUNK) { cut = true; break; }
       }
@@ -519,7 +531,12 @@ export class OrgAgentDutyService {
         if (proven) out.set(String(proven.duty_id), proven);
         after = key;
       }
-      if (page.length < pageSize) break;
+      // Tail check uses the size actually requested — then isolation
+      // restores the full page (a successful single-row page is not
+      // the range end).
+      const wasShort = page.length < pageSize;
+      pageSize = DUTY_PAGE;
+      if (wasShort) break;
     }
     return [...out.values()].sort((a, b) => byId(a.duty_id, b.duty_id));
   }
