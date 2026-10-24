@@ -11,6 +11,13 @@ import { StatusBadge, ProofChip, type Tone } from "../components/StatusBadge";
 import { DeniedState, EmptyState, ErrorState, Skeleton, UnverifiedPanel } from "../components/states";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { money } from "../components/EntityCard";
+/* P18.1 — Operator Control Center sections (relations, duties,
+   lifecycle controls, ops monitor, integrity probe). */
+import { ObjectiveRelations } from "../components/ObjectiveRelations";
+import { AgentDuties } from "../components/AgentDuties";
+import { ObjectiveOpsControls } from "../components/ObjectiveOpsControls";
+import { ObjectiveOpsMonitor } from "../components/ObjectiveOpsMonitor";
+import { IntegrityPanel } from "../components/IntegrityPanel";
 
 /* P15.9-B3 — Objective Detail (mandate §4/§5): canonical read
    GET /api/vnext/objectives/:id/cockpit only. Fresh pending =
@@ -116,6 +123,11 @@ export function ObjectiveDetail() {
   const [evNote, setEvNote] = useState("");
   const [amend, setAmend] = useState({ title: "", deadline: "", budget: "", reason: "" });
   const [grantF, setGrantF] = useState({ kpi: "", count: "", keys: "", value: "", expires: "" });
+  /* P18.1 — sibling objectives + org agents for the relation/duty
+     pickers. Fetched on identity change and after any mutation tick;
+     absent data renders as empty pickers, never fabricated rows. */
+  const [bizObjs, setBizObjs] = useState<Array<{ objective_id: string; title?: string | null; status: string }>>([]);
+  const [bizAgents, setBizAgents] = useState<Array<{ agent_id: string; title?: string | null; department?: string | null; state?: string }>>([]);
   const [grTick, setGrTick] = useState(0);
   const [grSt, setGrSt] = useState<
     | { kind: "loading" }
@@ -142,8 +154,39 @@ export function ObjectiveDetail() {
     setAmend({ title: "", deadline: "", budget: "", reason: "" });
     setGrantF({ kpi: "", count: "", keys: "", value: "", expires: "" });
     setGrSt({ kind: "loading" });
+    setBizObjs([]);
+    setBizAgents([]);
     opSeq.current++;
   }, [biz, id]);
+
+  useEffect(() => {
+    if (!biz) return;
+    const ctl = new AbortController();
+    api.vnextObjectives(biz)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        setBizObjs((r.objectives ?? []).map((o) => ({
+          objective_id: String(o.objective_id),
+          title: o.title ?? null,
+          status: String(o.status ?? ""),
+        })));
+      })
+      .catch(() => { if (!ctl.signal.aborted) setBizObjs([]); });
+    api.orgAgents(ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        setBizAgents((r.agents ?? [])
+          .filter((a) => String(a.business_id) === biz)
+          .map((a) => ({
+            agent_id: String(a.agent_id),
+            title: a.title ?? null,
+            department: a.department ?? null,
+            state: a.status,
+          })));
+      })
+      .catch(() => { if (!ctl.signal.aborted) setBizAgents([]); });
+    return () => ctl.abort();
+  }, [biz, tick]);
 
   useEffect(() => {
     /* Silent re-poll: keep the last good snapshot for THIS identity while
@@ -1018,6 +1061,30 @@ export function ObjectiveDetail() {
           </button>
         ))}
       </div>
+
+      <ObjectiveOpsControls
+        objective={{ objective_id: o.objective_id, business_id: o.business_id, status: o.status }}
+        onChanged={refetch}
+      />
+
+      <ObjectiveRelations
+        objectiveId={o.objective_id}
+        businessId={o.business_id}
+        objectives={bizObjs}
+        onChanged={refetch}
+      />
+
+      <AgentDuties
+        businessId={o.business_id}
+        objectiveId={o.objective_id}
+        objectives={bizObjs}
+        agents={bizAgents}
+        onChanged={refetch}
+      />
+
+      <ObjectiveOpsMonitor objectiveId={o.objective_id} />
+
+      <IntegrityPanel objectiveId={o.objective_id} />
 
       <h2 className="sech">KPI verifier grants</h2>
       <div className="sub">
