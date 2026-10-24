@@ -27,6 +27,11 @@
  *   F12 supersede is not conflict — CONFLICTS gating unaffected.
  *   F13 company E2E — business + objectives + org-agent duty +
  *       relations + gating + recovery, one scenario end-to-end.
+ *   F14 proof-budget exhaustion mid-walk is contained — verdict, not
+ *       throw; the fair-candidate scan keeps rotating (R1: a deep
+ *       legitimate graph must never livelock the rotation).
+ *   F15 cap-drain — nodes already inside the walk cap still get their
+ *       status checked (an achieved node inside the window satisfies).
  */
 
 import { describe, expect, it } from "vitest";
@@ -301,15 +306,11 @@ describe("P18-F — recovery + company E2E", () => {
     const u = plain(s, bid);
     depend(s, a, u);
     cancel(s, bid, u);
-    // 130 superseders > SUPERSEDE_WALK_CAP(128) — even with the LAST
-    // one achieved the walk cannot prove it and stays gated.
-    const leaves: string[] = [];
+    // 130 superseders > SUPERSEDE_WALK_CAP(128), none achieved — the
+    // bounded walk exhausts the cap window and stays gated.
     for (let i = 0; i < 130; i++) {
-      const r = plain(s, bid);
-      supersede(s, r, u);
-      leaves.push(r);
+      supersede(s, plain(s, bid), u);
     }
-    achieve(s, bid, leaves[129]);
     expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
     s.store.close();
   });
@@ -352,6 +353,67 @@ describe("P18-F — recovery + company E2E", () => {
     cancel(s, bid, u);
     expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
     achieve(s, bid, r); // can't — r has a lease; transition anyway (status only)
+    expect(s.scheduler.claimable(a).eligible).toBe(true);
+    s.store.close();
+  });
+
+  it("F14 proof-budget exhaustion mid-walk returns a verdict, never a livelock", () => {
+    const s = fresh("f14");
+    const bid = mkBiz(s.store);
+    const a = claimable(s, bid);
+    const u = plain(s, bid);
+    depend(s, a, u);
+    cancel(s, bid, u);
+    // A modest but deep-enough recovery graph; under a shrunken read
+    // budget the walk dies mid-expansion. Containment contract: the
+    // gate reports UPSTREAM_UNMET rather than throwing — and the
+    // rotation scan stops on budget instead of rolling back onto a
+    // cursor that can never advance.
+    let prev = u;
+    for (let i = 0; i < 10; i++) {
+      const r = plain(s, bid);
+      supersede(s, r, prev);
+      prev = r;
+    }
+    const unbudgeted = s.scheduler.claimable(a);
+    expect(unbudgeted.reason).toBe("UPSTREAM_UNMET");
+    const under = s.store.withReadBudget({ entities: 60, events: 512 },
+      () => s.scheduler.claimable(a));
+    // Contained verdict — not a thrown PROOF_LIMIT.
+    expect(under.eligible).toBe(false);
+    expect(under.reason).toBe("UPSTREAM_UNMET");
+    // Direct proof the catch-arm fires inside the walk: a budget that
+    // dies on the very first node expansion returns false, not throw.
+    const sched = s.scheduler as unknown as {
+      upstreamSatisfied(id: string): boolean };
+    const starved = s.store.withReadBudget({ entities: 3, events: 512 },
+      () => sched.upstreamSatisfied(u));
+    expect(starved).toBe(false);
+    // The scan path likewise stops on budget rather than livelocking:
+    // two calls both return without throwing.
+    const scan = s.store.withReadBudget({ entities: 60, events: 512 },
+      () => s.scheduler.nextFairCandidate());
+    expect(scan).toBeNull();
+    s.store.close();
+  });
+
+  it("F15 nodes inside the walk cap still get status-checked", () => {
+    const s = fresh("f15");
+    const bid = mkBiz(s.store);
+    const a = claimable(s, bid);
+    const u = plain(s, bid);
+    depend(s, a, u);
+    cancel(s, bid, u);
+    // 130 superseders overflow the cap — but the FIRST edge in
+    // superseded_by's deterministic order is admitted to the seen set
+    // before the cap trips and is still status-checked: "any reachable
+    // within the cap" wins the admission.
+    for (let i = 0; i < 130; i++) {
+      supersede(s, plain(s, bid), u);
+    }
+    const sorted = s.relations.admissionView(u).superseded_by;
+    expect(sorted.length).toBe(130);
+    achieve(s, bid, sorted[0]);
     expect(s.scheduler.claimable(a).eligible).toBe(true);
     s.store.close();
   });
