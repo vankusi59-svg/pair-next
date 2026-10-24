@@ -55,6 +55,9 @@
  *   R25 undigestable payloads — digest() itself throws (non-finite
  *       numbers, pathological nesting) → classified HASH_MISMATCH,
  *       isolate-skip on reads, loud wedge on strict mints.
+ *   R26 non-TEXT entity_id — BLOB keys sort after all TEXT cursors;
+ *       a non-advancing isolate cursor degrades to a typed wedge,
+ *       never an infinite loop.
  */
 
 import { describe, expect, it } from "vitest";
@@ -939,8 +942,10 @@ describe("P18-A — objective_relation canonical entity", () => {
     // inside the verify predicate; before the wrap this was an
     // untyped Error wedging all reads.
     plant("AAA_INF", '{"a":1e999}');
-    // Pathological nesting — RangeError out of the canonicalizer.
-    plant("AAA_DEEP", "{\"a\":".repeat(5000));
+    // Pathological nesting — parseable (V8 parses iteratively) but
+    // the canonicalizer's recursive sortValue RangeErrors: exercises
+    // the digest wrap, not just the parse wrap.
+    plant("AAA_DEEP", "{\"a\":".repeat(5000) + "1" + "}".repeat(5000));
     const got = s.relations.relationsFor(a);
     expect(got.map((r) => String(r.relation_id))).toEqual([legit.relation_id]);
     // Same on the event tail: undigestable metadata_json classifies
@@ -954,6 +959,30 @@ describe("P18-A — objective_relation canonical entity", () => {
       s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
     } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
     expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH"); // AAA_* rows trip first
+    s.store.close();
+  });
+
+  it("R26 BLOB entity_id — non-advancing isolate cursor wedges, never loops", () => {
+    const s = fresh("r26");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // BLOB entity_id sorts after EVERY TEXT value in SQLite — a TEXT
+    // cursor derived from String(blob) can never pass it. Before the
+    // guard this spun allProven forever; now it must throw typed.
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", Buffer.from([0xDE, 0xAD]), 1, "{corrupt", "0".repeat(64), "2026-01-01T00:00:00.000Z");
+    const start = Date.now();
+    try {
+      s.relations.relationsFor(a);
+      expect.unreachable("should throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(IntegrityError);
+      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    }
+    expect(Date.now() - start).toBeLessThan(5000); // bounded, not a spin
     s.store.close();
   });
 });

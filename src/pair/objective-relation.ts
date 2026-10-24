@@ -291,11 +291,15 @@ export class ObjectiveRelationService {
         // A bad row kills its whole page — don't drop the legit rows
         // sharing it: shrink to single-row pages to isolate, then skip
         // the offender (its key is in err.detail; entityPage's own
-        // `entity_id > ?` predicate guarantees forward progress, so
-        // no cross-collation comparison is needed here).
+        // `entity_id > ?` predicate guarantees forward progress for
+        // TEXT keys, so no cross-collation comparison is needed). A
+        // detail that doesn't advance the cursor means a non-TEXT key
+        // (BLOBs sort after all TEXT, so the cursor can never pass) —
+        // degrade to the same typed wedge strict mode produces rather
+        // than spin forever.
         if (pageSize > 1) { pageSize = 1; continue; }
         const bad = String(e.detail ?? "");
-        if (!bad) throw e;
+        if (!bad || bad === after) throw e;
         after = bad;
         pageSize = RELATION_PAGE;
         continue;
