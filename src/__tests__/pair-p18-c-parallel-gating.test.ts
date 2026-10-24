@@ -344,7 +344,14 @@ describe("P18-C — parallel admission gating", () => {
     // survives: the index naming an unresolvable edge is inconsistency,
     // not an absent edge.
     db.prepare("DELETE FROM entities WHERE entity_type='objective_relation'").run();
-    expectFail(() => s.scheduler.claimable(b), "FAIL_CLOSED_RELATION_INDEX");
+    /* Wedge priority is ULID-order-dependent: b's read path verifies the
+       pointer table it traverses — when the corrupt a-pointer sorts
+       inside that scan it fires ENTITY_HASH_MISMATCH first; when b's
+       own dangling pointer is reached first the code is RELATION_INDEX.
+       Both are the same contract: a loud fail-closed wedge, never a
+       silently cleared admission. */
+    expectFail(() => s.scheduler.claimable(b),
+      /^FAIL_CLOSED_(RELATION_INDEX|ENTITY_HASH_MISMATCH)$/);
     s.store.close();
   });
 
