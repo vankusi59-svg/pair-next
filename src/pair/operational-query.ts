@@ -55,6 +55,10 @@ import type {
   OperatorContextRequest,
 } from "./conversation-reasoning.js";
 import type { PairEvidenceStore } from "./store.js";
+import type {
+  ConvReadGrantEffectiveScope,
+  ConversationReadGrantService,
+} from "./conversation-read-grant.js";
 
 /* ------------------------------------------------------------------ *
  *  credential classification (HTTP boundary helper)                    *
@@ -313,6 +317,12 @@ export interface OperationalQueryDeps {
   control: OperationalReadSurface;
   /** Envelope bound (default CONVERSATION_STATUS_MAX_CHARS). */
   status_max_chars?: number;
+  /** P16-D — the canonical verified-read-grant service. When wired,
+   *  operator/telegram principals carrying an ENABLED + unexpired grant
+   *  for their canonical principal_ref are verified for the scoped
+   *  sections the grant vouches; without it every non-admin principal
+   *  stays UNVERIFIED_IDENTITY (unchanged default-deny). */
+  readGrants?: Pick<ConversationReadGrantService, "scopeForPrincipal">;
   /** TEST seam — deterministic asof. */
   now?: () => string;
 }
@@ -353,11 +363,12 @@ export class OperationalQueryService {
 
   /* ---------------- authorization scope ------------------------------ */
 
-  /** Canonical proof of what a scoped principal may see. Derived fresh
+  /** Canonical proof of what a scoped actor ref may see. Derived fresh
    *  per turn from canonical rows only — a message mentioning an entity
-   *  never grants access. */
-  private scopeFor(principal: ConversationPrincipal): OperatorScope {
-    const raw = String(principal.operator_id);
+   *  never grants access. The ref may be a raw claim ("alice") or a
+   *  canonical `operator:<id>`; both forms are tried. */
+  private scopeForActorRef(actorRef: string): OperatorScope {
+    const raw = String(actorRef);
     const actors = new Set<string>([raw, canonicalOperatorActor(raw)]);
     const objectiveIds = new Set<string>();
     const businessIds = new Set<string>();
@@ -383,8 +394,16 @@ export class OperationalQueryService {
         missionIds.add(String(d.mission_id));
       }
     }
-    // Missions bound to an accessible business via the canonical
-    // work_open_binding chain (bound_open_id → binding.business_id).
+    for (const mid of this.missionsForBusinesses(businessIds)) {
+      missionIds.add(mid);
+    }
+    return { actors, objectiveIds, businessIds, missionIds };
+  }
+
+  /** Missions bound to an accessible business via the canonical
+   *  work_open_binding chain (bound_open_id → binding.business_id). */
+  private missionsForBusinesses(businessIds: Set<string>): Set<string> {
+    const missionIds = new Set<string>();
     const bindingBusinessByMission = new Map<string, string>();
     for (const b of this.deps.store.list("work_open_binding")) {
       if (b.mission_id) {
@@ -397,6 +416,28 @@ export class OperationalQueryService {
         missionIds.add(String(m.mission_id));
       }
     }
+    return missionIds;
+  }
+
+  /** P16-D — the OperatorScope a set of verified read grants vouches:
+   *  declared objective/business ids exactly (no implied expansion), plus
+   *  the full derived footprint of every own_footprint operator_ref, plus
+   *  binding-chain missions on the unioned businesses. */
+  private scopeForGrants(grants: ConvReadGrantEffectiveScope): OperatorScope {
+    const actors = new Set<string>();
+    const objectiveIds = new Set<string>(grants.objective_ids);
+    const businessIds = new Set<string>(grants.business_ids);
+    const missionIds = new Set<string>();
+    for (const ref of grants.operator_refs) {
+      const s = this.scopeForActorRef(ref);
+      for (const x of s.actors) actors.add(x);
+      for (const x of s.objectiveIds) objectiveIds.add(x);
+      for (const x of s.businessIds) businessIds.add(x);
+      for (const x of s.missionIds) missionIds.add(x);
+    }
+    for (const mid of this.missionsForBusinesses(businessIds)) {
+      missionIds.add(mid);
+    }
     return { actors, objectiveIds, businessIds, missionIds };
   }
 
@@ -407,12 +448,34 @@ export class OperationalQueryService {
     asof: string,
   ): Record<string, unknown> {
     const isAdmin = ctx.principal.kind === "admin";
-    // R1-F1 + R2-F1 — the ONLY verified identity today is `admin` (separate
-    // bearer credential). An `operator` kind is a caller claim, and a
-    // `telegram` kind proves only chat-id equality — neither is verified
-    // sender identity, so both are default-deny for scoped operational
-    // data until an explicit verifiable grant mechanism exists (Phase 5).
-    const verified = isAdmin;
+    const sections: Record<string, unknown> = {};
+    const unavailable: Array<{ section: string; reason: string }> = [];
+    const integrity: Array<{ section: string; error: string }> = [];
+
+    // R1-F1 + R2-F1 — `operator` is a caller claim and `telegram` proves
+    // only chat-id equality: neither is verified sender identity. P16-D —
+    // an explicit canonical read grant can vouch a non-admin principal for
+    // bounded scoped reads; without one (or when the grant service is not
+    // wired, or grant resolution fails) the principal stays UNVERIFIED.
+    let grantScope: OperatorScope | null = null;
+    if (!isAdmin && this.deps.readGrants) {
+      try {
+        const principalRef =
+          ctx.principal.kind === "telegram"
+            ? String(ctx.principal.operator_id)
+            : canonicalOperatorActor(String(ctx.principal.operator_id));
+        const effective = this.deps.readGrants.scopeForPrincipal(principalRef);
+        if (effective) grantScope = this.scopeForGrants(effective);
+      } catch (e) {
+        // Fail closed — grant-resolution failure denies the scope and is
+        // recorded as an integrity note, never served as data.
+        integrity.push({
+          section: "authorization",
+          error: e instanceof PairError ? e.code : "READ_FAILED",
+        });
+      }
+    }
+    const verified = isAdmin || grantScope !== null;
     const intents = classifyOperationalIntents(ctx.latest_message.body);
     /** Section selector — intent keys plus the scope-context pseudo-section
      *  `objectives_owned` that grounds scoped principals. */
@@ -422,10 +485,6 @@ export class OperationalQueryService {
       want.add("ACTIVE_WORK");
       want.add("ATTENTION");
     }
-
-    const sections: Record<string, unknown> = {};
-    const unavailable: Array<{ section: string; reason: string }> = [];
-    const integrity: Array<{ section: string; error: string }> = [];
 
     // Non-admin principals always get the (denied) own-footprint context —
     // what makes an empty global answer honest, not just empty.
@@ -440,10 +499,9 @@ export class OperationalQueryService {
       });
     };
 
-    // scopeFor exists for a future verified non-admin identity (Phase 5);
-    // today no non-admin kind is verified, so no scope is ever derived.
-    const scope =
-      verified && !isAdmin ? this.scopeFor(ctx.principal) : null;
+    // Admin reads stay unscoped (null); granted principals read exactly the
+    // vouched scope. Unverified principals never reach a section composer.
+    const scope = grantScope;
 
     const guarded = (name: string, fn: () => unknown) => {
       try {

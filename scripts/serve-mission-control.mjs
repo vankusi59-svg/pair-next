@@ -131,6 +131,7 @@ import {
   resolveMcAdminToken,
   operationalStatusMaxChars,
   OperationalQueryService,
+  ConversationReadGrantService,
 } from "../dist/pair/index.js";
 
 // Phase E §15 — declared credential VALUES are registered with the
@@ -592,6 +593,12 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
 // entry cannot be seeded/resolved at boot, ONLY the turn endpoint is
 // unavailable — every other Mission Control surface keeps serving.
 const conversationSessions = new ConversationSessionService(store);
+// P16-D — canonical verified read grants for the operational-status
+// surface. Pure canonical service (no model dependency) — always wired:
+// grant mint/control/status keep working even when the turn path is
+// unavailable; OperationalQueryService consumes scopeForPrincipal to
+// verify granted operator/telegram principals.
+const conversationReadGrants = new ConversationReadGrantService({ store });
 const missionDrafts = new MissionDraftService({
   conversation: conversationSessions, control, store,
   // Phase C — draft confirmation plans through the SAME Planner Pool
@@ -607,6 +614,7 @@ try {
     store,
     control,
     status_max_chars: operationalStatusMaxChars(),
+    readGrants: conversationReadGrants,
   });
   // TEST-ONLY seam: PAIR_CONVERSATION_STUB_REPLY replaces the codex-cli
   // invoker with a deterministic echo so Playwright/CI never calls a
@@ -1451,6 +1459,8 @@ const server = createMissionControlServer({
     drafts: missionDrafts,
     // P15.8-E — telegram ingress authority.
     telegram: telegramConversation,
+    // P16-D — verified read-grant management (mint/control/status).
+    readGrants: conversationReadGrants,
   },
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);

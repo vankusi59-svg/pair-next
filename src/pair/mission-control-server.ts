@@ -22,6 +22,7 @@ import type { WorkforceService } from "./work-graph.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import type { ConversationSessionService } from "./conversation-session.js";
+import type { ConversationReadGrantService } from "./conversation-read-grant.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
 import { classifyRequestCredential } from "./operational-query.js";
 import type { MissionDraftService } from "./mission-draft.js";
@@ -155,6 +156,10 @@ export interface MissionControlServerDeps {
      *  /api/telegram/conversation* route is TELEGRAM_CONVERSATION_
      *  DISABLED; unrelated routes unaffected. */
     telegram?: TelegramConversationService;
+    /** P16-D — canonical verified read grants for the operational-status
+     *  surface. Absent → /api/conversations/read-grants* 404s and every
+     *  non-admin principal stays UNVERIFIED_IDENTITY (default-deny). */
+    readGrants?: ConversationReadGrantService;
   };
 }
 
@@ -495,7 +500,11 @@ export function createMissionControlServer(
     const adminBoundary =
       (method === "POST" &&
         (p === "/api/conversations" ||
-          /^\/api\/conversations\/[^/]+\/turns$/.test(p))) ||
+          /^\/api\/conversations\/[^/]+\/turns$/.test(p) ||
+          // P16-D — read-grant mint/control is operational-status authority:
+          // the admin credential delegates reads, the MC-token owner claim
+          // vouches only its own provable scope (enforced in the service).
+          /^\/api\/conversations\/read-grants(\/|$)/.test(p))) ||
       (method === "GET" &&
         (p === "/api/conversations" ||
           /^\/api\/conversations\/[^/]+(\/messages)?$/.test(p)));
@@ -1797,6 +1806,67 @@ export function createMissionControlServer(
       if (p === "/api/conversations" || p.startsWith("/api/conversations/")) {
         const conv = deps.conversation;
         if (!conv) return void json(res, 404, { error: "CONVERSATION_DISABLED" });
+        // ----- P16-D — verified read-grant management -------------------
+        // Matched BEFORE the session-id routes (`/api/conversations/<id>`
+        // would otherwise swallow `/api/conversations/read-grants`). The
+        // uniform POST operator-id gate above still applies (every admin
+        // call carries an x-operator-id like the conversation turns do —
+        // its VALUE is unused on the admin lane). Authority is the
+        // credential class itself: adminBearer ⇒ actor "admin" (may
+        // delegate any declared scope); otherwise the MC-token operator
+        // claim ⇒ `operator:<id>` (may vouch only its own
+        // canonically-provable scope — enforced in the service).
+        if (p === "/api/conversations/read-grants" || p.startsWith("/api/conversations/read-grants/")) {
+          const grants = conv.readGrants;
+          if (!grants) return void json(res, 404, { error: "CONVERSATION_READ_GRANTS_DISABLED" });
+          const actor_kind = adminBearer ? "admin" : "operator";
+          const actor = adminBearer
+            ? "admin"
+            : operator === undefined ? undefined : canonicalOperatorActor(operator, p);
+          if (actor === undefined) {
+            throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+          }
+          if (method === "POST" && p === "/api/conversations/read-grants") {
+            const scope = body.scope as Record<string, unknown> | undefined;
+            const minted = grants.grant({
+              actor,
+              actor_kind,
+              principal_ref: String(body.principal_ref ?? ""),
+              operator_ref: String(body.operator_ref ?? ""),
+              scope: {
+                objective_ids: Array.isArray(scope?.objective_ids) ? scope.objective_ids.map(String) : [],
+                business_ids: Array.isArray(scope?.business_ids) ? scope.business_ids.map(String) : [],
+                own_footprint: scope?.own_footprint === true,
+              },
+              expires_at: Number(body.expires_at),
+              idempotency_key: body.idempotency_key === undefined ? undefined : String(body.idempotency_key),
+            });
+            return void json(res, 200, minted);
+          }
+          m = p.match(/^\/api\/conversations\/read-grants\/([^/]+)\/(disable|revoke)$/);
+          if (method === "POST" && m) {
+            return void json(res, 200, grants.control(m[1]!, {
+              actor,
+              actor_kind,
+              action: m[2] as "disable" | "revoke",
+              idempotency_key: body.idempotency_key === undefined ? undefined : String(body.idempotency_key),
+            }));
+          }
+          // Status: admin sees everything; an operator claim sees only
+          // grants it minted or that vouch its own operator_ref (no
+          // cross-principal enumeration, no existence leak).
+          const visible = <T extends { granted_by: string; operator_ref: string }>(rows: T[]) =>
+            actor_kind === "admin" ? rows : rows.filter((g) => g.granted_by === actor || g.operator_ref === actor);
+          m = p.match(/^\/api\/conversations\/read-grants\/([^/]+)$/);
+          if (method === "GET" && m) {
+            return void json(res, 200, { grants: visible(grants.status({ grant_id: m[1]! })) });
+          }
+          if (method === "GET" && p === "/api/conversations/read-grants") {
+            const pref = url.searchParams.get("principal_ref");
+            return void json(res, 200, { grants: visible(grants.status({ principal_ref: pref ?? undefined })) });
+          }
+          return void json(res, 404, { error: "NOT_FOUND", path: p });
+        }
         if (!operator) {
           throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
         }
@@ -2086,6 +2156,7 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_OBJECTIVE_SCOPE" ||
         e.code === "FAIL_CLOSED_BRAIN_AUTHORITY" ||
         e.code === "FAIL_CLOSED_BRAIN_SCOPE" ||
+        e.code === "FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY" ||
         e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
