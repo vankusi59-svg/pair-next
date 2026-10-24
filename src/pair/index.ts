@@ -104,6 +104,7 @@ export * from "./conversation-read-grant.js";
 export * from "./objective-capability-gap.js";
 export * from "./objective-relation.js";
 export * from "./objective-portfolio.js";
+export * from "./org-agent-duty.js";
 export * from "./scoped-memory.js";
 export * from "./operational-query.js";
 
