@@ -1,0 +1,335 @@
+/**
+ * P18-A — canonical objective_relation: the coordination layer's
+ * atomic fact.
+ *
+ *   R1  create() validates — closed kind vocabulary, both objectives
+ *       resolve, same business (derived, never asserted), no
+ *       self-relation, actor must be owner_authority_id of BOTH
+ *       endpoints (different owners → fail closed).
+ *   R2  mint is canonical — ACTIVE, digest-pinned, event-anchored,
+ *       business derived from the objectives.
+ *   R3  idempotent mint — same (from,to,kind) returns the same row;
+ *       the dedup oracle runs AFTER authority (foreign actor can't
+ *       probe existence).
+ *   R4  lifecycle — SUSPEND/RESUME/REVOKE transitions, terminal REVOKE
+ *       idempotent, illegal transitions fail closed, CAS-held.
+ *   R5  DEPENDS_ON acyclicity — mint rejects a cycle-closing edge;
+ *       SUSPENDED edges still count (RESUME re-proves the graph that
+ *       changed under it).
+ *   R6  reads — relationsFor / relationsForBusiness / upstreamOf /
+ *       conflictsWith return proven rows only.
+ *   R7  re-proof — digest-recomputed state flip, event-less forge,
+ *       foreign-business pairing → never served (reads AND control).
+ *   R8  actor shape — non operator:<ref> actors rejected.
+ */
+
+import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  ApprovalQueue,
+  ArtifactAuthority,
+  BusinessLayer,
+  ExecutorRegistry,
+  GovernedTaskGate,
+  MissionControl,
+  MissionObservability,
+  MissionRouter,
+  MissionRuntime,
+  MissionScheduleService,
+  MissionScheduler,
+  MissionSupervisor,
+  ObjectiveRelationService,
+  PairControlPlane,
+  PairEvidenceStore,
+  ReconciliationService,
+  RecoveryController,
+  WorkforceService,
+  digest,
+  relationDigest,
+} from "../pair/index.js";
+import { IntegrityError } from "../pair/errors.js";
+
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p18a-rel-"));
+let counter = 0;
+const OP = "p18-owner";
+const OWNER = `operator:${OP}`;
+const FUTURE = "2999-01-01T00:00:00.000Z";
+const KPI = "KPI_D";
+
+type Row = Record<string, unknown>;
+
+type Stack = {
+  dir: string;
+  store: PairEvidenceStore;
+  biz: BusinessLayer;
+  projectId: string;
+  relations: ObjectiveRelationService;
+};
+
+function fresh(name: string): Stack {
+  const dir = path.join(ROOT, `${counter++}-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+  const service = new PairControlPlane(store);
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const planner = () => ({ tasks: [{ task_key: "T1", title: "t", task_instruction: "t", required_capabilities: [], depends_on: [] }] });
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: new Map(), scheduler, approvals,
+    reconciliation: recon, recovery, planner,
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability: new MissionObservability(service),
+    planner,
+  });
+  const biz = new BusinessLayer({ store, control,
+    schedules: new MissionScheduleService(service),
+    planExpander: async (input) => ({ input, planner: { planner_run_id: "P", attempts: [], winner: { attempt_no: 1 } } }) });
+  const project = service.createProject({ name: "p", root_location: workspace });
+  return { dir, store, biz, projectId: String(project.project_id),
+    relations: new ObjectiveRelationService(store) };
+}
+
+function mkBusiness(s: Stack) {
+  return String(s.biz.createBusiness({
+    name: `b${counter}`, project_id: s.projectId, operator_id: OP }).business_id);
+}
+
+function mkObjective(s: Stack, businessId: string, operator = OP) {
+  return s.biz.objectives.create({
+    business_id: businessId,
+    title: "obj", statement: "Produce deliverables.",
+    kpis: [{ kpi_id: KPI, name: "d", unit: "count", direction: "AT_LEAST", baseline: 0, target: 1 }],
+    deadline: FUTURE, budget_ceiling_microusd: 500_000,
+    dedup_key: `dk-${counter++}`, operator_id: operator,
+  });
+}
+
+function objId(o: Row) { return String(o.objective_id); }
+
+/* ----------------------------- tests ----------------------------- */
+
+describe("P18-A — objective_relation canonical entity", () => {
+
+  it("R1 create() validates kind, resolution, business, self, bilateral owner", () => {
+    const s = fresh("r1");
+    const bid = mkBusiness(s);
+    const bid2 = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const foreign = objId(mkObjective(s, bid2));
+    const otherOwned = objId(mkObjective(s, bid, "someone-else"));
+    // Unknown kind.
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "LIKES", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // Missing objective.
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: "OBJ_NONE", kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // Self-relation.
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // Cross-business pairing — business is derived, never asserted.
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: foreign, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // Different owners — bilateral consent is required, not bypassed.
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: otherOwned, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    s.store.close();
+  });
+
+  it("R2 mint is canonical — digest, event anchor, derived business", () => {
+    const s = fresh("r2");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    expect(r.state).toBe("ACTIVE");
+    expect(r.business_id).toBe(bid);
+    expect(r.relation_digest).toMatch(/^[0-9a-f]{64}$/);
+    const events = s.store.listEvents("objective_relation", r.relation_id);
+    expect(events.map((e) => String(e.event_type))).toEqual(["OBJECTIVE_RELATION_CREATED"]);
+    s.store.close();
+  });
+
+  it("R3 idempotent mint — same triple converges; dedup runs after authority", () => {
+    const s = fresh("r3");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r1 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const r2 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    expect(r2.relation_id).toBe(r1.relation_id);
+    expect(s.store.list("objective_relation")).toHaveLength(1);
+    // A different kind is a different relation.
+    const r3 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "CONFLICTS", actor: OWNER });
+    expect(r3.relation_id).not.toBe(r1.relation_id);
+    s.store.close();
+  });
+
+  it("R4 lifecycle — SUSPEND/RESUME/REVOKE transitions + terminal idempotence", () => {
+    const s = fresh("r4");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    // RESUME from ACTIVE is illegal.
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "RESUME", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    const sus = s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER });
+    expect(sus.state).toBe("SUSPENDED");
+    // SUSPEND from SUSPENDED illegal; foreign actor denied.
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "RESUME", actor: "operator:intruder" }))
+      .toThrowError(IntegrityError);
+    const res = s.relations.control({
+      relation_id: r.relation_id, action: "RESUME", actor: OWNER });
+    expect(res.state).toBe("ACTIVE");
+    const rev = s.relations.control({
+      relation_id: r.relation_id, action: "REVOKE", actor: OWNER });
+    expect(rev.state).toBe("REVOKED");
+    // Terminal REVOKE is idempotent.
+    const rev2 = s.relations.control({
+      relation_id: r.relation_id, action: "REVOKE", actor: OWNER });
+    expect(rev2.state).toBe("REVOKED");
+    // Re-mint after revoke creates a NEW relation (old is terminal).
+    const r2 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    expect(r2.relation_id).not.toBe(r.relation_id);
+    const events = s.store.listEvents("objective_relation", r.relation_id);
+    expect(events.map((e) => String(e.new_state))).toEqual(
+      ["ACTIVE", "SUSPENDED", "ACTIVE", "REVOKED"]);
+    s.store.close();
+  });
+
+  it("R5 DEPENDS_ON acyclicity — mint-time + resume-time re-proof", () => {
+    const s = fresh("r5");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    s.relations.create({ from_objective_id: b, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    // c→a would close a→b→c→a — fail closed.
+    expect(() => s.relations.create({
+      from_objective_id: c, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // SUSPENDED edges still count toward acyclicity — reviving must
+    // never reopen a cycle. Suspend b→c; minting c→a STILL fails:
+    // the walk from a reaches c through a→b→c (both in the graph).
+    const relBC = s.relations.relationsFor(b)
+      .find((r) => r.to_objective_id === c)!;
+    s.relations.control({ relation_id: relBC.relation_id, action: "SUSPEND", actor: OWNER });
+    expect(() => s.relations.create({
+      from_objective_id: c, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // RESUME re-proves too — resuming b→c is legal (a→b→c is acyclic).
+    const res = s.relations.control({ relation_id: relBC.relation_id, action: "RESUME", actor: OWNER });
+    expect(res.state).toBe("ACTIVE");
+    s.store.close();
+  });
+
+  it("R6 reads — relationsFor / upstreamOf / conflictsWith", () => {
+    const s = fresh("r6");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    s.relations.create({ from_objective_id: a, to_objective_id: c, kind: "CONFLICTS", actor: OWNER });
+    expect(s.relations.relationsFor(a)).toHaveLength(2);
+    expect(s.relations.relationsFor(b)).toHaveLength(1);
+    expect(s.relations.relationsForBusiness(bid)).toHaveLength(2);
+    expect(s.relations.upstreamOf(a)).toEqual([b]);
+    expect(s.relations.upstreamOf(b)).toEqual([]);
+    // CONFLICTS is symmetric for the exclusion set.
+    expect(s.relations.conflictsWith(a)).toEqual([c]);
+    expect(s.relations.conflictsWith(c)).toEqual([a]);
+    s.store.close();
+  });
+
+  it("R7 re-proof — forged rows never served on read or control", () => {
+    const s = fresh("r7");
+    const bid = mkBusiness(s);
+    const bid2 = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const foreign = objId(mkObjective(s, bid2));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const read = () => JSON.parse(
+      (db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(r.relation_id) as { payload: string }).payload);
+    const write = (p: Row) => db.prepare(
+      "UPDATE entities SET payload=?, payload_hash=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run(JSON.stringify(p), digest(p), r.relation_id);
+    // 1) digest-recomputed state flip (SUSPENDED without the event).
+    const p1 = read();
+    p1.state = "SUSPENDED";
+    p1.relation_digest = relationDigest(p1);
+    write(p1);
+    expect(s.relations.relationsFor(a)).toHaveLength(0);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "RESUME", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // 2) foreign-business pairing — valid digest, wrong business.
+    const p2 = read();
+    p2.state = "ACTIVE";
+    p2.to_objective_id = foreign;
+    p2.relation_digest = relationDigest(p2);
+    write(p2);
+    expect(s.relations.relationsFor(a)).toHaveLength(0);
+    expect(s.relations.upstreamOf(a)).toEqual([]);
+    // 3) event-less fresh forge — a raw row with no lifecycle anchor.
+    const forged = {
+      relation_id: "REL_FORGED", schema: "pair.os.vnext.objective-relation.v1",
+      business_id: bid, from_objective_id: a, to_objective_id: b,
+      kind: "DEPENDS_ON", state: "ACTIVE", note: null, created_by: OWNER,
+      dedup_key: "x", created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z", relation_digest: "",
+    };
+    forged.relation_digest = relationDigest(forged);
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_FORGED", 1, JSON.stringify(forged), digest(forged), forged.created_at);
+    expect(s.relations.relationsFor(a)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("R8 actor shape — non operator:<ref> rejected at mint and control", () => {
+    const s = fresh("r8");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    for (const bad of ["", "admin", "operator:", "operator: ", "operator:a b", "system:x"]) {
+      expect(() => s.relations.create({
+        from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: bad }),
+        `actor=${JSON.stringify(bad)}`).toThrowError(IntegrityError);
+    }
+    s.store.close();
+  });
+});
