@@ -65,6 +65,7 @@ import type { BusinessLayer } from "./business.js";
 import type { WorkforceService } from "./work-graph.js";
 import { AgentContractService } from "./agent-contract.js";
 import { ObjectiveAuthorityService } from "./objective-authority.js";
+import { ObjectiveRelationService } from "./objective-relation.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { validateWorkOpenBindingById } from "./work-open-binding.js";
 
@@ -662,6 +663,15 @@ export class ArtifactDependencyResolver {
     return this._walDeps;
   }
 
+  /** P18-D — strict relation authority for the handoff scope. The
+   *  service is store-only (its own ObjectiveAuthorityService lazily
+   *  re-proves endpoints) — no cycle, read-only use. */
+  private _relations: ObjectiveRelationService | null = null;
+  private relations(): ObjectiveRelationService {
+    this._relations ??= new ObjectiveRelationService(this.store);
+    return this._relations;
+  }
+
   listEligibleExternalInputSources(
     mission: Record<string, unknown>,
   ): ExternalInputArtifactSource[] {
@@ -769,21 +779,42 @@ export class ArtifactDependencyResolver {
       lineageFail("allocation_business_mismatch");
     }
     const objectiveId = String(alloc.objective_id ?? "");
-    const objective = this.store.tryGet("objective", objectiveId) as
-      | Record<string, unknown>
-      | null
-      | undefined;
-    if (!objective) lineageFail("objective_missing");
-    const obj = objective as Record<string, unknown>;
-    if (String(obj.business_id ?? "") !== businessId) {
-      lineageFail("objective_business_mismatch");
+    // P18-D — authorized objective scope: the consumer's own objective
+    // plus every ACTIVE DEPENDS_ON upstream (cross-objective deliverable
+    // handoff). STRICT relation enumeration via admissionView — a
+    // corrupt relation row wedges the lineage exactly like a corrupt
+    // allocation (never silently expands, never silently denies).
+    // CONFLICTS/SUPERSEDES never authorize handoff; direct edges only
+    // (transitivity is not consent — each hop needs its own minted
+    // bilateral-owner relation). A fabricated or owner-amended edge
+    // drops semantically, never expands scope.
+    const authorizedObjectives = new Set<string>([objectiveId]);
+    try {
+      for (const up of this.relations().admissionView(objectiveId).upstream) {
+        authorizedObjectives.add(up);
+      }
+    } catch (err) {
+      lineageFail(
+        `relation_scope:${String((err as { code?: string })?.code ?? err)}`,
+      );
+    }
+    for (const authObjectiveId of authorizedObjectives) {
+      const objective = this.store.tryGet("objective", authObjectiveId) as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      if (!objective) lineageFail("objective_missing");
+      const obj = objective as Record<string, unknown>;
+      if (String(obj.business_id ?? "") !== businessId) {
+        lineageFail("objective_business_mismatch");
+      }
     }
     // F1 — sibling scope: every allocation of the objective must itself
     // satisfy canonical provenance; every bound mission binding under
     // those work items must validate against its real mission row.
     const siblingWorkItems = new Set<string>();
     for (const r of this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []) {
-      if (String(r.objective_id ?? "") !== objectiveId) continue;
+      if (!authorizedObjectives.has(String(r.objective_id ?? ""))) continue;
       try {
         // R2-F1 — sibling scope proven through the SAME full canonical
         // allocation authority as the consumer's own work item.

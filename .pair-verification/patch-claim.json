@@ -1,17 +1,18 @@
 {
-  "claim_id": "P18_C_PARALLEL_GATING",
-  "title": "P18-C parallel admission gating — DEPENDS_ON/CONFLICTS constraints on the auto-scheduler claim path",
+  "claim_id": "P18_D_DELIVERABLE_HANDOFF",
+  "title": "P18-D cross-objective deliverable handoff — eligible external input sources extend to direct ACTIVE DEPENDS_ON upstream objectives",
   "affected_surfaces": [
+    "ARTIFACT",
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-c-parallel-gating.test.ts#P18-C"
+    "src/__tests__/pair-p18-d-cross-objective-handoff.test.ts#P18-D"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P18-C: the canonical relation substrate now GATES autonomous admission (first non-inert consumer). ObjectiveRelationService.admissionView — STRICT ACTIVE DEPENDS_ON upstreams + CONFLICTS partners: corrupt rows propagate loudly (a corrupted-but-real edge can never silently clear admission), semantic unproven-ness (forged/owner-amended edges) drops rows so fabrication can never gate. R1-F1 fix — per-endpoint edge index (objective_relation_index keyed OBJ:REL) makes the gate O(degree) not O(global table): pointers entity-hash-proven + still fully re-prove their named relation; dangling/tampered pointers wedge (FAIL_CLOSED_RELATION_INDEX); a resumable chunked rebuild (INDEX_CHUNK=64, cursor in objective_relation_index_state marker) migrates legacy rows inside write txs — scheduler claim()/nextFairCandidate() advance it in their OWN committed tx so progress survives later wedges; marker un-built → identical strict global fallback (claimable() stays read-only). Shared scheduler predicate relationGate: UPSTREAM_UNMET when any ACTIVE DEPENDS_ON upstream is not ACHIEVED (pending AND terminally-failed both block); CONFLICT_LEASE_HELD when an ACTIVE CONFLICTS partner holds a live lease — mutual exclusion on the parallel lane. Wired at all three claim-path seams: claimable() (read-only readiness; roster mirror now mirrors activeRoster's invalid() on missing lease rows), nextFairCandidate() (gated candidates skipped transiently; one activeRoster snapshot per scan), claim() (gate LAST before mint — atomic with roster under immediate; retry-exhausted marker ordering preserved). Admission-only: mid-execution relations never kill a live lease. Manual/operator admission unaffected. Codex-only.",
+  "description": "P18-D: cross-objective artifact handoff over the canonical relation substrate. ArtifactHandoffResolver's eligibleSourcesForWorkItemScope() previously authorized only the consumer's own objective (work_item → allocation → objective → same-objective siblings → bound missions → ACCEPTED artifacts). It now builds an authorized-objective set = {consumer objective} ∪ direct ACTIVE DEPENDS_ON upstreams via ObjectiveRelationService.admissionView(objectiveId).upstream — the SAME strict read seam the P18-C scheduler gate uses (corrupt rows wedge loudly; forged/unproven rows can never authorize). Every authorized objective is re-proven: canonical get + business_id equality against the consumer allocation (cross-business authorization impossible). Only DEPENDS_ON authorizes — CONFLICTS/SUPERSEDES never appear in admissionView.upstream; SUSPENDED/REVOKED do not gate or authorize; no transitive traversal (each hop requires its own bilateral-owner edge). All downstream proofs unchanged: per-allocation full authority re-proof, bound-mission provenance, ACCEPTED-artifact + anchored PASS validation, exact artifact identity + CAS byte re-verification, and the single canonical listEligibleExternalInputSources seam consumed by pin/resolve/dispatch re-proofs. Planner-supplied fields stay non-authoritative. Codex-only.",
   "risk_override": "HIGH"
 }
