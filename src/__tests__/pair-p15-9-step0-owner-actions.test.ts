@@ -284,6 +284,13 @@ describe("Step0 owner-action HTTP seams", () => {
     const amBadField = await post(base, `/api/vnext/objectives/${oid}/amend`,
       { business_id: bid, patch: { status: "ACHIEVED" } }, OP);
     expect(amBadField.status).toBe(409);
+    // M5″ — the amend-patch owner gate: garbage/prefix-less owners
+    // rejected at the service layer, never orphaned.
+    for (const bad of ["operator:undefined", "alice", "operator:a b"]) {
+      const res = await post(base, `/api/vnext/objectives/${oid}/amend`,
+        { business_id: bid, patch: { owner_authority_id: bad } }, OP);
+      expect(res.status, bad).toBe(409);
+    }
     expect(eventCount(s.store)).toBe(before);
     s.store.close();
   });

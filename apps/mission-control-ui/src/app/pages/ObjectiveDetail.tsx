@@ -366,7 +366,11 @@ export function ObjectiveDetail() {
        Unresolved ops are preserved separately — a pending Configure
        reopened by the owner is an explicit retry of THAT op even when
        canonical version has since drifted. */
-    const sig = `${action}:${ctx.oid}:${policyVersion ?? "none"}:${action === "configure" ? JSON.stringify(canonLimits) : ""}`;
+    /* Array-serialized signature — ":"-joined strings can collide when
+       a field itself contains ":" (kpi_id/notes are free strings), which
+       would replay the WRONG stored body on an ambiguous retry (R3 M7″). */
+    const sig = JSON.stringify([action, ctx.oid, policyVersion ?? "none",
+      action === "configure" ? canonLimits : null]);
     let bodySig = sig;
     let body = pendingOps.current[sig];
     if (!body && action === "configure" && pendingCfg.current && pendingCfg.current.oid === ctx.oid) {
@@ -486,10 +490,10 @@ export function ObjectiveDetail() {
     }
     runOwnerOp(
       ctx,
-      `measure:${ctx.oid}:${meas.kpi}:${value}:${meas.note}`,
+      JSON.stringify(["measure", ctx.oid, meas.kpi, value, meas.note]),
       () => ({
         business_id: ctx.biz, kpi_id: meas.kpi, value,
-        evidence_key: crypto.randomUUID(), source: "owner-console",
+        evidence_key: crypto.randomUUID(),
         note: meas.note || undefined,
       }),
       (b) => api.objectiveRecordProgressApp(ctx.oid, b as never),
@@ -503,10 +507,10 @@ export function ObjectiveDetail() {
     const ctx = { biz: dlg.biz, oid: dlg.oid };
     runOwnerOp(
       ctx,
-      `evidence:${ctx.oid}:${evNote}`,
+      JSON.stringify(["evidence", ctx.oid, evNote]),
       () => ({
         business_id: ctx.biz,
-        evidence_key: crypto.randomUUID(), source: "owner-console",
+        evidence_key: crypto.randomUUID(),
         note: evNote || undefined,
       }),
       (b) => api.objectiveAttachEvidenceApp(ctx.oid, b as never),
@@ -551,7 +555,7 @@ export function ObjectiveDetail() {
     }
     runOwnerOp(
       ctx,
-      `amend:${ctx.oid}:${JSON.stringify(patch)}:${amend.reason}`,
+      JSON.stringify(["amend", ctx.oid, patch, amend.reason]),
       /* The key mints ONCE per stored op body — an ambiguous retry
          replays the same bytes, and the service dedups on the key so
          a committed-but-lost response can never double-commit. */
@@ -599,7 +603,7 @@ export function ObjectiveDetail() {
     const expiresAt = exp.toISOString();
     runOwnerOp(
       ctx,
-      `kpi-grant:${ctx.oid}:${grantF.kpi}:${JSON.stringify(rule)}:${expiresAt}`,
+      JSON.stringify(["kpi-grant", ctx.oid, grantF.kpi, rule, expiresAt]),
       () => ({
         action: "grant", kpi_id: grantF.kpi, rule, expires_at: expiresAt,
         idempotency_key: crypto.randomUUID(),
@@ -617,7 +621,7 @@ export function ObjectiveDetail() {
     const action = dlg.action;
     runOwnerOp(
       ctx,
-      `kpi-${action}:${ctx.oid}:${dlg.authorization_id}`,
+      JSON.stringify(["kpi", action, ctx.oid, dlg.authorization_id]),
       () => ({
         action, authorization_id: dlg.authorization_id,
         idempotency_key: crypto.randomUUID(),

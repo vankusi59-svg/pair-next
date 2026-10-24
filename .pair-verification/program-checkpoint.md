@@ -45,3 +45,11 @@ missing-info) bound to brain-context context_digest; reuse model catalog + gover
 - Review findings fixed: M1 operator-identity edge (canonicalOperatorActor/operatorRef at every mint+actor edge; garbage owners unmintable/unclaimable), M2 digest determinism (clock-derived status fields stripped from digest input; B1b), M3 HTTP seam tests (pair-p15-9-step0-owner-actions.test.ts, 6 scenarios), minors (typeof-strict value, required evidence_key, owner-console source, empty-patch amend rejected at service layer, UI diff-only/strict-date/REVOKED, direct KPI/budget re-proof B1d, nested-budget FAIL_CLOSED_BRAIN_BUDGET B1c, hash footprint B7)
 - Env note: C: drive hit 100% from accumulated pair-* test tmpdirs (2761 dirs ≈27GB) — cleaned; full-suite "unaccounted failures" were SQLITE_FULL, not code. Recheck disk before future full-suite runs.
 - Next: rerun codex-reviewer on cad17a2..ceca526; if PASS → feature branch + PR; then P16-B.
+
+---
+## R2/R3 REPAIR CHECKPOINT (2026-10-24)
+- Commits: 5feb87b (R1 repair) + ab58144 (R2 repair) + pending hygiene commit
+- R2 reviewer verdict: NEEDS_FIX → all findings repaired; R3 verdict: **PASS** (only minor/trivial findings)
+- R3 minors fixed in hygiene commit: empty-key/null-sentinel collision (M1″), digest() non-canonical patch 500 (M2″), dedup-window + authz-order doc notes (M3″/M4″), amend-patch owner gate test (M5″), vacuous all-undefined patch rejection (M6″), UI op-signature ':' collision → JSON.stringify (M7″), api.ts dead source field (M8″)
+- Full suite PASS_WITH_KNOWN_BASELINE maintained; win32 baselines identical on BASE
+- Next: verify:change on final diff → feature branch + PR → P16-B ReasoningBrief

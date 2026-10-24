@@ -1111,10 +1111,12 @@ export class ObjectiveAuthorityService {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must be an object");
     }
     const patchKeys = Object.keys(input.patch);
-    // A zero-key patch is NOT an amendment — committing it would bump
-    // terms_version + rebind objective_digest (invalidating every
-    // pinned review/policy grant) while changing nothing.
-    if (!patchKeys.length) {
+    // A patch with no EFFECTIVE key is NOT an amendment — committing
+    // it would bump terms_version + rebind objective_digest
+    // (invalidating every pinned review/policy grant) while changing
+    // nothing. Keys present-but-undefined (service callers can send
+    // them; JSON cannot) are vacuous the same way.
+    if (!patchKeys.length || patchKeys.every((k) => input.patch[k] === undefined)) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must name at least one key");
     }
     for (const k of patchKeys) {
@@ -1137,17 +1139,38 @@ export class ObjectiveAuthorityService {
          LAST committed amendment: same key + same patch digest is an
          idempotent no-op, same key + different patch is a typed
          conflict — never a silent double-commit. Callers that send no
-         key keep the original always-commit semantics. */
-      if (input.idempotency_key !== undefined) {
+         key (or an empty key — normalized away, never aliased to the
+         unkeyed null sentinel) keep the original always-commit
+         semantics.
+         Dedup window is ONE amendment deep: an older key retried after
+         a different amendment committed is treated as a NEW operation
+         and re-applies its patch — honest "latest-key replay", not a
+         full ledger (bounded ledgers already exist for evidence/spend
+         where collisions matter more). Replay is evaluated AFTER
+         scope/owner/terminal gates: a foreign or expired caller can
+         never probe whether a key committed — authz leaks nothing. */
+      const idemKey = input.idempotency_key || undefined;
+      if (idemKey !== undefined) {
         const last = (row.last_amendment ?? null) as Record<string, unknown> | null;
-        const patchDigest = digest(patch);
-        if (last && String(last.idempotency_key ?? "") === input.idempotency_key) {
-          if (String(last.patch_digest ?? "") === patchDigest) {
+        if (last && last.idempotency_key === idemKey) {
+          let patchDigest: string;
+          try {
+            patchDigest = digest(patch);
+          } catch {
+            // Non-canonical patch values (e.g., NaN reachable only from
+            // a service caller — JSON cannot carry them) fail as the
+            // typed field error the validators would have produced.
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_FIELD",
+              "patch contains non-canonical values",
+            );
+          }
+          if (last.patch_digest === patchDigest) {
             return row; // exact replay — never double-commits
           }
           throw new IntegrityError(
             "FAIL_CLOSED_OBJECTIVE_AMEND_CONFLICT",
-            `${objectiveId}: idempotency_key ${input.idempotency_key} reused with different patch`,
+            `${objectiveId}: idempotency_key ${idemKey} reused with different patch`,
           );
         }
       }
@@ -1200,7 +1223,7 @@ export class ObjectiveAuthorityService {
         reason: input.reason ?? null,
         at: utcnow(),
         keys: Object.keys(patch),
-        idempotency_key: input.idempotency_key ?? null,
+        idempotency_key: idemKey ?? null,
         patch_digest: digest(patch),
       };
       row.objective_digest = objectiveDigest({

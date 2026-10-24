@@ -186,7 +186,9 @@ export const api = {
     id: string,
     body: {
       business_id: string; kpi_id: string; value: number;
-      evidence_key?: string; source?: string; note?: string;
+      /* No source field — the route pins source:"owner-console"
+         itself; a client-chosen provenance label is never accepted. */
+      evidence_key?: string; note?: string;
     },
   ) =>
     req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/progress`, {
@@ -195,7 +197,7 @@ export const api = {
     }, { noAuthPrompt: true }),
   objectiveAttachEvidenceApp: (
     id: string,
-    body: { business_id: string; evidence_key?: string; source?: string; note?: string },
+    body: { business_id: string; evidence_key?: string; note?: string },
   ) =>
     req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/evidence`, {
       method: "POST",
