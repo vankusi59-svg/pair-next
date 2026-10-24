@@ -1,22 +1,18 @@
 {
-  "claim_id": "P15_9_OWNER_ACTION_SEAMS_PLUS_P16_A_BRAIN_CONTEXT",
-  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator (R2 repair)",
+  "claim_id": "P16_B_REASONING_BRIEF",
+  "title": "P16-B Strategic ReasoningBrief — deterministic advisory contract",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "UI",
-    "DEV_INFRA"
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
+    "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
     "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
-    "src/__tests__/pair-p15-9-step0-owner-actions.test.ts#Step0",
-    "src/__tests__/pair-p15-9a-company-cockpit.test.ts#P15.9-A1",
     "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Step 0 (P15.9): owner POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Authority is ONLY x-operator-id via canonicalOperatorActor/operatorRef — coercion artifacts AND whitespace refs rejected at every identity edge; owner_authority_id additionally gated at the canonical SERVICE layer (assertOwnerAuthorityRef: operator:<non-artifact non-whitespace ref>) so no caller — HTTP, service or amend patch — can mint a permanently-unclaimable owner (R1-M1/R2-M1′; H5/H6). Body identity fields never substitute (H3); verifier is always the header actor; evidence_key required; source pinned owner-console; value typeof-strict finite (H4). amend rejects zero-key patches AND dedups on optional idempotency_key vs last_amendment.patch_digest — ambiguous retry never double-commits (R2-M2′; H7). accountBudget stays unexposed. 403s carry the error code only — authority messages name real owner/business ids (R2-M4′). Identity edges normalized across create/legacy/business/routine/cost/secret-policy/work-items/budgets/org-agents/ceo-cycle/auto-*/cockpit/reviews/signoff/company. UI: diff-only amendments, strict numeric/date entry, REVOKED tone, per-op idempotency keys, exact-body retry. Step 1 (P16-A): brain-context.ts contextFor — owner-gated strict read-only aggregation over ObjectiveCockpitService (payload+event hash footprint identical — B7). context_digest pins canonical state only: asof + clock-derived status fields stripped from digest input; verified against a REAL ObjectiveAutoPolicyService across a live expiry instant (B1b-real — a future now()-derived key would fail it, R2-M6′). KPI/budget re-proven directly — BINDING_ABSENT never misreports UNPROVEN (B1d); ~2x proof charge documented (R2-M3′); nested budget fails closed (B1c); autonomy sources list wired deps only (R2-M7′). Unscoped memory/experience SCOPE_BINDING_ABSENT. Tamper propagates (B2); CAS drops+reports (B4); business isolation (B5). Library-only.",
+  "description": "P16-B: src/pair/reasoning-brief.ts — ReasoningBriefService.briefFor composes the Strategic ReasoningBrief DETERMINISTICALLY from BrainContextService.contextFor (the ONE read path — owner gate, scope check, read budget, nested-budget refusal and fail-closed strict reads inherited verbatim; RB5/RB9). facts[] carry provenance tiers CANONICAL/PROVEN/PROJECTED/UNVERIFIED + section names — KPI/budget claims PROVEN only when the canonical re-proof ran (RB2/RB2b). hypotheses[] fire only on real canonical signals (RB8: MEASUREMENT_LEADS_EXECUTION requires all-targets-met AND unproven workstreams; resolves when completion proves). options[] enumerate governed candidate moves (CEO_INITIALIZE/PRIORITIZE, OWNER_REVIEW_SIGNOFF, OWNER_RECORD_PROGRESS, OWNER_CONFIGURE/ENABLE_POLICY, WAIT) each naming its existing authority_channel + tradeoff — terminal objectives emit zero options (RB3). missing_information maps unavailable/integrity; expected absences (BINDING_ABSENT, SCOPE_BINDING_ABSENT, *_NOT_WIRED) do not degrade confidence; integrity notes → LOW (RB4). reasoner reuses the canonical model lane: assertCeoModelUsable reported-not-thrown + resolveCeoModelTransport identity — NOT_CONFIGURED/UNRESOLVED/UNQUALIFIED/QUALIFIED, NEVER an invocation (RB7). brief_digest pins canonical content only — asof, actor and clock-volatile gate results excluded (RB1); context_digest binds the exact BrainContext snapshot (P16-C stale-check anchor). ADVISORY_ONLY schema constant; ZERO writes (hash-footprint proof RB6); no second Planner/Router/execution authority. Stacked on P16-A — no CEO wiring yet (P16-C).",
   "risk_override": "HIGH"
 }
