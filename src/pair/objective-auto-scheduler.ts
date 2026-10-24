@@ -311,7 +311,11 @@ export class ObjectiveAutoScheduler {
     }
     return (f.active_leases as string[]).filter((id) => {
       const lease = this.lease(id);
-      return lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
+      // A roster id that resolves to nothing is corrupt — mirror
+      // activeRoster()'s invalid() so claimable()'s readiness can
+      // never drift from what claim() actually enforces.
+      if (!lease) invalid("roster lease missing");
+      return lease.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
     });
   }
 
@@ -911,6 +915,11 @@ export class ObjectiveAutoScheduler {
   /** Test-only preparation contract. This does not call the operating loop. */
   claim(objectiveId: string, workerId: string, bootId: string, opportunity: string,
       opts?: { max_lifetime_ms?: number }): LeaseHandle {
+    // P18-C F1 — advance the relation edge index in its OWN committed
+    // transaction: chunks persist even when the gate below later
+    // wedges on budget/corruption, so the O(degree) index converges
+    // over write calls instead of rolling back forever.
+    this.store.immediate(() => this.relations.ensureIndex());
     const result = this.proof(() => {
       if (!workerId || workerId.length > 128 || !bootId || bootId.length > 128 ||
           !opportunity || opportunity.length > 128) invalid("invalid worker/opportunity");
@@ -925,13 +934,6 @@ export class ObjectiveAutoScheduler {
       const a = this.authority(objectiveId);
       this.requireCurrent(q!, a);
       const { f, active } = this.activeRoster();
-      // P18-C — relation admission gate re-proven atomically with the
-      // roster the lease mint joins: a DEPENDS_ON edge minted or a
-      // CONFLICTS partner claimed between candidate selection and this
-      // check cannot be raced — the whole gate+mint is one immediate
-      // transaction.
-      const gate = this.relationGate(objectiveId, active);
-      if (gate !== null) invalid(`relation admission gate: ${gate}`);
       if (active.length >= MAX_ACTIVE || active.includes(objectiveId)) invalid("global/Objective lease cap");
       const rateWindowStart = Number(f.rate_window_start ?? 0);
       const rateWindowCount = rateWindowStart + 60_000 > this.instant()
@@ -950,6 +952,15 @@ export class ObjectiveAutoScheduler {
         }, "RETRY_EXHAUSTED", opportunity);
         return null;
       }
+      // P18-C — relation admission gate: the most expensive check runs
+      // LAST, re-proven atomically with the roster the lease mint
+      // joins (a DEPENDS_ON edge minted or a CONFLICTS partner claimed
+      // between candidate selection and this check cannot be raced —
+      // the whole gate+mint is one immediate transaction). Retried-
+      // exhausted objectives still hit the durable marker above first
+      // — pre-gating ordering is preserved.
+      const gate = this.relationGate(objectiveId, active);
+      if (gate !== null) invalid(`relation admission gate: ${gate}`);
       const token = randomBytes(32).toString("hex");
       const fence = (prior?.fence ?? 0) + 1;
       const lease = writeSchedulerRow<Lease>(this.store, LEASE_STATE, objectiveId, {
@@ -1131,6 +1142,10 @@ export class ObjectiveAutoScheduler {
   /** Deterministic rank order is chosen before claim; claim itself always
    * re-proves under the writer lock. No process-local queue decides order. */
   nextFairCandidate(): string | null {
+    // P18-C F1 — same own-transaction index advance as claim(): the
+    // per-candidate gate below then costs O(degree) per usable row
+    // instead of O(global table) per scan.
+    this.store.immediate(() => this.relations.ensureIndex());
     return this.proof(() => {
       const f = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL);
       if (!f) return null;

@@ -19,6 +19,12 @@
  *       (foreign created_by) cannot DoS admission.
  *   C8  admission-only — a CONFLICTS minted mid-execution does not
  *       retroactively kill a live lease; it gates the NEXT claim.
+ *   C9  O(degree) index — a busy global relation table cannot wedge
+ *       the per-candidate gate (the F1 availability fix).
+ *   C10 index corruption wedges loudly — tampered pointer payloads
+ *       and dangling pointers fail closed, never silently clear.
+ *   C11 legacy fallback — while the index marker reports un-built,
+ *       the gate proves the same verdict via strict global enum.
  */
 
 import { describe, expect, it } from "vitest";
@@ -278,6 +284,80 @@ describe("P18-C — parallel admission gating", () => {
     expectFail(() => s.scheduler.claim(b, "w2", "b2", "op2"),
       "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
     void h;
+    s.store.close();
+  });
+
+  it("C9 O(degree) edge index — global relation volume cannot wedge the gate", () => {
+    const s = fresh("c9");
+    const bid = mkBiz(s.store);
+    // A busy relation table: a hub objective with 40 CONFLICTS edges
+    // plus a cohort of relation-free claimables. Pre-fix the gate
+    // enumerated the WHOLE table per usable candidate (~4 charged
+    // reads each × cohort) and wedged the proof budget; the index
+    // makes each gate O(degree) — relation-free objectives cost ~2.
+    const hub = mkObjective(s, bid);
+    for (let i = 0; i < 40; i++) {
+      const p = mkObjective(s, bid);
+      s.relations.create({ from_objective_id: oid(hub), to_objective_id: oid(p),
+        kind: "CONFLICTS", actor: OWNER });
+    }
+    const candidates = Array.from({ length: 12 }, () => claimable(s, bid));
+    // The first create built the index; pointers cover both endpoints.
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const marker = db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation_index_state' AND entity_id='progress'").get() as { payload: string };
+    expect(JSON.parse(marker.payload).built).toBe(true);
+    expect((db.prepare("SELECT COUNT(*) c FROM entities WHERE entity_type='objective_relation_index'").get() as { c: number }).c).toBe(80);
+    // Every relation-free candidate is served — no PROOF_LIMIT wedge.
+    s.scheduler.nextFairCandidate(); // cohort-boundary prime
+    const served = new Set<string>();
+    for (let i = 0; i < candidates.length * 2 && served.size < candidates.length; i++) {
+      const c = s.scheduler.nextFairCandidate();
+      if (c) served.add(c);
+    }
+    expect(served).toEqual(new Set(candidates));
+    s.store.close();
+  });
+
+  it("C10 index corruption wedges loudly; dangling pointer fails closed", () => {
+    const s = fresh("c10");
+    const bid = mkBiz(s.store);
+    const a = claimable(s, bid);
+    const b = claimable(s, bid);
+    s.relations.create({ from_objective_id: a, to_objective_id: b,
+      kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
+    // A tampered pointer payload is page-level corruption — the strict
+    // gate wedges, it cannot silently clear a's admission.
+    db.prepare("UPDATE entities SET payload='corrupt' WHERE entity_type='objective_relation_index' AND entity_id LIKE ?")
+      .run(`${a}:%`);
+    expectFail(() => s.scheduler.claimable(a), "FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    expectFail(() => s.scheduler.claim(a, "w1", "b1", "op1"), "FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    // Dangling pointer — delete the relation while b's pointer to it
+    // survives: the index naming an unresolvable edge is inconsistency,
+    // not an absent edge.
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation'").run();
+    expectFail(() => s.scheduler.claimable(b), "FAIL_CLOSED_RELATION_INDEX");
+    s.store.close();
+  });
+
+  it("C11 un-built index marker → strict global fallback proves the same gate", () => {
+    const s = fresh("c11");
+    const bid = mkBiz(s.store);
+    const a = claimable(s, bid);
+    const b = claimable(s, bid);
+    s.relations.create({ from_objective_id: a, to_objective_id: b,
+      kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
+    // Simulate a pre-index store: drop the marker AND the pointers —
+    // admissionView falls back to the strict whole-table proof and
+    // must reach the SAME verdict (a real edge never escapes).
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index_state'").run();
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index'").run();
+    expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
+    expectFail(() => s.scheduler.claim(a, "w1", "b1", "op1"),
+      "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
     s.store.close();
   });
 });

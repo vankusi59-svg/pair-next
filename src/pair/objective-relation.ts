@@ -62,7 +62,7 @@
  */
 
 import { digest, newId, utcnow } from "./canonical.js";
-import { IntegrityError, PairError } from "./errors.js";
+import { IntegrityError, NotFoundError, PairError } from "./errors.js";
 import {
   assertOwnerAuthorityRef,
   ObjectiveAuthorityService,
@@ -70,6 +70,19 @@ import {
 import type { PairEvidenceStore } from "./store.js";
 
 export const OBJECTIVE_RELATION_ENTITY = "objective_relation";
+/** P18-C F1 — per-endpoint edge index so the admission gate costs
+ *  O(degree), not O(global table). Key shape
+ *  `${objectiveId}:${relationId}` — a colon-bounded prefix range
+ *  enumerates exactly one objective's edge pointers. Each pointer is
+ *  entity-hash-proven and names a relation that is still FULLY
+ *  re-proven at read time — a forged pointer can only name a real
+ *  canonical edge (gating on it is correct), never fabricate one. */
+export const RELATION_INDEX_ENTITY = "objective_relation_index";
+const RELATION_INDEX_STATE = "objective_relation_index_state";
+/** Rebuild chunk per write call — resumable via the marker cursor so
+ *  index migration converges over writes instead of demanding one
+ *  giant enumeration inside the caller's proof budget. */
+const INDEX_CHUNK = 64;
 export const OBJECTIVE_RELATION_SCHEMA = "pair.os.vnext.objective-relation.v1";
 
 export const RELATION_CREATED_EVENT = "OBJECTIVE_RELATION_CREATED";
@@ -371,6 +384,9 @@ export class ObjectiveRelationService {
     // under the writer lock — a racing mint on another connection
     // serializes instead of passing a stale check (no wedge/orphan).
     return this.store.immediate(() => {
+      // Migrate the edge index inside the same writer tx — a bounded
+      // chunk per write, converging to authoritative over calls.
+      this.ensureIndex();
       const from = this.objective(fromId);
       const to = this.objective(toId);
       const businessId = String(from.business_id ?? "");
@@ -454,6 +470,11 @@ export class ObjectiveRelationService {
           kind,
         },
       });
+      // Index pointers for BOTH endpoints — atomic with the mint so a
+      // committed edge is always findable by admissionView once the
+      // marker reports built.
+      this.indexEdge(row.relation_id, fromId);
+      this.indexEdge(row.relation_id, toId);
       // Return the stored row — put injects entity_id/version; dedup
       // replays and control() return the same shape.
       return saved as ObjectiveRelationRow;
@@ -475,6 +496,7 @@ export class ObjectiveRelationService {
       fail("FAIL_CLOSED_RELATION_ACTION", `unknown action ${action}`);
     }
     return this.store.immediate(() => {
+      this.ensureIndex();
       const stored = this.store.tryGet(
         OBJECTIVE_RELATION_ENTITY, String(input.relation_id)) as Row | null;
       if (!stored) {
@@ -584,15 +606,78 @@ export class ObjectiveRelationService {
 
   /** STRICT admission seam (P18-C): the ACTIVE edge sets an admission
    *  gate must judge — DEPENDS_ON upstreams of the objective (edges it
-   *  must wait on) and CONFLICTS partners (either direction). Unlike
-   *  upstreamOf/conflictsWith this enumerates STRICT: any corrupt
-   *  relation row propagates loudly instead of being silently
+   *  must wait on) and CONFLICTS partners (either direction). Any
+   *  corrupt relation row propagates loudly instead of being silently
    *  excluded — a corrupted-but-real edge can never silently clear an
    *  objective for admission. Semantic unproven-ness (fabrications,
    *  owner amendments) still drops the row — a forged edge can never
    *  gate. Budget trips propagate. Callers judge semantics (upstream
-   *  status, lease roster) — this view only proves WHICH edges exist. */
+   *  status, lease roster) — this view only proves WHICH edges exist.
+   *
+   *  Cost is O(degree) once the per-endpoint edge index is built
+   *  (ensureIndex, driven by write paths); until the marker reports
+   *  built — e.g. a store whose relations pre-date the index — this
+   *  falls back to the identical STRICT global enumeration at O(table)
+   *  cost. Both paths prove the same complete ACTIVE edge set. */
   admissionView(objectiveId: string): {
+    upstream: string[];
+    conflicts: string[];
+  } {
+    if (!this.indexBuilt()) return this.admissionGlobal(objectiveId);
+    const upstream = new Set<string>();
+    const conflicts = new Set<string>();
+    const prefix = `${objectiveId}:`;
+    let after = prefix;
+    for (;;) {
+      const page = this.store.entityPage<Row>({
+        entity_type: RELATION_INDEX_ENTITY,
+        after_id: after,
+        limit: RELATION_PAGE,
+        upper_id: `${prefix}\\uffff`,
+      }) as Row[];
+      if (!page.length) break;
+      for (const idx of page) {
+        const key = String(idx.entity_id);
+        const relId = key.slice(prefix.length);
+        if (String(idx.relation_id) !== relId ||
+            String(idx.objective_id) !== objectiveId) {
+          fail("FAIL_CLOSED_RELATION_INDEX",
+            `index key/payload mismatch ${key}`);
+        }
+        let edge: Row;
+        try {
+          edge = this.store.get(OBJECTIVE_RELATION_ENTITY, relId) as Row;
+        } catch (e) {
+          // A pointer that resolves to nothing is index inconsistency —
+          // corrupted state, not an absent edge: wedge loudly, never
+          // silently clear admission.
+          if (e instanceof NotFoundError) {
+            fail("FAIL_CLOSED_RELATION_INDEX", `dangling index ${key}`);
+          }
+          throw e;
+        }
+        const proven = this.provenRow(edge, true);
+        if (!proven) { after = key; continue; }
+        if (proven.state === "ACTIVE") {
+          if (proven.kind === "DEPENDS_ON" &&
+              proven.from_objective_id === objectiveId) {
+            upstream.add(proven.to_objective_id);
+          } else if (proven.kind === "CONFLICTS") {
+            const other = proven.from_objective_id === objectiveId
+              ? proven.to_objective_id : proven.from_objective_id;
+            conflicts.add(other);
+          }
+        }
+        after = key;
+      }
+      if (page.length < RELATION_PAGE) break;
+    }
+    return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
+  }
+
+  /** The strict whole-table enumeration — identical proof set to the
+   *  index path, used while the index marker reports un-built. */
+  private admissionGlobal(objectiveId: string): {
     upstream: string[];
     conflicts: string[];
   } {
@@ -608,5 +693,67 @@ export class ObjectiveRelationService {
       }
     }
     return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
+  }
+
+  private indexMarker(): Row | null {
+    const row = this.store.tryGet(RELATION_INDEX_STATE, "progress") as
+      Row | null;
+    return row && typeof row === "object" ? row : null;
+  }
+
+  private indexBuilt(): boolean {
+    return this.indexMarker()?.built === true;
+  }
+
+  /** Idempotent pointer write — one index row per (endpoint, edge). */
+  private indexEdge(relationId: string, objectiveId: string): void {
+    const key = `${objectiveId}:${relationId}`;
+    if (this.store.tryGet(RELATION_INDEX_ENTITY, key)) return;
+    this.store.put(RELATION_INDEX_ENTITY, key, {
+      objective_id: objectiveId,
+      relation_id: relationId,
+      created_at: utcnow(),
+    }, 0);
+  }
+
+  /** Resumable STRICT index rebuild — advances at most INDEX_CHUNK
+   *  edges per call, persisting the cursor in the marker so migration
+   *  converges over write calls rather than demanding one giant
+   *  enumeration inside the caller's proof budget. Corruption wedges
+   *  the rebuild (and the calling write) loudly — the marker only
+   *  reports `built` after the COMPLETE strict set is indexed, so a
+   *  partial index is never mistaken for authoritative. Idempotent;
+   *  a no-op once built. Call inside a store.immediate writer. */
+  ensureIndex(): void {
+    const marker = this.indexMarker();
+    if (marker?.built === true) return;
+    let after = String(marker?.cursor ?? "");
+    let built = 0;
+    let exhausted = false;
+    while (!exhausted && built < INDEX_CHUNK) {
+      const page = this.store.entityPage<Row>({
+        entity_type: OBJECTIVE_RELATION_ENTITY,
+        after_id: after,
+        limit: RELATION_PAGE,
+      }) as Row[];
+      if (!page.length) { exhausted = true; break; }
+      for (const row of page) {
+        const proven = this.provenRow(row, true);
+        after = String(row.entity_id);
+        if (proven) {
+          this.indexEdge(proven.relation_id, proven.from_objective_id);
+          this.indexEdge(proven.relation_id, proven.to_objective_id);
+          built++;
+        }
+        if (built >= INDEX_CHUNK) break;
+      }
+      if (page.length < RELATION_PAGE) exhausted = true;
+    }
+    this.store.put(RELATION_INDEX_STATE, "progress", {
+      built: exhausted,
+      cursor: exhausted ? null : after,
+      built_at: exhausted ? utcnow() : null,
+      version: Number(marker?.version ?? 0),
+    }, Number(marker?.version ?? 0));
   }
 }
