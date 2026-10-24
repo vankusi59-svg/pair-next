@@ -303,7 +303,12 @@ export class BrainContextService {
           ? "BINDING_ABSENT:pre-INITIALIZE"
           : `BINDING_UNOBSERVABLE:${obsError}`);
     }
-    if (obsError !== null) obsUnavailable.push(`OBSERVATION_ERROR:${obsError}`);
+    if (obsError !== null) {
+      obsUnavailable.push(`OBSERVATION_ERROR:${obsError}`);
+      // Workstream/kpi-summary projections vanish with the
+      // observation — name the loss precisely, not just its cause.
+      obsUnavailable.push(`WORKSTREAMS_UNOBSERVABLE:${obsError}`);
+    }
     sections.observation = section(
       ["buildReviewObservation", "objective_workstream.getBinding"],
       {

@@ -15,11 +15,12 @@
  *    moves that existing authority surfaces may commit — the brief is
  *    never a Planner, Router, or execution authority (INV_MISSION_001).
  *  - DETERMINISTIC: identical canonical state yields an identical
- *    brief_digest. Volatile inputs (asof, actor, reasoner gate results —
- *    receipt-currency is clock-derived like auto-policy expiry) are
- *    excluded from the digest so a qualification-expiry instant cannot
- *    fake a state change. context_digest pins the exact BrainContext
- *    snapshot the brief was composed from — P16-C's stale-check anchor.
+ *    brief_digest. Volatile inputs (asof, actor, reasoner eligibility
+ *    gates) are excluded — eligibility is deterministic on canonical
+ *    MODEL-CATALOG state which lives outside context_digest's scope,
+ *    so digesting it would let a catalog mutation move brief_digest
+ *    while context_digest stands still. context_digest pins the exact
+ *    BrainContext snapshot — P16-C's stale-check anchor.
  *  - EVIDENCE-LINKED: every fact carries provenance
  *    (CANONICAL | PROVEN | PROJECTED | UNVERIFIED) and the context
  *    section names it was read from. Claims the canonical re-proof
@@ -268,8 +269,8 @@ export class ReasoningBriefService {
         options: brief.options,
         missing_information: brief.missing_information,
         confidence: brief.confidence,
-        // Volatile-by-construction: eligibility gates ride on receipt
-        // CURRENCY (clock-derived like auto-policy expiry) — only the
+        // Out-of-scope-by-construction: eligibility gates read MODEL-
+        // CATALOG state (outside context_digest's scope) — only the
         // configured binding is canonical brief content.
         reasoner: { model_entry_id: reasoner.model_entry_id },
       }),
@@ -532,7 +533,8 @@ export class ReasoningBriefService {
     }
     if (
       policy?.state === "ENABLED" &&
-      lifecycle.owner_action_required === true
+      lifecycle.owner_action_required === true &&
+      autonomy.auto_driver != null // no driver exists to be blocked when unwired
     ) {
       out.push({
         id: "OWNER_GATE_BLOCKS_AUTONOMY",
@@ -573,7 +575,10 @@ export class ReasoningBriefService {
       .observation_error as string | null;
     if (!terminal) {
       // INITIALIZE/PRIORITIZE need an observable binding truth — under
-      // observation_error "absent" is unknowable, not true.
+      // observation_error "absent" is unknowable, not true. (Defense-
+      // in-depth: obsError today implies terminal via the same
+      // classifier, so this branch is belt-and-suspenders, kept so a
+      // future non-terminal obsError can't smuggle options.)
       if (obsErrorOpt !== null) {
         // unobservable — no decomposition option is honest
       } else if (!hasBinding) {
@@ -605,6 +610,11 @@ export class ReasoningBriefService {
           tradeoff: "signing off commits the review outcome into canonical state; deferring keeps autonomy frozen",
         });
       }
+      /* Currently unreachable in practice — KPI_PROGRESS_UNPROVEN is
+         only emitted via the classified legitimate terminal-grant-end
+         path, and terminal objectives emit zero options above. Kept
+         deliberately: if a future non-terminal unproven classification
+         lands, the governed move is already named honestly. */
       if (unprovenKpi) {
         out.push({
           id: "OWNER_RECORD_PROGRESS",
@@ -616,6 +626,10 @@ export class ReasoningBriefService {
         });
       }
       if (policy) {
+        // Every non-enabled state with a legal owner recovery move is
+        // named (TRANSITIONS table, objective-auto-policy): omitting
+        // one would hide the governed move from the reasoner. REVOKED
+        // has no legal path back — correctly no option.
         if (policy.configured !== true) {
           out.push({
             id: "OWNER_CONFIGURE_POLICY",
@@ -633,6 +647,33 @@ export class ReasoningBriefService {
             rationale: "auto-policy exists but is DISABLED — enabling is the owner-gated step that authorizes driver passes",
             rests_on: ["AUTO_POLICY"],
             tradeoff: "enabling authorizes bounded autonomy within the configured limits; the digest pin means any terms bump re-gates it",
+          });
+        } else if (policy.state === "PAUSED") {
+          out.push({
+            id: "OWNER_RESUME_POLICY",
+            kind: "POLICY_CONTROL",
+            authority_channel: "policy-resume route",
+            rationale: "auto-policy is PAUSED — resume is the legal owner transition back to ENABLED",
+            rests_on: ["AUTO_POLICY"],
+            tradeoff: "resume reauthorizes bounded autonomy under the existing envelope; pausing was a deliberate hold",
+          });
+        } else if (policy.state === "EXPIRED") {
+          out.push({
+            id: "OWNER_RECONFIGURE_POLICY",
+            kind: "POLICY_CONTROL",
+            authority_channel: "policy-configure route",
+            rationale: "auto-policy EXPIRED — only a fresh configure re-arms it (new authorization window + limits)",
+            rests_on: ["AUTO_POLICY"],
+            tradeoff: "re-arming is a NEW owner authorization, not a renewal — limits must be re-stated deliberately",
+          });
+        } else if (policy.state === "HALTED") {
+          out.push({
+            id: "OWNER_RESET_HALT",
+            kind: "POLICY_CONTROL",
+            authority_channel: "policy-reset_halt route",
+            rationale: "auto-policy is HALTED — reset_halt is the only legal owner transition out",
+            rests_on: ["AUTO_POLICY"],
+            tradeoff: "a halt marks a safety stop — resetting without understanding the halt reason defeats its purpose",
           });
         }
       }
@@ -672,9 +713,11 @@ export class ReasoningBriefService {
 
   /**
    * Read-only eligibility projection — the SAME gate the CEO cycle
-   * runs (assertCeoModelUsable) reported rather than thrown, plus the
-   * canonical transport identity. NEVER invokes. ~6 bounded tryGet
-   * catalog reads; a bad model config is an answer, not a failure.
+   * runs, in the SAME order (resolveCeoModelTransport then
+   * assertCeoModelUsable), reported rather than thrown. NEVER invokes.
+   * Bounded catalog read (model/provider/receipt tryGets + the
+   * model_role_assignment table — bounded by table size); a bad model
+   * config is an answer, not a failure.
    */
   private reasoner(): BriefReasoner {
     const id = this.deps.model_entry_id;
