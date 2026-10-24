@@ -116,6 +116,7 @@ import {
   TelegramConversationService,
   ObjectiveAutoPolicyService,
   ObjectiveCapabilityGapService,
+  ScopedMemoryReader,
   AUTONOMOUS_EXECUTOR_IDS,
   createObjectiveAutoReconcile,
   createObjectiveAutoDriver,
@@ -339,6 +340,11 @@ const registry = new ExecutorRegistry(service);
 const experience = new ExperienceService(service);
 const experienceExtractor = new ExperienceExtractor(service, experience);
 const experienceVerifier = new ExperienceVerifier(service, experience);
+// P17 — scoped Layer-A memory recall for the Brain context: the
+// automaton DB carries the V13 tenancy columns; rows without a
+// business/objective binding stay unscoped and are never admitted
+// to an objective's advisory surface.
+const scopedMemoryReader = new ScopedMemoryReader(automaton.raw);
 const routingAdvisor = new VerifiedExperienceRoutingAdvisor(service, experience);
 const PAIR_ENV = {
   os: process.platform,
@@ -530,6 +536,12 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
       workstreams: new ObjectiveWorkstreamService({
         store, business, workforce, objectives: business.objectives,
       }),
+      // P17 — tenancy-scoped advisory surfaces: verified experience
+      // (canonical, advisory tier) + scoped Layer-A memory recall.
+      // The BrainContext inside the CEO cycle consumes only rows bound
+      // to the objective's business/objective scope.
+      experience,
+      scopedMemory: scopedMemoryReader,
     });
     return objectiveCeoOps;
   };

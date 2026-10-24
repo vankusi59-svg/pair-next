@@ -37,7 +37,7 @@ import {
    ceo-runtime + reasoning-brief → ceo-planning-cycle). All cross-
    references are call-time bindings or hoisted export functions —
    keep it that way: no eval-time use of the cyclic modules here. */
-import { BrainContextService } from "./brain-context.js";
+import { BrainContextService, type BrainContextDeps } from "./brain-context.js";
 import {
   briefObservationView,
   ReasoningBriefService,
@@ -119,6 +119,11 @@ export interface CeoRuntimeComposition {
    *  model entry; optional sections with no wired authority report
    *  *_NOT_WIRED honestly. */
   brain_brief?: CeoObservationDeps["brain_brief"];
+  /** P17 — optional scoped advisory surfaces forwarded into the
+   *  default BrainContextService (ignored when brain_brief is
+   *  injected — the injected seam owns its own wiring). */
+  experience?: BrainContextDeps["experience"];
+  scopedMemory?: BrainContextDeps["scopedMemory"];
   timeout_ms?: number;
   stale_grace_ms?: number;
   now?: () => string;
@@ -163,6 +168,9 @@ export function createDefaultCeoPlanningCycle(
         workforce: deps.workforce,
         objectives,
         workstreams,
+        // P17 — scoped tenancy readers; absent deps report *_NOT_WIRED.
+        experience: deps.experience,
+        scopedMemory: deps.scopedMemory,
       }),
       model_entry_id: modelEntryId,
     });

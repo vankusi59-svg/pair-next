@@ -135,7 +135,35 @@ export interface BrainContext {
   context_digest: string;
 }
 
-export interface BrainContextDeps extends ObjectiveCockpitDeps {}
+/** P17 — the scoped-experience read the Brain consumes. Implemented
+ *  by ExperienceService.scopedFor; declared structurally so the dep
+ *  stays a seam (an unwired composition reports EXPERIENCE_NOT_WIRED
+ *  rather than fabricating an empty section). */
+export interface ScopedExperienceReader {
+  scopedFor(scope: { objective_id: string; business_id: string }): {
+    rows: Array<Record<string, unknown>>;
+    excluded_unscoped: number;
+    excluded_out_of_scope: number;
+    excluded_ineligible?: number;
+  };
+}
+
+/** P17 — the scoped Layer-A memory read (semantic/procedural, trust
+ *  fields surfaced, exclusion counts honest). Implemented by
+ *  ScopedMemoryReader; declared structurally for the same seam reason. */
+export interface ScopedMemoryDep {
+  scopedFor(scope: { objective_id: string; business_id: string }): {
+    semantic: unknown[];
+    procedural: unknown[];
+    excluded_unscoped: number;
+    excluded_out_of_scope: number;
+  };
+}
+
+export interface BrainContextDeps extends ObjectiveCockpitDeps {
+  experience?: ScopedExperienceReader;
+  scopedMemory?: ScopedMemoryDep;
+}
 
 function section(
   sources: string[],
@@ -383,23 +411,74 @@ export class BrainContextService {
       value: autoValue,
     };
 
-    /* Unscoped-memory exclusion — Semantic/Procedural Memory and
-       Verified Experience carry NO business/objective tenancy binding
-       today. Consuming them here would open a cross-scope poisoning
-       window, so both sections report the typed gap instead of data.
-       P17's tenancy scope is the prerequisite for wiring them. */
-    sections.memory = section(
-      [],
-      null,
-      ["SCOPE_BINDING_ABSENT:semantic/procedural memory has no business/objective tenancy binding — excluded pending P17 scope"],
-      [],
-    );
-    sections.experience = section(
-      [],
-      null,
-      ["SCOPE_BINDING_ABSENT:verified experience has no business/objective tenancy scope — excluded pending P17 scope"],
-      [],
-    );
+    /* P17 — scoped consumption replaces the SCOPE_BINDING_ABSENT stub.
+       Memory (Layer A, model-writable) and Experience (Layer C,
+       advisory) are admitted ONLY through their tenancy binding:
+       objective-scoped rows for THIS objective, business-scoped rows
+       for THIS business. Unscoped and foreign rows never render — the
+       counts stay honest in the section value. An unwired seam reports
+       *_NOT_WIRED (same contract as the autonomy deps), never a fake
+       empty section. Advisory projections omit use-counters/timestamps
+       that churn on read-side bookkeeping — same stripVolatile reason. */
+    const tenancyScope = { objective_id: objectiveId, business_id: businessId };
+    if (this.deps.scopedMemory) {
+      const m = this.deps.scopedMemory.scopedFor(tenancyScope);
+      sections.memory = section(
+        ["scoped_memory.scopedFor"],
+        {
+          semantic: m.semantic,
+          procedural: m.procedural,
+          excluded: {
+            unscoped: m.excluded_unscoped,
+            out_of_scope: m.excluded_out_of_scope,
+          },
+        },
+        [],
+        [],
+      );
+    } else {
+      sections.memory = section(
+        [],
+        null,
+        ["MEMORY_NOT_WIRED:scoped Layer-A memory reader absent — section reported empty rather than fabricated"],
+        [],
+      );
+    }
+    if (this.deps.experience) {
+      const e = this.deps.experience.scopedFor(tenancyScope);
+      sections.experience = section(
+        ["experience.scopedFor"],
+        {
+          experiences: e.rows.slice(0, 16).map((row) => ({
+            experience_id: String(row.experience_id),
+            type: String(row.type),
+            status: String(row.status),
+            outcome: row.outcome ?? null,
+            confidence: row.confidence ?? null,
+            observation_count: Number(row.observation_count ?? 1),
+            scope_business_id: row.scope_business_id ?? null,
+            scope_objective_id: row.scope_objective_id ?? null,
+            evidence_origin: row.evidence_origin ?? null,
+          })),
+          admitted: e.rows.length,
+          truncated: e.rows.length > 16,
+          excluded: {
+            unscoped: e.excluded_unscoped,
+            out_of_scope: e.excluded_out_of_scope,
+            ineligible: e.excluded_ineligible ?? 0,
+          },
+        },
+        [],
+        [],
+      );
+    } else {
+      sections.experience = section(
+        [],
+        null,
+        ["EXPERIENCE_NOT_WIRED:scoped experience reader absent — section reported empty rather than fabricated"],
+        [],
+      );
+    }
 
     const unavailable = [...new Set(Object.values(sections).flatMap((s) => s.unavailable))].sort();
     const integrity = [...new Set(Object.values(sections).flatMap((s) => s.integrity))].sort();

@@ -160,10 +160,14 @@ export interface ReasoningBriefOpts {
    as expected. */
 const EXPECTED_GAP_CODES = new Set([
   "BINDING_ABSENT",
-  "SCOPE_BINDING_ABSENT",
   "ARTIFACT_AUTHORITY_NOT_WIRED",
   "AUTO_POLICY_NOT_WIRED",
   "AUTO_DRIVER_NOT_WIRED",
+  // P17 — unwired tenancy seams degrade to typed gaps (the scoped
+  // surfaces may be absent in minimal compositions; that is wiring,
+  // not a canonical defect).
+  "MEMORY_NOT_WIRED",
+  "EXPERIENCE_NOT_WIRED",
 ]);
 
 function isExpectedGap(code: string): boolean {
@@ -318,6 +322,8 @@ export class ReasoningBriefService {
     const reviews = val("reviews");
     const autonomy = val("autonomy");
     const artifacts = val("artifacts");
+    const experience = val("experience");
+    const memory = val("memory");
 
     // -- objective identity/state (canonical row, strict-verified) --
     const oid = ctx.objective_id;
@@ -493,6 +499,62 @@ export class ReasoningBriefService {
       provenance: "CANONICAL",
       sections: ["artifacts"],
     });
+
+    // -- P17 tenancy-scoped advisory surfaces. Experience rows are
+    //    canonical entities but advisory-tier content → PROJECTED.
+    //    Layer-A memory is model-writable MODEL_HYPOTHESIS by
+    //    construction → UNVERIFIED (the rows exist; their CONTENT is
+    //    never claimed proven). Exclusion counts stay visible — a
+    //    scope wall is a fact too, not just the admitted rows. --
+    const expRows = (experience.experiences as Array<Record<string, unknown>> | undefined) ?? [];
+    // Emit only on real admitted content — a wired-but-empty section
+    // must not mint a permanent zero-fact (an all-exclusion scope
+    // still surfaces the counts INSIDE the section, and the Brain
+    // unavailable channel carries the wiring story).
+    if (expRows.length || Number(experience.admitted ?? 0) > 0) {
+      const byType: Record<string, number> = {};
+      for (const r of expRows) {
+        const t = String(r.type);
+        byType[t] = (byType[t] ?? 0) + 1;
+      }
+      out.push({
+        predicate: "EXPERIENCE",
+        subject: oid,
+        value: {
+          admitted: experience.admitted ?? 0,
+          truncated: experience.truncated === true,
+          by_type: byType,
+          considered_ids: expRows.map((r) => String(r.experience_id)).slice(0, 16),
+          excluded: experience.excluded ?? {},
+        },
+        provenance: "PROJECTED",
+        sections: ["experience"],
+      });
+    }
+    const sem = (memory.semantic as unknown[] | undefined) ?? [];
+    const proc = (memory.procedural as unknown[] | undefined) ?? [];
+    // Same rule — an empty wired memory table is "no memory yet", not
+    // an UNVERIFIED fact; emitting it would cap every wired brief at
+    // MEDIUM forever.
+    if (sem.length || proc.length) {
+      out.push({
+        predicate: "MEMORY",
+        subject: oid,
+        value: {
+          semantic_count: sem.length,
+          procedural_count: proc.length,
+          trust_classes: [
+            ...new Set(
+              [...(sem as Array<Record<string, unknown>>), ...(proc as Array<Record<string, unknown>>)]
+                .map((r) => String(r.trust_class ?? "UNSPECIFIED")),
+            ),
+          ].sort(),
+          excluded: memory.excluded ?? {},
+        },
+        provenance: "UNVERIFIED",
+        sections: ["memory"],
+      });
+    }
 
     return out;
   }

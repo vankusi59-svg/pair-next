@@ -40,6 +40,78 @@ function ref(entityType: string, entityId: string): string {
   return `${entityType}:${entityId}`;
 }
 
+/* P17 — canonical scope derivation, evidence-only:
+ *   mission.bound_open_id → work_open_binding → work_item →
+ *   parent chain → root → root work_item's own objective_id/business_id.
+ * The ROOT work_item carries the canonical pins (work-graph inherits
+ * objective_id/business_id from the root at mint) — no binding-table
+ * pattern-match needed. Any link that fails to resolve degrades to
+ * business-only (or unscoped) — never throws, never fabricates an
+ * objective claim: an under-scoped row is simply invisible to tighter
+ * reads. A binding whose business disagrees with the mission's own is
+ * malformed → objective claim dropped, mission's business kept. */
+export function deriveMissionScope(
+  store: { tryGet: (t: string, id: string) => unknown; },
+  missionId: string,
+): {
+  scope_business_id: string | null;
+  scope_objective_id: string | null;
+} {
+  const none = { scope_business_id: null, scope_objective_id: null };
+  const workItemRoot = (workItemId: string): Record<string, unknown> | null => {
+    let id = workItemId;
+    for (let depth = 0; depth < 64; depth++) {
+      const item = store.tryGet("work_item", id) as Record<string, unknown> | null;
+      if (!item) return null;
+      const parent = item.parent_work_item_id != null ? String(item.parent_work_item_id) : "";
+      if (!parent) return item;
+      id = parent;
+    }
+    return null; // cyclic/deeper-than-cap — unproven, degrade
+  };
+  try {
+    const mission = store.tryGet("mission", missionId) as Record<string, unknown> | null;
+    if (!mission) return none;
+    const businessId = mission.business_id != null ? String(mission.business_id) : null;
+    const openId = mission.bound_open_id != null ? String(mission.bound_open_id) : "";
+    if (openId) {
+      const ob = store.tryGet("work_open_binding", openId) as Record<string, unknown> | null;
+      if (ob && String(ob.mission_id ?? "") === String(mission.mission_id)) {
+        const bindingBiz = ob.business_id != null ? String(ob.business_id) : null;
+        // A binding disagreeing with the mission's canonical business
+        // is malformed — drop the objective claim, keep the mission's
+        // own business (the binding cannot override it).
+        if (bindingBiz !== null && businessId !== null && bindingBiz !== businessId) {
+          return { scope_business_id: businessId, scope_objective_id: null };
+        }
+        const wid = ob.work_item_id != null ? String(ob.work_item_id) : "";
+        const root = wid ? workItemRoot(wid) : null;
+        if (root) {
+          const rootObj = root.objective_id != null ? String(root.objective_id) : null;
+          const rootBiz = root.business_id != null ? String(root.business_id) : null;
+          if (rootObj) {
+            // Re-prove the root's claim: the objective must resolve and
+            // its canonical business must agree with the root's own —
+            // a forged root pairing (O1, B2) never mints a scope.
+            const obj = store.tryGet("objective", rootObj) as Record<string, unknown> | null;
+            const objBiz = obj && obj.business_id != null ? String(obj.business_id) : null;
+            if (obj && (rootBiz === null || rootBiz === objBiz)) {
+              return {
+                scope_business_id: objBiz ?? rootBiz ?? businessId,
+                scope_objective_id: rootObj,
+              };
+            }
+            // Forged/unresolvable root claim — degrade to business-only.
+          }
+        }
+      }
+    }
+    return { scope_business_id: businessId, scope_objective_id: null };
+  } catch {
+    return none;
+  }
+}
+
 export interface ExtractedObservation {
   type: string;
   seriesKey: string;
@@ -56,6 +128,11 @@ export interface ExtractedObservation {
   providers?: string[];
   models?: string[];
   provenance: string;
+  /** P17 tenancy binding derived from the evidence chain — a
+   *  candidate aggregates ONLY within its own scope (the dedup fold
+   *  matches on series_key AND scope together). */
+  scopeBusinessId?: string | null;
+  scopeObjectiveId?: string | null;
 }
 
 export class ExperienceExtractor {
@@ -68,13 +145,44 @@ export class ExperienceExtractor {
     return this.service.store;
   }
 
+  /* P17 — canonical scope derivation. See deriveMissionScope below —
+   *  the extractor delegates to the shared evidence-only resolver. */
+  missionScope(missionId: string): {
+    scope_business_id: string | null;
+    scope_objective_id: string | null;
+  } {
+    return deriveMissionScope(this.store, missionId);
+  }
+
+  private executionScope(exec: Record<string, unknown>, task: Record<string, unknown> | null) {
+    const missionId = String(exec.mission_id ?? task?.mission_id ?? "");
+    return missionId ? this.missionScope(missionId) : { scope_business_id: null, scope_objective_id: null };
+  }
+
   /**
-   * Create or fold a candidate. Same series_key + new evidence → aggregate;
-   * already-recorded evidence ref → semantic no-op; MODEL_GENERATED origin →
-   * created then auto-quarantined by the service (never advisory).
+   * Create or fold a candidate. Same series_key + SAME tenancy scope +
+   * new evidence → aggregate; already-recorded evidence ref → semantic
+   * no-op; MODEL_GENERATED origin → created then auto-quarantined by
+   * the service (never advisory). A foreign-scope same-signature
+   * observation never folds into this scope's series — tenancy is
+   * part of the dedup identity.
    */
   fold(obs: ExtractedObservation): Record<string, unknown> {
-    const existing = this.experience.findBySeriesKey(obs.seriesKey);
+    // Normalize the obs scope the same way assertScope normalizes the
+    // STORED row (an objective scope always carries the objective's own
+    // canonical business) — otherwise an objective-only obs scope
+    // {null, O} can never match its stored {B, O} member and mints a
+    // duplicate series row.
+    const scope = {
+      scope_business_id: obs.scopeBusinessId ?? null,
+      scope_objective_id: obs.scopeObjectiveId ?? null,
+    };
+    if (scope.scope_objective_id !== null && scope.scope_business_id === null) {
+      const obj = this.store.tryGet("objective", scope.scope_objective_id) as
+        Record<string, unknown> | null;
+      if (obj) scope.scope_business_id = String(obj.business_id ?? "") || null;
+    }
+    const existing = this.experience.findBySeriesKey(obs.seriesKey, scope);
     if (existing) {
       return this.experience.foldObservation(String(existing.experience_id), {
         evidence_ref: obs.evidenceRef,
@@ -102,6 +210,7 @@ export class ExperienceExtractor {
       observed_executors: obs.executors,
       observed_providers: obs.providers,
       observed_models: obs.models,
+      ...scope,
     });
   }
 
@@ -127,6 +236,7 @@ export class ExperienceExtractor {
       ((task?.required_capabilities as string[]) ?? []).map(String).sort();
     const envFp = environmentFingerprint(opts.environment ?? {});
     const envs = opts.environment ? [envFp] : [];
+    const scope = this.executionScope(exec, task);
     const out: Record<string, unknown>[] = [];
 
     out.push(
@@ -157,6 +267,8 @@ export class ExperienceExtractor {
         environments: envs,
         executors: [executorId],
         provenance: "terminal_execution",
+        scopeBusinessId: scope.scope_business_id,
+        scopeObjectiveId: scope.scope_objective_id,
       }),
     );
 
@@ -201,6 +313,8 @@ export class ExperienceExtractor {
           providers: provider ? [String(provider)] : [],
           models: model ? [String(model)] : [],
           provenance: "terminal_execution",
+          scopeBusinessId: scope.scope_business_id,
+          scopeObjectiveId: scope.scope_objective_id,
         }),
       );
     }
@@ -239,6 +353,8 @@ export class ExperienceExtractor {
           environments: envs,
           executors: [executorId],
           provenance: "route_outcome",
+          scopeBusinessId: scope.scope_business_id,
+          scopeObjectiveId: scope.scope_objective_id,
         }),
       );
     }
@@ -261,6 +377,7 @@ export class ExperienceExtractor {
       String(err.class ?? err.message ?? exec.result_state ?? "UNKNOWN"),
     );
     const envFp = environmentFingerprint(opts.environment ?? {});
+    const scope = this.executionScope(exec, task);
     const signature = digest({
       error_class: errorClass,
       executor: executorId,
@@ -289,6 +406,8 @@ export class ExperienceExtractor {
       environments: opts.environment ? [envFp] : [],
       executors: [executorId],
       provenance: "terminal_failure",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 
@@ -317,6 +436,7 @@ export class ExperienceExtractor {
       );
     }
     const envFp = environmentFingerprint(opts.environment ?? {});
+    const scope = this.executionScope(ok, this.store.tryGet("task", String(ok.task_id)));
     const seriesKey = digest({
       type: "REMEDIATION_PAIR",
       executor: String(fail.executor_id),
@@ -341,6 +461,8 @@ export class ExperienceExtractor {
       environments: opts.environment ? [envFp] : [],
       executors: [String(fail.executor_id)],
       provenance: "verified_remediation",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 
@@ -370,6 +492,7 @@ export class ExperienceExtractor {
         depends_on: t.depends_on,
       }));
     const seriesKey = digest({ type: "PLAN_TEMPLATE", tasks });
+    const scope = this.missionScope(missionId);
     return this.fold({
       type: "PLAN_TEMPLATE",
       seriesKey,
@@ -383,6 +506,8 @@ export class ExperienceExtractor {
       },
       outcome: "SUCCESS",
       provenance: "verified_plan_revision",
+      scopeBusinessId: scope.scope_business_id,
+      scopeObjectiveId: scope.scope_objective_id,
     });
   }
 }
