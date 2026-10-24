@@ -59,6 +59,7 @@ const SURFACE_FILES = {
   "src/pair/business.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-authority.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-auto-policy.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/objective-auto-scheduler.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-auto-driver.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-capability-gap.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-workstream.ts": ["BUSINESS_OBJECTIVE"],
@@ -402,6 +403,7 @@ export const PACKS = {
     "pair-p18-c-parallel-gating.test.ts",
     "pair-p18-d-cross-objective-handoff.test.ts",
     "pair-p18-e-org-agent-duty.test.ts",
+    "pair-p18-f-recovery.test.ts",
   ],
   TELEGRAM_INGRESS: [
     "pair-p15-8e-telegram.test.ts",

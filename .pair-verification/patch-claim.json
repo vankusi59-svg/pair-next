@@ -1,17 +1,17 @@
 {
-  "claim_id": "P18_E_ORG_AGENT_DUTY",
-  "title": "P18-E canonical org_agent_duty — an org_agent's declared objective coverage inside one business",
+  "claim_id": "P18_F_RECOVERY_E2E",
+  "title": "P18-F supersession-aware recovery + company E2E",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-e-org-agent-duty.test.ts#P18-E"
+    "src/__tests__/pair-p18-f-recovery.test.ts#P18-F"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P18-E: parity fix on P18-A objective-relation.ts — colon-containing relation endpoints are now rejected at create(), dropped in provenRow (unmintable shape), never projected into index pointers by ensureIndex (a raw colon-endpoint row could otherwise mint a poison key inside an innocent objective's admissionView prefix range and wedge its gate permanently), and typed-failed at admissionView. P18-E proper: new canonical entity org_agent_duty — declares that a specific org_agent's responsibility covers a specific objective set (the staffing fact P18-F recovery/company-E2E consumes to prove a mandate legitimately spans objectives). Multi-lateral authority: actor=operator:<ref> must equal owner_authority_id of EVERY covered objective (the P18-A bilateral rule extended to N). business_id derived from canonical objectives (cross-business sets can never mint); org_agent must resolve and belong to the derived business. Digest pins all canonical fields; OCC on version; event tail re-proved (DUTY_CREATED identity pins incl. objective_ids set + legal STATE hops to row state). provenRow strict/lenient split identical to P18-A: corruption wedges strict write paths and drops per-row on lenient reads; semantic unproven-ness (foreign created_by, amended owner, missing agent, unsorted/duplicate objective_ids, key-borrowed clones) never serves. Reads are O(degree) via dual pointer index (O:{objective}:{duty} + A:{agent}:{duty}, proof-agnostic, resumable chunked rebuild, built-only-when-complete marker) with identical strict global fallback before the marker. coveringDuties(agent, objs) requires ONE proven ACTIVE duty covering the whole set — union-of-duties is deliberately not coverage. INERT: no scheduler/allocation/UI consumer yet — later seams call covers()/coveringDuties(). Codex-only.",
+  "description": "P18-F: SUPERSEDES finally consumes the relation substrate — recovery for terminally-blocked admission. admissionView() gains a third proven set, superseded_by (ACTIVE SUPERSEDES edges whose `to` is the objective — identical strict proof in index and global-fallback paths). The scheduler's relationGate resolves each unmet DEPENDS_ON upstream through the proven supersession DAG (BFS, visited-set cycle-safe, SUPERSEDE_WALK_CAP=128 nodes): the requirement is satisfied iff ANY reachable node — the upstream itself or a declared replacement — is ACHIEVED. A failed upstream with an achieved declared replacement releases admission; a pending upstream with an achieved replacement releases too (supersession re-points the requirement uniformly, same authority as revoking the edge). Cycles, ambiguous branching, over-cap walks and unproven/suspended/revoked edges stay gated — owner-authored states fail contained to that objective, never wedge the scan. Corrupt rows still propagate loudly. Boundaries held: handoff keeps raw upstream (supersession never expands artifact provenance), duties keep declared coverage (recovery never re-points), CONFLICTS gating unaffected. Tests F1–F13 incl. index/fallback parity, cap, cycle, unproven-edge probes and a company E2E (business + org_agent duty + relation + terminal failure + declared recovery + admission). Codex-only.",
   "risk_override": "HIGH"
 }

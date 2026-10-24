@@ -637,7 +637,9 @@ export class ObjectiveRelationService {
 
   /** STRICT admission seam (P18-C): the ACTIVE edge sets an admission
    *  gate must judge — DEPENDS_ON upstreams of the objective (edges it
-   *  must wait on) and CONFLICTS partners (either direction). Any
+   *  must wait on), CONFLICTS partners (either direction) and
+   *  SUPERSEDES superseders (P18-F recovery: proven ACTIVE edges whose
+   *  `to` is this objective — the declared replacement set). Any
    *  corrupt relation row propagates loudly instead of being silently
    *  excluded — a corrupted-but-real edge can never silently clear an
    *  objective for admission. Semantic unproven-ness (fabrications,
@@ -653,6 +655,7 @@ export class ObjectiveRelationService {
   admissionView(objectiveId: string): {
     upstream: string[];
     conflicts: string[];
+    superseded_by: string[];
   } {
     // The index path builds a `:`-delimited prefix range — a colon
     // endpoint is unkeyable and must fail loudly, never silently
@@ -664,6 +667,7 @@ export class ObjectiveRelationService {
     if (!this.indexBuilt()) return this.admissionGlobal(objectiveId);
     const upstream = new Set<string>();
     const conflicts = new Set<string>();
+    const supersededBy = new Set<string>();
     const prefix = `${objectiveId}:`;
     let after = prefix;
     for (;;) {
@@ -722,13 +726,22 @@ export class ObjectiveRelationService {
             const other = proven.from_objective_id === objectiveId
               ? proven.to_objective_id : proven.from_objective_id;
             conflicts.add(other);
+          } else if (proven.kind === "SUPERSEDES" &&
+              proven.to_objective_id === objectiveId) {
+            // Recovery seam (P18-F): the objective's declared
+            // replacements — proven, ACTIVE, same proof bar as the
+            // gating edges. The caller walks the DAG; this view only
+            // proves which edges exist.
+            supersededBy.add(proven.from_objective_id);
           }
         }
         after = key;
       }
       if (exited || page.length < RELATION_PAGE) break;
     }
-    return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
+    return { upstream: [...upstream].sort(),
+      conflicts: [...conflicts].sort(),
+      superseded_by: [...supersededBy].sort() };
   }
 
   /** The strict whole-table enumeration — identical proof set to the
@@ -736,9 +749,11 @@ export class ObjectiveRelationService {
   private admissionGlobal(objectiveId: string): {
     upstream: string[];
     conflicts: string[];
+    superseded_by: string[];
   } {
     const upstream = new Set<string>();
     const conflicts = new Set<string>();
+    const supersededBy = new Set<string>();
     for (const r of this.allProven(true)) {
       if (r.state !== "ACTIVE") continue;
       if (r.kind === "DEPENDS_ON" && r.from_objective_id === objectiveId) {
@@ -746,9 +761,14 @@ export class ObjectiveRelationService {
       } else if (r.kind === "CONFLICTS") {
         if (r.from_objective_id === objectiveId) conflicts.add(r.to_objective_id);
         if (r.to_objective_id === objectiveId) conflicts.add(r.from_objective_id);
+      } else if (r.kind === "SUPERSEDES" &&
+          r.to_objective_id === objectiveId) {
+        supersededBy.add(r.from_objective_id);
       }
     }
-    return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
+    return { upstream: [...upstream].sort(),
+      conflicts: [...conflicts].sort(),
+      superseded_by: [...supersededBy].sort() };
   }
 
   private indexMarker(): Row | null {

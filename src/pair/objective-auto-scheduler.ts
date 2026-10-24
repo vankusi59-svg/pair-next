@@ -29,6 +29,10 @@ export const FAIRNESS_STATE = "objective_auto_fairness";
 const GLOBAL = "LOCAL_PAIR_DB";
 const MAX_ACTIVE = 4;
 const PAGE = 64;
+/** P18-F recovery: bound on supersession-DAG nodes visited per unmet
+ *  upstream inside relationGate — a wider owner-authored graph stays
+ *  gated rather than walking unbounded (contained, never a wedge). */
+const SUPERSEDE_WALK_CAP = 128;
 /** R2-F1 — per-call bound on shortlist pages in nextFairCandidate. The
  *  SQL filter already excludes non-actionable and actively-leased rows,
  *  so a second page is only needed if a full PAGE of shortlisted rows
@@ -285,16 +289,46 @@ export class ObjectiveAutoScheduler {
    *  (admissionView): a corrupt relation row propagates and wedges
    *  admission rather than silently clearing it; an unproven/forged
    *  edge never gates. Upstream status re-reads strict here because
-   *  the relation proof pins endpoints, not their mutable status. */
+   *  the relation proof pins endpoints, not their mutable status.
+   *
+   *  Recovery (P18-F): an unmet upstream is resolved through the
+   *  proven supersession DAG — the requirement is satisfied iff ANY
+   *  objective reachable from it through ACTIVE SUPERSEDES edges
+   *  (itself included) is ACHIEVED. A declared replacement that has
+   *  already delivered satisfies the dependency; a cycle, an
+   *  ambiguously-branching or an over-cap walk simply stays gated —
+   *  owner-authored states fail contained, never wedge the scan. */
   private relationGate(objectiveId: string, activeLeases: string[]): string | null {
     const { upstream, conflicts } = this.relations.admissionView(objectiveId);
     for (const up of upstream) {
-      const u = this.objectives.get(up) as Row;
-      if (String(u.status) !== "ACHIEVED") return "UPSTREAM_UNMET";
+      if (!this.upstreamSatisfied(up)) return "UPSTREAM_UNMET";
     }
     const active = new Set(activeLeases);
     if (conflicts.some((c) => active.has(c))) return "CONFLICT_LEASE_HELD";
     return null;
+  }
+
+  /** BFS over the proven supersession DAG rooted at an unmet upstream:
+   *  satisfied iff any reachable node — the upstream itself or one of
+   *  its declared replacements — is ACHIEVED. Visited-set makes cycles
+   *  finite; SUPERSEDE_WALK_CAP bounds total walk work. Each step uses
+   *  the same STRICT admissionView seam, so a corrupt edge row wedges
+   *  loudly while a forged or revoked edge never unlocks admission. */
+  private upstreamSatisfied(objectiveId: string): boolean {
+    const seen = new Set<string>([objectiveId]);
+    const queue = [objectiveId];
+    while (queue.length) {
+      const cur = queue.shift() as string;
+      const row = this.objectives.get(cur) as Row;
+      if (String(row.status) === "ACHIEVED") return true;
+      for (const s of this.relations.admissionView(cur).superseded_by) {
+        if (seen.has(s)) continue;
+        if (seen.size >= SUPERSEDE_WALK_CAP) return false;
+        seen.add(s);
+        queue.push(s);
+      }
+    }
+    return false;
   }
 
   /** Read-only roster view for claimable()'s conflict gate — mirrors

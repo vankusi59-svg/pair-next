@@ -475,7 +475,8 @@ describe("P18-C — parallel admission gating", () => {
     // can never re-prove, so it never gates).
     expect(ptrs.some((p) => p.entity_id === `${b}:${rid}`)).toBe(true);
     // The innocent objective is unaffected: no wedge, no phantom gate.
-    expect(s.relations.admissionView(a)).toEqual({ upstream: [], conflicts: [] });
+    expect(s.relations.admissionView(a)).toEqual(
+      { upstream: [], conflicts: [], superseded_by: [] });
     expect(s.scheduler.claimable(a).eligible).toBe(true);
     // And a colon endpoint arg fails typed, never silently under-gates.
     expectFail(() => s.relations.admissionView(`${a}:evil`),
