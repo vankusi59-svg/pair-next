@@ -50,9 +50,29 @@ import type { WorkforceService } from "./work-graph.js";
 
 type Row = Record<string, unknown> & { version: number };
 
+/** Operator knob: `PAIR_CEO_MODEL` overrides the default CEO reasoning
+ *  model id (bounded identifier only — the provider stays codex-cli, so
+ *  the subscription-only transport policy is preserved). Mirrors the
+ *  PAIR_CONVERSATION_MODEL convention: empty/unset → default; a
+ *  malformed identifier fails closed before any catalog read. */
+export const CEO_MODEL_ENV = "PAIR_CEO_MODEL";
+
+function configuredCeoModelId(): string {
+  const configured = String(process.env[CEO_MODEL_ENV] ?? "").trim();
+  const model = configured === "" ? CEO_CODEX_DEFAULT_MODEL : configured;
+  if (model.length > 100 || !/^[A-Za-z0-9][A-Za-z0-9_.:\/-]*$/.test(model)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_CEO_MODEL_CONFIG",
+      `${CEO_MODEL_ENV} invalid`,
+    );
+  }
+  return model;
+}
+
 /**
- * Resolve the configured default CEO model (`codex-cli:gpt-6.1-sol`)
- * to its canonical model_entry_id — pure read of the existing
+ * Resolve the configured default CEO model (`codex-cli:gpt-6.1-sol`,
+ * overridable via PAIR_CEO_MODEL — model id only, provider is always
+ * codex-cli) to its canonical model_entry_id — pure read of the existing
  * provider/model catalog plus the SAME authority gates the cycle
  * applies at claim time. Never seeds, never bypasses qualification:
  * missing entry, ambiguous duplicate identity, non-codex transport
@@ -60,13 +80,13 @@ type Row = Record<string, unknown> & { version: number };
  * fail closed with a typed IntegrityError.
  */
 export function resolveDefaultCeoModelEntry(store: PairEvidenceStore): string {
+  const modelId = configuredCeoModelId();
   // Deterministic canonical id — resolution is never a guess.
-  const canonicalId = canonicalModelId(
-    CODEX_CLI_PROVIDER_ID, CEO_CODEX_DEFAULT_MODEL);
+  const canonicalId = canonicalModelId(CODEX_CLI_PROVIDER_ID, modelId);
   if (!store.tryGet("model_entry", canonicalId)) {
     throw new IntegrityError(
       "FAIL_CLOSED_CEO_MODEL_UNRESOLVED",
-      `default CEO model ${CODEX_CLI_PROVIDER_ID}:${CEO_CODEX_DEFAULT_MODEL} is not cataloged`,
+      `default CEO model ${CODEX_CLI_PROVIDER_ID}:${modelId} is not cataloged`,
     );
   }
   // Ambiguity — catalog semantics make (provider_id, model_id) a single
@@ -74,12 +94,12 @@ export function resolveDefaultCeoModelEntry(store: PairEvidenceStore): string {
   // only through a non-canonical write) is corrupt authority.
   const claiming = (store.list("model_entry") as Row[]).filter(
     (m) => String(m.provider_id ?? "") === CODEX_CLI_PROVIDER_ID &&
-           String(m.model_id ?? "") === CEO_CODEX_DEFAULT_MODEL &&
+           String(m.model_id ?? "") === modelId &&
            String(m.model_entry_id) !== canonicalId);
   if (claiming.length > 0) {
     throw new IntegrityError(
       "FAIL_CLOSED_CEO_MODEL_AMBIGUOUS",
-      `${claiming.length} foreign model_entry row(s) claim ${CODEX_CLI_PROVIDER_ID}:${CEO_CODEX_DEFAULT_MODEL}`,
+      `${claiming.length} foreign model_entry row(s) claim ${CODEX_CLI_PROVIDER_ID}:${modelId}`,
     );
   }
   // Codex-cli transport identity (provider/protocol/endpoint gates —

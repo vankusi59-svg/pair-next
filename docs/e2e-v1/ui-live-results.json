@@ -1,0 +1,72 @@
+[
+ {
+  "name": "company: business name rendered",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "company: ACHIEVED objective rendered",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "objectives: list loads",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "objectives: mixed statuses present",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "detail: title rendered",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "detail: ACHIEVED status",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "detail: KPI visible",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "detail: evidence key visible",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "loop: scheduler/driver surface renders",
+  "pass": false,
+  "extra": ""
+ },
+ {
+  "name": "cross-check: UI status == API status",
+  "pass": true,
+  "extra": "api=ACHIEVED"
+ },
+ {
+  "name": "reviews: sign-off/review surface",
+  "pass": false,
+  "extra": ""
+ },
+ {
+  "name": "isolation: wrong token -> 401/403",
+  "pass": true,
+  "extra": "status=401"
+ },
+ {
+  "name": "missions: MSN list renders",
+  "pass": true,
+  "extra": ""
+ },
+ {
+  "name": "probe detail: renders without crash",
+  "pass": true,
+  "extra": ""
+ }
+]
