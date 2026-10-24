@@ -186,7 +186,6 @@ export interface ConvReadGrantControlInput {
   actor: string;
   actor_kind: "admin" | "operator";
   action: "disable" | "revoke";
-  idempotency_key?: string | null;
 }
 
 /** The scope a set of grants vouches — consumed by OperationalQueryService

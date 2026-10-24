@@ -1852,7 +1852,6 @@ export function createMissionControlServer(
               actor,
               actor_kind,
               action: m[2] as "disable" | "revoke",
-              idempotency_key: body.idempotency_key === undefined ? undefined : String(body.idempotency_key),
             }));
           }
           // Status: admin sees everything; an operator claim sees only
