@@ -15,12 +15,13 @@
  *        header present → body identity fields are inert).
  *   H4 — schema: NaN/string/null progress values, missing evidence_key,
  *        non-object patch, wrong-enum amendment field all fail typed.
- *   H5 — garbage-owner objective cannot be claimed by a garbage
- *        header: an objective minted (service-level) with
- *        owner "operator:undefined" is unreachable because the edge
- *        rejects coercion-artifact identities before owner compare.
- *   H6 — create route refuses an absent/empty/garbage operator identity
- *        instead of minting the literal owner "operator:undefined".
+ *   H5 — garbage owners are unmintable AND unclaimable: the service
+ *        rejects artifact refs at create (R2 M1′), and a forged
+ *        garbage-owner row stays unreachable through the edge.
+ *   H6 — create refuses absent/empty/garbage operator identity AND
+ *        garbage/prefix-less body owner_authority_id (R2 M1′ mint hole).
+ *   H7 — amend idempotency: same key+patch is an idempotent replay,
+ *        same key+diff patch is a typed conflict, never double-commit.
  */
 import { describe, expect, it, afterEach } from "vitest";
 import fs from "node:fs";
@@ -46,6 +47,7 @@ import {
   RecoveryController,
   WorkforceService,
   createMissionControlServer,
+  digest,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-step0-http-"));
@@ -60,6 +62,26 @@ type Row = Record<string, unknown> & { version: number };
 
 function dbOf(store: PairEvidenceStore) {
   return (store as unknown as { db: import("better-sqlite3").Database }).db;
+}
+
+/** Forge a persisted payload in place — payload_hash is recomputed so
+ *  the row is "canonically valid" but semantically corrupt; used to
+ *  construct rows no mint path may produce, to prove edge defenses. */
+function sqlRewriteEntity(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  fn: (body: Record<string, unknown>) => void,
+): void {
+  const row = dbOf(store)
+    .prepare("SELECT payload FROM entities WHERE entity_type=? AND entity_id=?")
+    .get(entityType, entityId) as { payload: string } | undefined;
+  if (!row) throw new Error(`entity ${entityType}:${entityId} absent`);
+  const body = JSON.parse(row.payload) as Record<string, unknown>;
+  fn(body);
+  dbOf(store)
+    .prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type=? AND entity_id=?")
+    .run(JSON.stringify(body), digest(body), entityType, entityId);
 }
 function eventCount(store: PairEvidenceStore): number {
   return (dbOf(store).prepare("SELECT COUNT(*) n FROM events").get() as { n: number }).n;
@@ -266,24 +288,30 @@ describe("Step0 owner-action HTTP seams", () => {
     s.store.close();
   });
 
-  it("H5 objective with garbage owner ref is unreachable via garbage header", async () => {
+  it("H5 garbage owners are unmintable AND unclaimable at every layer", async () => {
     const s = freshStack("h5");
-    // Service-level create CAN mint a garbage owner ("operator:undefined")
-    // — the edge must refuse the matching coercion-artifact identity so
-    // no caller can ever satisfy assertOwner for it.
-    const { bid, oid } = mkObjective(s, "undefined");
-    expect(String((s.biz.objectives.get(oid) as Row).owner_authority_id))
-      .toBe("operator:undefined");
+    // R2 M1′ — the canonical service now rejects garbage refs at the
+    // MINT too: no caller (HTTP or service) can create an orphan row.
+    for (const bad of ["undefined", "null", "[object Object]", "NaN", " "]) {
+      expect(() => mkObjective(s, bad), bad).toThrowError(
+        expect.objectContaining({ code: "FAIL_CLOSED_OBJECTIVE_FIELD" }));
+    }
+    // And a forged row (hash-valid, semantically corrupt — something no
+    // mint path can produce) is still unreachable through the edge.
+    const { bid, oid } = mkObjective(s);
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      b.owner_authority_id = "operator:undefined";
+    });
     const base = await serve(s);
-    for (const bad of ["undefined", "null", "[object Object]"]) {
+    for (const bad of ["undefined", "null", "[object Object]", " ", "a b"]) {
       const res = await post(base, `/api/vnext/objectives/${oid}/progress`,
-        { business_id: bid, kpi_id: KPI, value: 1, evidence_key: `e-${bad}` }, bad);
+        { business_id: bid, kpi_id: KPI, value: 1, evidence_key: `e-${counter}` }, bad);
       expect(res.status, bad).toBe(403);
     }
     s.store.close();
   });
 
-  it("H6 create route refuses absent/empty/garbage operator identity", async () => {
+  it("H6 create route refuses absent/empty/garbage operator identity + owner", async () => {
     const s = freshStack("h6");
     const { bid } = mkObjective(s);
     const base = await serve(s);
@@ -297,13 +325,65 @@ describe("Step0 owner-action HTTP seams", () => {
     expect(emptyOp.status).toBe(403);
     const garbage = await post(base, "/api/vnext/objectives", body, "undefined");
     expect(garbage.status).toBe(403);
-    // A real operator still creates — the gate rejects garbage, not
-    // operators.
+    /* R2 M1′ — the sibling mint hole: body.owner_authority_id used to
+       pass verbatim. Garbage, prefix-less and whitespace refs are all
+       rejected — they would mint permanently-unclaimable owners. */
+    for (const bad of [
+      "operator:undefined", "operator:null", "undefined", "alice",
+      "operator:alice bob", "operator: ", "operator:",
+    ]) {
+      const res = await post(base, "/api/vnext/objectives",
+        { ...body, owner_authority_id: bad, dedup_key: `dk-h6b-${counter}` }, OP);
+      expect(res.status, bad).toBe(409);
+    }
+    // An explicit VALID owner (creator ≠ owner is a real contract) still mints.
+    const delegated = await post(base, "/api/vnext/objectives",
+      { ...body, owner_authority_id: "operator:owner-delegate",
+        dedup_key: `dk-h6c-${counter}` }, OP);
+    expect(delegated.status).toBe(200);
+    expect(String(((await delegated.json()) as Row).owner_authority_id))
+      .toBe("operator:owner-delegate");
+    // A real operator still creates — the gate rejects garbage, not operators.
     const ok = await post(base, "/api/vnext/objectives",
       { ...body, dedup_key: `dk-h6-${counter}` }, OP);
     expect(ok.status).toBe(200);
     const created = (await ok.json()) as Row;
     expect(String(created.owner_authority_id)).toBe(OWNER);
+    s.store.close();
+  });
+
+  it("H7 amend idempotency: same key+patch replays, same key+diff patch conflicts", async () => {
+    const s = freshStack("h7");
+    const { bid, oid } = mkObjective(s);
+    const base = await serve(s);
+    const v0 = Number((s.biz.objectives.get(oid) as Row).terms_version);
+
+    const a1 = await post(base, `/api/vnext/objectives/${oid}/amend`,
+      { business_id: bid, patch: { title: "v1" }, idempotency_key: "am-1" }, OP);
+    expect(a1.status).toBe(200);
+    expect(Number((s.biz.objectives.get(oid) as Row).terms_version)).toBe(v0 + 1);
+
+    // Exact replay — committed-but-lost response retried: row back,
+    // NO second bump, no second event.
+    const before = eventCount(s.store);
+    const a2 = await post(base, `/api/vnext/objectives/${oid}/amend`,
+      { business_id: bid, patch: { title: "v1" }, idempotency_key: "am-1" }, OP);
+    expect(a2.status).toBe(200);
+    expect(Number((s.biz.objectives.get(oid) as Row).terms_version)).toBe(v0 + 1);
+    expect(eventCount(s.store)).toBe(before);
+
+    // Same key + different semantics → typed conflict, never silent commit.
+    const a3 = await post(base, `/api/vnext/objectives/${oid}/amend`,
+      { business_id: bid, patch: { title: "v2" }, idempotency_key: "am-1" }, OP);
+    expect(a3.status).toBe(409);
+    expect(String(((await a3.json()) as Row).error))
+      .toBe("FAIL_CLOSED_OBJECTIVE_AMEND_CONFLICT");
+
+    // A genuinely new amendment (new key) commits normally.
+    const a4 = await post(base, `/api/vnext/objectives/${oid}/amend`,
+      { business_id: bid, patch: { title: "v2" }, idempotency_key: "am-2" }, OP);
+    expect(a4.status).toBe(200);
+    expect(Number((s.biz.objectives.get(oid) as Row).terms_version)).toBe(v0 + 2);
     s.store.close();
   });
 });

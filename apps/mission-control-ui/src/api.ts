@@ -203,7 +203,13 @@ export const api = {
     }, { noAuthPrompt: true }),
   objectiveAmendApp: (
     id: string,
-    body: { business_id: string; patch: Record<string, unknown>; reason?: string },
+    body: {
+      business_id: string; patch: Record<string, unknown>; reason?: string;
+      /* Canonical dedup anchor (R2 M2′): minted once per operation —
+         a committed-but-lost response retried with the same key+patch
+         replays idempotently instead of bumping terms_version twice. */
+      idempotency_key?: string;
+    },
   ) =>
     req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/amend`, {
       method: "POST",

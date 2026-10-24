@@ -73,7 +73,16 @@ export const BRAIN_CONTEXT_SCHEMA = "pair.os.vnext.brain-context.v1";
 /** Default read budget for one snapshot. Generous enough for the
  *  largest realistic objective projection, hard enough that a runaway
  *  enumeration fails typed rather than unbounded. Callers may tighten
- *  per-context via opts.read_budget. */
+ *  per-context via opts.read_budget.
+ *
+ *  NOTE on charge factor: contextFor re-proves the KPI/budget claims
+ *  directly (proveClaims) AND the cockpit observation runs the same
+ *  validators again inside buildReviewObservation — the canonical
+ *  claim scan is charged ~2× against this bound. That is deliberate:
+ *  the direct proof is what lets a missing workstream binding report
+ *  BINDING_ABSENT without falsely reporting claims UNPROVEN. The
+ *  bound sizes for the doubled charge; tighten only with measured
+ *  headroom (R2 M3′). */
 export const BRAIN_CONTEXT_READ_BUDGET = {
   entities: 8192,
   events: 8192,
@@ -342,12 +351,18 @@ export class BrainContextService {
        its canonical subset — clock-derived fields are stripped so an
        expiry-instant flip cannot fake a state change. */
     const autoValue = { auto_policy: c.auto_policy, auto_driver: c.auto_driver };
+    // Sources name only the seams actually consulted — an unwired dep
+    // is reported via unavailable[], never claimed as provenance (M7′).
+    const autoSources = [
+      ...(this.deps.autoPolicy ? ["auto_policy.statusReadOnly"] : []),
+      ...(this.deps.autoDriver ? ["auto_driver.statusReadOnly"] : []),
+    ];
     sections.autonomy = {
-      sources: ["auto_policy.statusReadOnly", "auto_driver.statusReadOnly"],
+      sources: autoSources,
       unavailable: autoUnavailable,
       integrity: [],
       digest: digest({
-        sources: ["auto_policy.statusReadOnly", "auto_driver.statusReadOnly"],
+        sources: autoSources,
         unavailable: autoUnavailable,
         integrity: [],
         value: stripVolatile(autoValue),

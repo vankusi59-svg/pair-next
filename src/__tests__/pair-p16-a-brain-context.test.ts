@@ -46,6 +46,7 @@ import {
   MissionScheduleService,
   MissionScheduler,
   MissionSupervisor,
+  ObjectiveAutoPolicyService,
   ObjectiveWorkstreamService,
   PairControlPlane,
   PairEvidenceStore,
@@ -324,6 +325,48 @@ describe("P16-A BrainContextService.contextFor", () => {
     const ap = (c2.sections.autonomy!.value as Row).auto_policy as Row;
     expect(ap.expiry_pending).toBe(true); // transient status IS visible…
     expect(c2.context_digest).toBe(c1.context_digest); // …but never digested
+    s.store.close();
+  });
+
+  it("B1b-real wired REAL auto-policy service: expiry instant never moves context_digest", () => {
+    const { s, oid } = seeded("b1r", []);
+    /* R2 M6′ — the stub variant proved the strip mechanism; this pins
+       the REAL ObjectiveAutoPolicyService field set: an ENABLED policy
+       whose expires_at passes between reads changes expiry_pending/
+       effective/reasons (clock-derived) but the digest must not move.
+       If a future now()-derived key lands in toStatus and is not
+       stripped, this test catches it. */
+    const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives);
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
+        max_ceo_calls: 4 },
+      idempotency_key: `cfg-b1r-${counter}`,
+    });
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: 1, idempotency_key: `en-b1r-${counter}`,
+    });
+    const live = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: policy,
+    });
+    const c1 = live.contextFor(oid, OWNER);
+    const ap1 = (c1.sections.autonomy!.value as Row).auto_policy as Row;
+    expect(ap1.expiry_pending).toBe(false);
+    // Same store, same policy row — only the clock jumped past expiry.
+    const expiredClock = new ObjectiveAutoPolicyService(
+      s.store, s.biz.objectives, () => Date.now() + 120_000);
+    const stale = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: expiredClock,
+    });
+    const c2 = stale.contextFor(oid, OWNER);
+    const ap2 = (c2.sections.autonomy!.value as Row).auto_policy as Row;
+    expect(ap2.expiry_pending).toBe(true); // transient status IS visible…
+    expect(c2.context_digest).toBe(c1.context_digest); // …never digested
     s.store.close();
   });
 

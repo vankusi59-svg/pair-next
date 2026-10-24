@@ -552,7 +552,11 @@ export function ObjectiveDetail() {
     runOwnerOp(
       ctx,
       `amend:${ctx.oid}:${JSON.stringify(patch)}:${amend.reason}`,
-      () => ({ business_id: ctx.biz, patch, reason: amend.reason || undefined }),
+      /* The key mints ONCE per stored op body — an ambiguous retry
+         replays the same bytes, and the service dedups on the key so
+         a committed-but-lost response can never double-commit. */
+      () => ({ business_id: ctx.biz, patch, reason: amend.reason || undefined,
+        idempotency_key: crypto.randomUUID() }),
       (b) => api.objectiveAmendApp(ctx.oid, b as never),
       "Amendment committed — terms re-bound (terms_version bumped).",
       "Amendment",
