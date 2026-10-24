@@ -25,6 +25,9 @@
  *       and dangling pointers fail closed, never silently clear.
  *   C11 legacy fallback — while the index marker reports un-built,
  *       the gate proves the same verdict via strict global enum.
+ *   C12 chunked rebuild — a >INDEX_CHUNK legacy table converges over
+ *       calls; `built` must NEVER be marked on a page the chunk cap
+ *       cut mid-way (R2-F1: partial index = dropped gates forever).
  */
 
 import { describe, expect, it } from "vitest";
@@ -358,6 +361,48 @@ describe("P18-C — parallel admission gating", () => {
     expect(s.scheduler.claimable(a).reason).toBe("UPSTREAM_UNMET");
     expectFail(() => s.scheduler.claim(a, "w1", "b1", "op1"),
       "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
+    s.store.close();
+  });
+
+  it("C12 chunked rebuild — built only after the COMPLETE set is indexed", () => {
+    const s = fresh("c12");
+    const bid = mkBiz(s.store);
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // 72 real relations > INDEX_CHUNK(64): the rebuild needs two calls
+    // and the second lands on a short page — the exact boundary where
+    // a mid-page chunk cut must not mark the index complete.
+    const objs: string[] = [];
+    for (let i = 0; i < 72; i++) objs.push(oid(mkObjective(s, bid)));
+    const x = claimable(s, bid);
+    for (let i = 0; i < 71; i++) {
+      s.relations.create({ from_objective_id: objs[i]!, to_objective_id: objs[i + 1]!,
+        kind: "CONFLICTS", actor: OWNER });
+    }
+    // A DEPENDS_ON edge — x must stay gated through every index state.
+    s.relations.create({ from_objective_id: x, to_objective_id: objs[71]!,
+      kind: "DEPENDS_ON", actor: OWNER });
+    // Simulate a pre-index store: drop marker + pointers entirely.
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index_state'").run();
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index'").run();
+    const markerBuilt = () => {
+      const m = db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation_index_state' AND entity_id='progress'")
+        .get() as { payload: string } | undefined;
+      return m ? JSON.parse(m.payload).built === true : false;
+    };
+    const idxCount = () => (db.prepare(
+      "SELECT COUNT(*) c FROM entities WHERE entity_type='objective_relation_index'").get() as { c: number }).c;
+    // Chunk 1: 64 edges → marker NOT built (a short-page cut must not
+    // claim completeness — the unprocessed tail would never gate).
+    s.store.immediate(() => s.relations.ensureIndex());
+    expect(markerBuilt()).toBe(false);
+    expect(idxCount()).toBe(128);
+    // Chunk 2: the remaining 8 edges on a short page → complete.
+    s.store.immediate(() => s.relations.ensureIndex());
+    expect(markerBuilt()).toBe(true);
+    expect(idxCount()).toBe(144);
+    // The indexed tail edge still gates — identical verdict to the
+    // global fallback, now at O(degree).
+    expect(s.scheduler.claimable(x).reason).toBe("UPSTREAM_UNMET");
     s.store.close();
   });
 });

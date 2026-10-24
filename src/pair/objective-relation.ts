@@ -633,7 +633,7 @@ export class ObjectiveRelationService {
         entity_type: RELATION_INDEX_ENTITY,
         after_id: after,
         limit: RELATION_PAGE,
-        upper_id: `${prefix}\\uffff`,
+        upper_id: prefix + String.fromCharCode(0xffff),
       }) as Row[];
       if (!page.length) break;
       for (const idx of page) {
@@ -662,7 +662,12 @@ export class ObjectiveRelationService {
           if (proven.kind === "DEPENDS_ON" &&
               proven.from_objective_id === objectiveId) {
             upstream.add(proven.to_objective_id);
-          } else if (proven.kind === "CONFLICTS") {
+          } else if (proven.kind === "CONFLICTS" &&
+              (proven.from_objective_id === objectiveId ||
+               proven.to_objective_id === objectiveId)) {
+            // Endpoint check mirrors the global path — a planted
+            // pointer naming a FOREIGN conflict edge can never
+            // fabricate a gate for this objective.
             const other = proven.from_objective_id === objectiveId
               ? proven.to_objective_id : proven.from_objective_id;
             conflicts.add(other);
@@ -737,6 +742,7 @@ export class ObjectiveRelationService {
         limit: RELATION_PAGE,
       }) as Row[];
       if (!page.length) { exhausted = true; break; }
+      let cut = false;
       for (const row of page) {
         const proven = this.provenRow(row, true);
         after = String(row.entity_id);
@@ -745,9 +751,13 @@ export class ObjectiveRelationService {
           this.indexEdge(proven.relation_id, proven.to_objective_id);
           built++;
         }
-        if (built >= INDEX_CHUNK) break;
+        if (built >= INDEX_CHUNK) { cut = true; break; }
       }
-      if (page.length < RELATION_PAGE) exhausted = true;
+      // `exhausted` means the FETCH reached the table end AND the whole
+      // page was processed — a short page cut mid-way by the chunk cap
+      // still holds unprocessed rows; marking built there would drop
+      // real edges from the gate forever.
+      if (!cut && page.length < RELATION_PAGE) exhausted = true;
     }
     this.store.put(RELATION_INDEX_STATE, "progress", {
       built: exhausted,
