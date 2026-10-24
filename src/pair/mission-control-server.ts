@@ -40,6 +40,7 @@ import {
 import { ObjectiveCockpitService } from "./objective-cockpit.js";
 import { ObjectivePortfolioService } from "./objective-portfolio.js";
 import { ObjectiveRelationService } from "./objective-relation.js";
+import { OrgAgentDutyService } from "./org-agent-duty.js";
 import type { ArtifactAuthority } from "./artifact-authority.js";
 
 export interface MissionControlServerDeps {
@@ -1642,6 +1643,479 @@ export function createMissionControlServer(
           })),
         });
       }
+      // ===== P18.1 — Operator Control Center owner seams =====
+      // Owner-facing HTTP for the canonical P18 substrate that
+      // previously required sidecar calls: objective relations
+      // (DEPENDS_ON/CONFLICTS/SUPERSEDES), org-agent duties, objective
+      // status transitions, and aggregated scheduler/driver
+      // observability. Same contract as every vnext route: the ONLY
+      // authority source is the x-operator-id header canonicalized via
+      // canonicalOperatorActor; all semantics — bilateral/N-lateral
+      // owner proof, business scope, CAS, idempotent replay, proven
+      // rows — live inside the canonical services. The route
+      // authenticates and schema-checks only; it never writes a store
+      // row and never substitutes a body-declared owner.
+      const relationSvc = () =>
+        new ObjectiveRelationService(deps.store!);
+      const dutySvc = () =>
+        new OrgAgentDutyService(deps.store!);
+      // Owner proof for objective-scoped reads: the canonical row's
+      // owner_authority_id must equal the header actor — the same
+      // assertion the authority service makes internally. A foreign
+      // owner learns nothing about the objective's relation/duty
+      // surface (403 code-only, per the shared error mapping).
+      const ownedObjective = (objectiveId: string) => {
+        const row = biz!.objectives.get(objectiveId);
+        if (String(row.owner_authority_id) !==
+            canonicalOperatorActor(req.headers["x-operator-id"], p)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_AUTHORITY", p);
+        }
+        return row;
+      };
+      // Business-scope proof (portfolio convention): the actor must
+      // strictly own at least one objective in the business — a
+      // tampered row anywhere fails closed before any projection.
+      const assertBusinessScope = (businessId: string, actor: string) => {
+        const owned = biz!.objectives.strictEnumerate().filter(
+          (o) => String(o.business_id) === businessId &&
+            String(o.owner_authority_id) === actor);
+        if (!owned.length) {
+          throw new IntegrityError("FAIL_CLOSED_PORTFOLIO_SCOPE", p);
+        }
+        return owned;
+      };
+      // ----- P18.1-B — objective relations: reads + owner mutations --
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/relations$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "RELATIONS_DISABLED" });
+        }
+        ownedObjective(m[1]!); // owner proof
+        const rels = relationSvc();
+        return void json(res, 200, {
+          relations: rels.relationsFor(m[1]!),
+          admission: rels.admissionView(m[1]!),
+        });
+      }
+      if (m && method === "POST") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "RELATIONS_DISABLED" });
+        }
+        const relActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        // Strict request typing BEFORE the service sees anything —
+        // wrong JSON types are a typed 400 with zero mutation; the
+        // service re-validates kind/endpoints/authority independently.
+        if (
+          typeof body.to_objective_id !== "string" ||
+          typeof body.kind !== "string" ||
+          (body.note !== undefined && body.note !== null && typeof body.note !== "string") ||
+          (body.dedup_key !== undefined && typeof body.dedup_key !== "string")
+        ) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_RELATION_REQUEST",
+            detail: "to_objective_id + kind required strings; note/dedup_key optional strings",
+          });
+        }
+        return void json(res, 200, {
+          relation: relationSvc().create({
+            from_objective_id: m[1]!,
+            to_objective_id: body.to_objective_id as string,
+            kind: body.kind as string,
+            actor: relActor,
+            note: body.note === undefined ? undefined : (body.note as string | null),
+            dedup_key: body.dedup_key === undefined ? undefined : (body.dedup_key as string),
+          }),
+        });
+      }
+      // Advisory preview — reports CURRENT canonical state and the
+      // implication the proposed edge would have. Advisory only: the
+      // authoritative validation (bilateral authority, acyclicity,
+      // business scope) happens inside create() at commit time; this
+      // surface exists so the operator can see consequences before
+      // confirming. No write is possible on this route.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/relations\/preview$/);
+      if (m && method === "POST") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "RELATIONS_DISABLED" });
+        }
+        const from = ownedObjective(m[1]!); // owner proof
+        if (typeof body.to_objective_id !== "string" ||
+            typeof body.kind !== "string") {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_RELATION_REQUEST",
+            detail: "to_objective_id + kind required strings",
+          });
+        }
+        const fromId = m[1]!;
+        const toId = body.to_objective_id as string;
+        const kind = body.kind as string;
+        if (!["DEPENDS_ON", "CONFLICTS", "SUPERSEDES"].includes(kind)) {
+          return void json(res, 200, {
+            advisory: true, valid: false,
+            errors: [`unknown kind ${kind}`],
+          });
+        }
+        const rels = relationSvc();
+        const businessId = String(from.business_id ?? "");
+        const edges = rels.relationsForBusiness(businessId);
+        const errors: string[] = [];
+        let toRow: Record<string, unknown> | null = null;
+        try { toRow = biz.objectives.get(toId) as Record<string, unknown>; }
+        catch { errors.push(`objective ${toId} not found`); }
+        if (toRow && String(toRow.business_id ?? "") !== businessId) {
+          errors.push("cross-business relation");
+        }
+        if (toRow && String(toRow.owner_authority_id ?? "") !==
+            String(from.owner_authority_id ?? "")) {
+          errors.push("target objective has a different owner (bilateral authority required)");
+        }
+        if (toId === fromId) errors.push("self-relation is meaningless");
+        const duplicate = edges.find((r) =>
+          r.kind === kind && r.state !== "REVOKED" &&
+          ((r.from_objective_id === fromId && r.to_objective_id === toId) ||
+            (kind === "CONFLICTS" && r.from_objective_id === toId &&
+              r.to_objective_id === fromId)));
+        if (duplicate) errors.push(`identical ${kind} edge already exists (${duplicate.relation_id})`);
+        // Advisory cycle reachability over ACTIVE DEPENDS_ON — a hint
+        // for the operator; create() runs the authoritative check.
+        let wouldCycle = false;
+        if (kind === "DEPENDS_ON" && !errors.length) {
+          const active = edges.filter(
+            (r) => r.kind === "DEPENDS_ON" && r.state === "ACTIVE");
+          const seen = new Set<string>([toId]);
+          const stack = [toId];
+          while (stack.length) {
+            const cur = stack.pop()!;
+            if (cur === fromId) { wouldCycle = true; break; }
+            for (const e of active) {
+              if (e.from_objective_id === cur && !seen.has(e.to_objective_id)) {
+                seen.add(e.to_objective_id); stack.push(e.to_objective_id);
+              }
+            }
+          }
+          if (wouldCycle) errors.push("would create a DEPENDS_ON cycle");
+        }
+        const toStatus = toRow ? String(toRow.status ?? "") : null;
+        const implications = ({
+          DEPENDS_ON: {
+            effect: `${fromId} will not be admitted until ${toId} is ACHIEVED or superseded`,
+            current_target_status: toStatus,
+            would_block_now: toStatus !== "ACHIEVED",
+          },
+          CONFLICTS: {
+            effect: `${fromId} and ${toId} must never hold concurrent active leases`,
+            symmetric: true,
+          },
+          SUPERSEDES: {
+            effect: `${fromId} declares itself the replacement for ${toId}; dependents of ${toId} are released when ${fromId} is ACHIEVED`,
+            requires: `${fromId} must reach ACHIEVED for the release to fire`,
+          },
+        } as Record<string, Record<string, unknown>>)[kind] ?? {};
+        return void json(res, 200, {
+          advisory: true,
+          valid: errors.length === 0,
+          errors,
+          kind,
+          from_objective_id: fromId,
+          to_objective_id: toId,
+          implications,
+          current: {
+            relations: rels.relationsFor(fromId).length,
+            admission: errors.length ? undefined : rels.admissionView(fromId),
+          },
+        });
+      }
+      m = p.match(/^\/api\/vnext\/relations\/([^/]+)\/(suspend|resume|revoke)$/);
+      if (m && method === "POST") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "RELATIONS_DISABLED" });
+        }
+        const relActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        return void json(res, 200, {
+          relation: relationSvc().control({
+            relation_id: m[1]!,
+            action: m[2]!.toUpperCase() as "SUSPEND" | "RESUME" | "REVOKE",
+            actor: relActor,
+          }),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/relations$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "RELATIONS_DISABLED" });
+        }
+        const actor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const owned = assertBusinessScope(m[1]!, actor);
+        const ownedIds = new Set(owned.map((o) => String(o.objective_id)));
+        // Edges entirely inside the owned scope only — identical
+        // honesty bound as the portfolio projection.
+        return void json(res, 200, {
+          relations: relationSvc().relationsForBusiness(m[1]!).filter(
+            (r) => ownedIds.has(r.from_objective_id) &&
+              ownedIds.has(r.to_objective_id)),
+        });
+      }
+      // ----- P18.1-C — org-agent duties: reads + owner mutations -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/duties$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "DUTIES_DISABLED" });
+        }
+        ownedObjective(m[1]!); // owner proof
+        return void json(res, 200, {
+          duties: dutySvc().dutiesForObjective(m[1]!),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/org-agents\/([^/]+)\/duties$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "DUTIES_DISABLED" });
+        }
+        const actor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const agentId = m[1]!;
+        const agent = biz.listOrgAgents().find(
+          (a) => String(a.agent_id) === agentId);
+        if (!agent) return void json(res, 404, { error: "ORG_AGENT_NOT_FOUND" });
+        const owned = assertBusinessScope(String(agent.business_id ?? ""), actor);
+        const ownedIds = new Set(owned.map((o) => String(o.objective_id)));
+        // Scoped-honest read: only duties whose covered objectives are
+        // ALL owned by the actor enter the projection — a duty
+        // spanning foreign coverage is invisible, never partially
+        // disclosed (portfolio edge-honesty convention).
+        return void json(res, 200, {
+          duties: dutySvc().dutiesForAgent(agentId).filter(
+            (d) => d.objective_ids.every((o) => ownedIds.has(o))),
+        });
+      }
+      if (m && method === "POST") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "DUTIES_DISABLED" });
+        }
+        const dutyActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        if (!Array.isArray(body.objective_ids) ||
+            body.objective_ids.some((v) => typeof v !== "string") ||
+            (body.note !== undefined && body.note !== null && typeof body.note !== "string") ||
+            (body.dedup_key !== undefined && typeof body.dedup_key !== "string")) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_DUTY_REQUEST",
+            detail: "objective_ids must be a string array; note/dedup_key optional strings",
+          });
+        }
+        return void json(res, 200, {
+          duty: dutySvc().create({
+            org_agent_id: m[1]!,
+            objective_ids: body.objective_ids as string[],
+            actor: dutyActor,
+            note: body.note === undefined ? undefined : (body.note as string | null),
+            dedup_key: body.dedup_key === undefined ? undefined : (body.dedup_key as string),
+          }),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/duties\/([^/]+)\/(suspend|resume|revoke)$/);
+      if (m && method === "POST") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "DUTIES_DISABLED" });
+        }
+        const dutyActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        return void json(res, 200, {
+          duty: dutySvc().control({
+            duty_id: m[1]!,
+            action: m[2]!.toUpperCase() as "SUSPEND" | "RESUME" | "REVOKE",
+            actor: dutyActor,
+          }),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/duties$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "DUTIES_DISABLED" });
+        }
+        const actor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const owned = assertBusinessScope(m[1]!, actor);
+        const ownedIds = new Set(owned.map((o) => String(o.objective_id)));
+        const svc = dutySvc();
+        const seen = new Map<string, unknown>();
+        for (const agent of biz.listOrgAgents(m[1]!)) {
+          for (const d of svc.dutiesForAgent(String(agent.agent_id))) {
+            // Duties fully inside the owned objective scope only —
+            // partial/foreign coverage never enters the projection.
+            if (d.objective_ids.every((o) => ownedIds.has(o))) {
+              seen.set(d.duty_id, d);
+            }
+          }
+        }
+        return void json(res, 200, { duties: [...seen.values()] });
+      }
+      // ----- P18.1-D — objective status transitions -----------------
+      // PAUSE/RESUME/CANCEL via the canonical transitionStatus — the
+      // service owns the legal-transition table, terminal guards and
+      // owner proof; the route only types the request.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/transition$/);
+      if (m && method === "POST") {
+        if (!biz) {
+          return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        }
+        const trActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        if (typeof body.to !== "string" || typeof body.business_id !== "string" ||
+            (body.reason !== undefined && body.reason !== null && typeof body.reason !== "string")) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_OBJECTIVE_TRANSITION_REQUEST",
+            detail: "to + business_id required strings; reason optional string",
+          });
+        }
+        return void json(res, 200, {
+          objective: biz.objectives.transitionStatus(m[1]!, {
+            business_id: body.business_id as string,
+            to: body.to as never,
+            reason: body.reason === undefined || body.reason === null
+              ? undefined : String(body.reason),
+            actor: trActor,
+          }),
+        });
+      }
+      // ----- P18.1-E — aggregated operations observability ----------
+      // One-call per-objective operational view: canonical objective
+      // row + policy/scheduler/driver/admission/duty state. Every field
+      // is an existing owner-scoped read — nothing here is inferred.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/operations$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "OPERATIONS_DISABLED" });
+        }
+        const opsActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const objectiveId = m[1]!;
+        autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        // policy.statusReadOnly performs the owner proof without any
+        // lazy-expiry write — safe for a pure observability GET.
+        const policy = autoPolicySvc.statusReadOnly(objectiveId, opsActor);
+        const rels = relationSvc();
+        const admission = rels.admissionView(objectiveId);
+        const driver = deps.autoDriver
+          ? deps.autoDriver.statusReadOnly(objectiveId, opsActor)
+          : null;
+        return void json(res, 200, {
+          operations: {
+            objective_id: objectiveId,
+            objective: biz.objectives.get(objectiveId),
+            auto_policy: policy,
+            auto_scheduler: deps.autoScheduler
+              ? deps.autoScheduler.status(objectiveId, opsActor,
+                  driver
+                    ? { enabled: true, driver_missing: [],
+                        runnable: (driver as Record<string, unknown>)
+                          .objective_runnable === true,
+                        reasons: [] }
+                    : undefined)
+              : null,
+            auto_driver: driver,
+            admission,
+            relations: rels.relationsFor(objectiveId),
+            duties: dutySvc().dutiesForObjective(objectiveId),
+          },
+        });
+      }
+      // Company-level operations overview — per owned-objective queue
+      // snapshot for the cockpit table. Read-only composition over the
+      // same owner-scoped status seams.
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/operations$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "OPERATIONS_DISABLED" });
+        }
+        const actor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const owned = assertBusinessScope(m[1]!, actor);
+        autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        const rows = owned.map((o) => {
+          const oid = String(o.objective_id);
+          const rec: Record<string, unknown> = {
+            objective_id: oid,
+            status: o.status,
+            title: o.title ?? o.statement ?? null,
+            updated_at: o.updated_at,
+          };
+          try {
+            rec.auto_policy_effective =
+              autoPolicySvc!.statusReadOnly(oid, actor).effective;
+          } catch {
+            rec.auto_policy_effective = "NOT_OBSERVED";
+          }
+          if (deps.autoScheduler) {
+            try {
+              const s = deps.autoScheduler.status(oid, actor) as
+                Record<string, unknown>;
+              rec.queue_state = s.queue_state;
+              rec.pending_generation = s.pending_generation;
+              rec.claimed_generation = s.claimed_generation;
+              rec.blocked_reason = s.blocked_reason;
+              rec.next_due = s.next_due;
+              rec.lease = s.lease;
+              rec.owner_action_required = s.owner_action_required;
+            } catch {
+              rec.queue_state = "NOT_OBSERVED";
+            }
+          } else {
+            rec.queue_state = "NOT_OBSERVED";
+          }
+          if (deps.autoDriver) {
+            try {
+              const d = deps.autoDriver.statusReadOnly(oid, actor) as
+                Record<string, unknown>;
+              rec.driver_last_outcome = d.last_outcome;
+              rec.capability_gap = d.capability_gap;
+            } catch {
+              rec.driver_last_outcome = "NOT_OBSERVED";
+            }
+          } else {
+            rec.driver_last_outcome = "NOT_OBSERVED";
+          }
+          return rec;
+        });
+        return void json(res, 200, { operations: rows });
+      }
+      // ----- P18.1-G — integrity observability (read-only probe) ----
+      // Reports whether the canonical strict reads an admission gate
+      // depends on currently prove or wedge. A wedge is reported with
+      // its typed error code — the probe NEVER repairs, reindexes, or
+      // weakens the fail-closed contract; admission itself still
+      // wedges on the same strict reads.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/integrity$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "INTEGRITY_DISABLED" });
+        }
+        ownedObjective(m[1]!); // owner proof
+        const checks: Array<Record<string, unknown>> = [];
+        const probe = (name: string, fn: () => unknown) => {
+          try {
+            const out = fn();
+            checks.push({ name, ok: true, result: out });
+          } catch (e) {
+            const err = e as { code?: string; message?: string };
+            checks.push({
+              name, ok: false,
+              code: err.code ?? "ERROR",
+              detail: String(err.message ?? e).slice(0, 300),
+            });
+          }
+        };
+        const probeOid = m[1]!;
+        const rels = relationSvc();
+        probe("relation_admission_view", () => rels.admissionView(probeOid));
+        probe("relation_rows", () => rels.relationsFor(probeOid).length);
+        probe("duty_rows", () => dutySvc().dutiesForObjective(probeOid).length);
+        probe("objective_row", () => biz!.objectives.get(probeOid).status);
+        const wedged = checks.filter((c) => c.ok === false);
+        return void json(res, 200, {
+          objective_id: m[1],
+          status: wedged.length ? "WEDGED" : "CLEAN",
+          checks,
+          // Honest contract note: this is observability, not repair.
+          remediation: wedged.length
+            ? "Canonical strict reads wedge fail-closed; recovery requires the documented corruption-remediation procedure — no automatic repair exists."
+            : null,
+        });
+      }
       // ----- P15.9-A1 — Company Cockpit canonical read projections ----
       // READ-ONLY: selective fields composed through existing strict
       // reads. Same owner-scope contract as auto-policy/kpi-verification:
@@ -2192,7 +2666,11 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_BRAIN_SCOPE" ||
         e.code === "FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY" ||
         e.code === "FAIL_CLOSED_COMPANY_SCOPE" ||
-        e.code === "FAIL_CLOSED_PORTFOLIO_SCOPE" ? 403
+        e.code === "FAIL_CLOSED_PORTFOLIO_SCOPE" ||
+        e.code === "FAIL_CLOSED_RELATION_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_RELATION_BUSINESS" ||
+        e.code === "FAIL_CLOSED_DUTY_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_DUTY_BUSINESS" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;
