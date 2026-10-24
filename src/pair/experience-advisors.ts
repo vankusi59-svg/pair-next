@@ -175,6 +175,10 @@ export class VerifiedExperiencePlannerAdvisor {
    * nothing — capabilities/deps only. Callers must still run
    * validatePlanProposal + commitPlan; no permissions/executors carry over.
    */
+  /** By-id read — bypasses scopeAdmits by design (the caller already
+   *  named the row). Pre-P17 this was the only surface; if a scoped
+   *  consumer ever wires it, the tenancy check must be added here.
+   *  Currently zero production callers. */
   reusePlanTemplate(
     experienceId: string,
   ): { proposal: { tasks: ProposedTask[] }; template_id: string } {

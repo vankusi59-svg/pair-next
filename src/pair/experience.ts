@@ -646,7 +646,7 @@ export class ExperienceService {
     // staleness floor (CANDIDATE, QUARANTINED, revoked, stale).
     // admitted + ineligible = the complete in-scope population; the
     // projection never hides them.
-    const excluded_ineligible = inScopeIds.size - rows.length;
+    const excluded_ineligible = Math.max(0, inScopeIds.size - rows.length);
     return {
       rows,
       excluded_unscoped,

@@ -90,10 +90,18 @@ export function deriveMissionScope(
           const rootObj = root.objective_id != null ? String(root.objective_id) : null;
           const rootBiz = root.business_id != null ? String(root.business_id) : null;
           if (rootObj) {
-            return {
-              scope_business_id: rootBiz ?? businessId,
-              scope_objective_id: rootObj,
-            };
+            // Re-prove the root's claim: the objective must resolve and
+            // its canonical business must agree with the root's own —
+            // a forged root pairing (O1, B2) never mints a scope.
+            const obj = store.tryGet("objective", rootObj) as Record<string, unknown> | null;
+            const objBiz = obj && obj.business_id != null ? String(obj.business_id) : null;
+            if (obj && (rootBiz === null || rootBiz === objBiz)) {
+              return {
+                scope_business_id: objBiz ?? rootBiz ?? businessId,
+                scope_objective_id: rootObj,
+              };
+            }
+            // Forged/unresolvable root claim — degrade to business-only.
           }
         }
       }
