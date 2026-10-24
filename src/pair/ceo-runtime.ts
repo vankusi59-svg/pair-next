@@ -32,6 +32,11 @@ import {
   CeoPlanningCycleService,
   type CeoObservationDeps,
 } from "./ceo-planning-cycle.js";
+/* P16-C brief wiring closes a managed ESM cycle (ceo-runtime →
+   brain-context → objective-cockpit → objective-adaptive-review →
+   ceo-runtime + reasoning-brief → ceo-planning-cycle). All cross-
+   references are call-time bindings or hoisted export functions —
+   keep it that way: no eval-time use of the cyclic modules here. */
 import { BrainContextService } from "./brain-context.js";
 import {
   briefObservationView,

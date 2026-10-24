@@ -187,7 +187,7 @@ const OWNER_REF_ARTIFACTS = new Set([
  *  operator:<x>, and coercion-artifact refs are rejected there), so
  *  minting one orphans the objective forever — even amend() could not
  *  repair it because assertOwner requires the unreachable actor. */
-function assertOwnerAuthorityRef(field: string, value: unknown): string {
+export function assertOwnerAuthorityRef(field: string, value: unknown): string {
   const s = assertStr(field, value);
   const ref = s.startsWith("operator:") ? s.slice("operator:".length) : null;
   if (ref === null || !ref || /\s/.test(ref) || OWNER_REF_ARTIFACTS.has(ref)) {

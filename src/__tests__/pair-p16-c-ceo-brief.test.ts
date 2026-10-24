@@ -17,8 +17,11 @@
  *   C3  — advisory isolation: a malformed/authority-violating model
  *         decision is rejected by the UNCHANGED canonical validator;
  *         brief content loosens nothing.
- *   C4  — fail-closed: a throwing brief seam aborts BEFORE the attempt
- *         claim — zero attempt rows, zero invocations.
+ *   C4a — compositional IntegrityError degrades to a deterministic
+ *         BRAIN_BRIEF_UNAVAILABLE marker inside the digest; the cycle
+ *         commits (the advisory surface never wedges the cycle).
+ *   C4b — non-IntegrityError seam throws propagate fail-closed BEFORE
+ *         the attempt claim — zero attempt rows, zero invocations.
  *   C5  — no writes added: the entity/event type footprint of a cycle
  *         is identical with and without the brief seam (reads only).
  *   C6  — read identity: a non-owner invoker actor still composes the
@@ -35,6 +38,13 @@
  *         drift check binds brief content, not just the old fields.
  *   C10 — prompt contract: the user prompt carries the advisory
  *         boundary line + the full serialized brief projection.
+ *   C11 — bound objective: BINDING/WORKSTREAM_STATE facts reach the
+ *         prompt; PRIORITIZE_EXISTING commits through the unchanged
+ *         canonical gate.
+ *   C12 — unproven KPI claim (hash-consistent row, current outside
+ *         objective_digest): the seam's stronger re-proof fails →
+ *         typed marker, cycle commits AND replays — the advisory
+ *         surface never wedges replay either.
  *
  * Harness mirrors pair-p15-3 (FakeInvoker + mkModel/mkProvider) over
  * the real P16-B stack (freshFullStack + ReasoningBriefService).
@@ -244,6 +254,46 @@ function ceoStack(name: string, raw: string | ((i: CeoInvokeInput) => string), o
 const attemptsOf = (store: PairEvidenceStore) => store.list("ceo_decision_attempt") as Row[];
 const decisionsOf = (store: PairEvidenceStore) => store.list("ceo_decision") as Row[];
 
+const PRIORITIZE_JSON = (keys: string[]) => JSON.stringify({
+  schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+  workstreams: null, priority_order: keys,
+  wait_reason: null, summary: "order",
+});
+
+function decompose(s: Stack, oid: string, keys: string[]) {
+  const o = s.biz.objectives.get(oid);
+  s.workstreams.decomposeObjective({
+    objective_id: oid,
+    expected_objective_version: Number(o.version),
+    expected_terms_version: Number(o.terms_version),
+    expected_objective_digest: String(o.objective_digest),
+    workstreams: keys.map((k) => ({
+      workstream_key: k, title: `ws ${k}`, goal: `g ${k}` })) as never,
+    actor: OP,
+  });
+  return s.workstreams.getBinding(oid)!;
+}
+
+/** Rewrite an entity payload in place with recomputed payload_hash —
+ *  the canonical hash-consistent mutation primitive. */
+function sqlRewriteEntity(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  fn: (body: Record<string, unknown>) => void,
+): void {
+  const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+  const row = db.prepare(
+    "SELECT payload FROM entities WHERE entity_type=? AND entity_id=?")
+    .get(entityType, entityId) as { payload: string } | undefined;
+  if (!row) throw new Error(`entity ${entityType}:${entityId} absent`);
+  const body = JSON.parse(row.payload) as Record<string, unknown>;
+  fn(body);
+  db.prepare(
+    "UPDATE entities SET payload=?, payload_hash=? WHERE entity_type=? AND entity_id=?")
+    .run(JSON.stringify(body), digest(body), entityType, entityId);
+}
+
 function footprint(store: PairEvidenceStore) {
   const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
   const ev = (db.prepare(
@@ -320,8 +370,8 @@ describe("P16-C — CEO consumes ReasoningBrief", () => {
     s.store.close();
   });
 
-  it("C4 throwing brief seam fails closed BEFORE the attempt claim", async () => {
-    const s = ceoStack("c4", CEO_WAIT);
+  it("C4a compositional IntegrityError degrades to a typed marker — cycle commits", async () => {
+    const s = ceoStack("c4a", CEO_WAIT);
     const svc = new CeoPlanningCycleService({
       store: s.store, objectives: s.biz.objectives, workstreams: s.workstreams,
       proveWorkItemDone: (row) => s.biz.proveWorkItemDone(row as never),
@@ -330,13 +380,32 @@ describe("P16-C — CEO consumes ReasoningBrief", () => {
         throw new IntegrityError("FAIL_CLOSED_BRAIN_BUDGET", "test");
       },
     });
-    const eventsBefore = s.store.listEvents("ceo_decision_attempt", "*").length;
+    const r = await svc.runCycle({ objective_id: s.oid, actor: OP });
+    expect(String(r.decision.state)).toBe("COMMITTED");
+    const obs = JSON.parse(
+      s.invoker.inputs[0]!.user_prompt.split("\n")[1]!) as Record<string, unknown>;
+    const bb = obs.brain_brief as Record<string, unknown>;
+    expect(bb.kind).toBe("BRAIN_BRIEF_UNAVAILABLE");
+    expect(bb.authority).toBe("ADVISORY_ONLY");
+    expect(bb.reason).toBe("FAIL_CLOSED_BRAIN_BUDGET");
+    s.store.close();
+  });
+
+  it("C4b non-IntegrityError propagates fail-closed BEFORE the attempt claim", async () => {
+    const s = ceoStack("c4b", CEO_WAIT);
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.biz.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: (row) => s.biz.proveWorkItemDone(row as never),
+      invoker: s.invoker, model_entry_id: s.me,
+      brain_brief: () => {
+        throw new TypeError("programmer bug");
+      },
+    });
     await expect(svc.runCycle({ objective_id: s.oid, actor: OP }))
-      .rejects.toMatchObject({ code: "FAIL_CLOSED_BRAIN_BUDGET" });
+      .rejects.toBeInstanceOf(TypeError);
     expect(s.invoker.calls).toBe(0);
     expect(attemptsOf(s.store)).toHaveLength(0);
     expect(decisionsOf(s.store)).toHaveLength(0);
-    expect(s.store.listEvents("ceo_decision_attempt", "*")).toHaveLength(eventsBefore);
     s.store.close();
   });
 
@@ -505,6 +574,59 @@ describe("P16-C — CEO consumes ReasoningBrief", () => {
     // Without the seam the prompt keeps its original shape (no clause).
     const plain = buildCeoUserPrompt({ a: 1 });
     expect(plain).not.toContain("ADVISORY-ONLY");
+    s.store.close();
+  });
+
+  it("C11 bound objective — WORKSTREAM_STATE/BINDING facts reach the prompt; PRIORITIZE commits", async () => {
+    const s = ceoStack("c11", PRIORITIZE_JSON(["a", "b"]));
+    decompose(s, s.oid, ["a", "b"]);
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.biz.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: (row) => s.biz.proveWorkItemDone(row as never),
+      invoker: s.invoker, model_entry_id: s.me,
+      brain_brief: briefSeam(s, s.me),
+    });
+    const r = await svc.runCycle({ objective_id: s.oid, actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("PRIORITIZE_EXISTING");
+    expect(String(r.decision.state)).toBe("COMMITTED");
+    const obs = JSON.parse(
+      s.invoker.inputs[0]!.user_prompt.split("\n")[1]!) as Record<string, unknown>;
+    const bb = obs.brain_brief as Record<string, unknown>;
+    const preds = (bb.facts as Array<{ predicate: string }>).map((f) => f.predicate);
+    expect(preds).toContain("BINDING");
+    expect(preds).toContain("WORKSTREAM_STATE");
+    s.store.close();
+  });
+
+  it("C12 unproven KPI claim — typed marker, cycle commits AND replays", async () => {
+    /* R1-MAJOR repro: kpis[0].current is group-A runtime state OUTSIDE
+       objective_digest — a hash-consistent row carrying an unproven
+       current passes objectives.get but fails the seam's stronger
+       re-proof (assertCanonicalObjectiveKpiProgress). Without the
+       marker the advisory surface would wedge the authoritative cycle
+       and its replay forever on a legitimately-degraded objective. */
+    const s = ceoStack("c12", CEO_WAIT);
+    sqlRewriteEntity(s.store, "objective", s.oid, (b) => {
+      (b.kpis as Row[])[0]!.current = 1;
+    });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.biz.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: (row) => s.biz.proveWorkItemDone(row as never),
+      invoker: s.invoker, model_entry_id: s.me,
+      brain_brief: briefSeam(s, s.me),
+    });
+    const r1 = await svc.runCycle({ objective_id: s.oid, actor: OP });
+    expect(String(r1.decision.state)).toBe("COMMITTED");
+    const obs = JSON.parse(
+      s.invoker.inputs[0]!.user_prompt.split("\n")[1]!) as Record<string, unknown>;
+    const bb = obs.brain_brief as Record<string, unknown>;
+    expect(bb.kind).toBe("BRAIN_BRIEF_UNAVAILABLE");
+    expect(String(bb.reason)).toContain("FAIL_CLOSED");
+    // The exact property the wedge destroyed: replay of the committed
+    // decision still serves on the SAME (degraded) canonical state.
+    const r2 = await svc.runCycle({ objective_id: s.oid, actor: OP });
+    expect(r2.replayed).toBe(true);
+    expect(s.invoker.calls).toBe(1);
     s.store.close();
   });
 });

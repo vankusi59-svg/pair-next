@@ -19,6 +19,7 @@ import { IntegrityError } from "./errors.js";
 import { CEO_CLI_TIMEOUT, ceoCliTimeoutMs } from "./env-config.js";
 import { modelRoleOf, sameCanonicalModel, MODEL_ROLE, listModelRoleAssignments } from "./model-role.js";
 import { providerModelEligibility } from "./model-routable.js";
+import { assertOwnerAuthorityRef } from "./objective-authority.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import {
@@ -160,9 +161,17 @@ export interface CeoObservationDeps {
    *  the advisory content. Production wiring composes
    *  ReasoningBriefService.briefFor → briefObservationView, which emits
    *  exactly the digest-stable fields brief_digest pins; a wired
-   *  projection MUST be deterministic on canonical state. Errors
-   *  propagate fail-closed like every other observation read — the
-   *  model is never invoked over an observation that cannot compose.
+   *  projection MUST be deterministic on canonical state.
+   *
+   *  Degradation contract (deliberate): the seam's read surface is
+   *  STRICTLY STRONGER than this observation's own — contextFor
+   *  re-proves KPI/budget evidence chains the CEO observation never
+   *  required. An IntegrityError from the seam therefore degrades to
+   *  a deterministic typed marker (BRAIN_BRIEF_UNAVAILABLE + code)
+   *  inside the digest — an advisory component can never wedge the
+   *  authoritative cycle or its replay, and the model is told the
+   *  advisory view is absent and why. Non-IntegrityError throws
+   *  (bugs/infra) still propagate fail-closed.
    *  The brief is ADVISORY-ONLY: it carries named options, never
    *  commands; validation and commit authority stay with
    *  assertCanonicalCeoDecision + the canonical workstream services. */
@@ -254,15 +263,29 @@ export function buildCeoObservation(
     workstreams,
   };
   // P16-C — advisory brief projection (ADVISORY_ONLY — named context,
-  //  never authority). Read identity is the strict-verified canonical
-  //  owner_authority_id from the row above: the reasoner consumes the
-  //  OWNER's governed view of its objective, while the invoker's
-  //  identity stays on attempt/decision provenance rows. Errors from
-  //  the seam propagate fail-closed — an observation that cannot
-  //  compose is never reasoned over.
+  //  never authority). Read identity is the canonical owner_authority_id
+  //  re-validated HERE (assertCanonicalRow checks only string shape — a
+  //  hash-consistent forged owner ref would otherwise satisfy the seam's
+  //  owner gate tautologically): the reasoner consumes the OWNER's
+  //  governed view while the invoker's identity stays on attempt/decision
+  //  provenance rows. Compositional IntegrityErrors degrade to a
+  //  deterministic typed marker — the advisory surface never wedges the
+  //  authoritative cycle; only the error CODE is digested (messages may
+  //  embed volatile detail). Non-IntegrityError throws propagate.
   if (deps.brain_brief) {
-    (observation as Record<string, unknown>).brain_brief =
-      deps.brain_brief(objectiveId, String(obj.owner_authority_id));
+    try {
+      const ownerActor = assertOwnerAuthorityRef(
+        "owner_authority_id", obj.owner_authority_id);
+      (observation as Record<string, unknown>).brain_brief =
+        deps.brain_brief(objectiveId, ownerActor);
+    } catch (err) {
+      if (!(err instanceof IntegrityError)) throw err;
+      (observation as Record<string, unknown>).brain_brief = {
+        kind: "BRAIN_BRIEF_UNAVAILABLE",
+        authority: "ADVISORY_ONLY",
+        reason: String(err.code),
+      };
+    }
   }
   return { observation, observation_digest: digest(observation) };
 }
