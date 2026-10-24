@@ -39,6 +39,14 @@
  *   R18 CONFLICTS symmetric dedup — reverse pair converges.
  *   R19 fabricated self-relation / CREATED-state rewrite / TEXT
  *       version column → unproven or TAMPERED.
+ *   R20 strict write path — a corrupt row wedges mints (never a
+ *       silent duplicate or a starved cycle check), while lenient
+ *       reads still serve siblings.
+ *   R21 cross-collation isolate-skip — astral-plane corrupt keys
+ *       (JS/UTF-8 ordering disagree) skip, not wedge.
+ *   R22 taxonomy + dedup_key validation — unparseable payload on the
+ *       control path throws IntegrityError (not SyntaxError); non-
+ *       string/oversized dedup_key rejected at mint.
  */
 
 import { describe, expect, it } from "vitest";
@@ -681,6 +689,103 @@ describe("P18-A — objective_relation canonical entity", () => {
     db.prepare("UPDATE events SET new_state=?, event_hash=? WHERE event_id=?")
       .run("REVOKED", digest(body), ev.event_id);
     expect(s.relations.relationsFor(a)).toHaveLength(0); // forged CREATED → unproven
+    s.store.close();
+  });
+
+  it("R20 strict write path — corrupt rows wedge mints, never truncate dedup/cycle", () => {
+    const s = fresh("r20");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const c = objId(mkObjective(s, bid));
+    const d = objId(mkObjective(s, bid));
+    const rAB = s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const rBC = s.relations.create({ from_objective_id: b, to_objective_id: c, kind: "DEPENDS_ON", actor: OWNER });
+    // Mint the lenient-read sibling while the set is still clean.
+    const rAD = s.relations.create({ from_objective_id: a, to_objective_id: d, kind: "CONFLICTS", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const corrupt = (id: string) => {
+      const row = db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(id) as { payload: string };
+      db.prepare("UPDATE entities SET payload=? WHERE entity_type='objective_relation' AND entity_id=?")
+        .run(row.payload.replace("ACTIVE", "XXXXXX"), id);
+    };
+    const count = () => (db.prepare(
+      "SELECT COUNT(*) n FROM entities WHERE entity_type='objective_relation'").get() as { n: number }).n;
+    // Corrupt a→b: a replayed mint must NOT silently dedup-miss into a
+    // second canonical row — the strict write path fails loudly.
+    corrupt(rAB.relation_id);
+    let code = "";
+    try {
+      s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
+    expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    expect(count()).toBe(3); // no dup
+    // Corrupt b→c too: the c→a cycle-check must not walk a starved
+    // edge set — it fails loudly on the corruption instead.
+    corrupt(rBC.relation_id);
+    code = "";
+    try {
+      s.relations.create({ from_objective_id: c, to_objective_id: a, kind: "DEPENDS_ON", actor: OWNER });
+    } catch (e) { code = e instanceof IntegrityError ? e.code : "?"; }
+    expect(code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    expect(count()).toBe(3);
+    // Reads stay lenient: corrupt rows skip, legit siblings serve.
+    expect(s.relations.relationsFor(a).map((r) => String(r.relation_id)))
+      .toEqual([rAD.relation_id]);
+    s.store.close();
+  });
+
+  it("R21 cross-collation isolate-skip — astral corrupt keys skip, not wedge", () => {
+    const s = fresh("r21");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const legit = s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const plant = (key: string) => db.prepare(
+      "INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", key, 1, "{corrupt", "0".repeat(64), "2026-01-01T00:00:00.000Z");
+    // U+FFFF then U+10000: SQLite orders ￿ < 𐀀 (UTF-8) but JS
+    // orders them oppositely (UTF-16 surrogate pairs). Both must be
+    // isolated+skipped without a cross-collation cursor wedge.
+    plant("\uFFFF");
+    plant("\u{10000}");
+    const got = s.relations.relationsFor(a);
+    expect(got.map((r) => String(r.relation_id))).toEqual([legit.relation_id]);
+    s.store.close();
+  });
+
+  it("R22 taxonomy + dedup_key — IntegrityError on corrupt control read; key validation", () => {
+    const s = fresh("r22");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({ from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Unparseable payload on the control read path → typed integrity
+    // failure (get's wrap), never a bare SyntaxError.
+    db.prepare("UPDATE entities SET payload=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run("{nope", r.relation_id);
+    try {
+      s.relations.control({ relation_id: r.relation_id, action: "SUSPEND", actor: OWNER });
+      expect.unreachable("should throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(IntegrityError);
+      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_ENTITY_HASH_MISMATCH");
+    }
+    // Restore, then dedup_key shape validation at mint.
+    const d = objId(mkObjective(s, bid));
+    for (const bad of [12345 as never, "x".repeat(300)]) {
+      expect(() => s.relations.create({
+        from_objective_id: a, to_objective_id: d, kind: "CONFLICTS",
+        actor: OWNER, dedup_key: bad as never }))
+        .toThrowError(IntegrityError);
+    }
+    // Still exactly one relation row — both bad mints failed closed.
+    expect((db.prepare(
+      "SELECT COUNT(*) n FROM entities WHERE entity_type='objective_relation'")
+      .get() as { n: number }).n).toBe(1);
     s.store.close();
   });
 });

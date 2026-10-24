@@ -81,6 +81,7 @@ export type RelationState = "ACTIVE" | "SUSPENDED" | "REVOKED";
  *  deeper chains are malformed, not long. */
 const CYCLE_DEPTH_CAP = 128;
 const NOTE_CAP = 512;
+const DEDUP_KEY_CAP = 256;
 
 export interface ObjectiveRelationRow extends Record<string, unknown> {
   relation_id: string;
@@ -241,7 +242,12 @@ export class ObjectiveRelationService {
    *  key K claiming another relation's identity is rejected by the
    *  page itself (thrown IntegrityError carries the key in .detail —
    *  resume past it; the row never enters the proven set). */
-  private allProven(): ObjectiveRelationRow[] {
+  /** strict=true (write paths): any corrupt row propagates — dedup
+   *  and acyclicity must judge over the COMPLETE canonical set or
+   *  fail loudly; silently excluding a corrupted-but-real relation
+   *  would mint a duplicate or admit a cycle. strict=false (reads):
+   *  a corrupt row fails only itself, siblings still serve. */
+  private allProven(strict = false): ObjectiveRelationRow[] {
     const out: ObjectiveRelationRow[] = [];
     let after = "";
     let pageSize = RELATION_PAGE;
@@ -259,12 +265,15 @@ export class ObjectiveRelationService {
         // proven set and defeat dedup/acyclicity upstream.
         if (!(e instanceof IntegrityError) ||
             e.code !== "FAIL_CLOSED_ENTITY_HASH_MISMATCH") throw e;
+        if (strict) throw e;
         // A bad row kills its whole page — don't drop the legit rows
         // sharing it: shrink to single-row pages to isolate, then skip
-        // the offender (its key is in err.detail).
+        // the offender (its key is in err.detail; entityPage's own
+        // `entity_id > ?` predicate guarantees forward progress, so
+        // no cross-collation comparison is needed here).
         if (pageSize > 1) { pageSize = 1; continue; }
         const bad = String(e.detail ?? "");
-        if (!bad || bad <= after) throw e;
+        if (!bad) throw e;
         after = bad;
         pageSize = RELATION_PAGE;
         continue;
@@ -352,7 +361,7 @@ export class ObjectiveRelationService {
         fail("FAIL_CLOSED_RELATION_AUTHORITY",
           "actor must be the owner_authority_id of both objectives");
       }
-      const proven = this.allProven();
+      const proven = this.allProven(true);
       if (kind === "DEPENDS_ON") {
         const edges = proven.filter(
           (r) => r.business_id === businessId &&
@@ -372,6 +381,20 @@ export class ObjectiveRelationService {
       });
       if (existing) return existing;
 
+      // dedup_key is audit metadata stored verbatim — validate shape
+      // and bound it like `note` (no numbers, no unbounded blobs).
+      let dedupKey: string;
+      if (input.dedup_key != null) {
+        if (typeof input.dedup_key !== "string" ||
+            input.dedup_key.length === 0 ||
+            [...input.dedup_key].length > DEDUP_KEY_CAP) {
+          fail("FAIL_CLOSED_RELATION_FIELDS", "dedup_key");
+        }
+        dedupKey = input.dedup_key;
+      } else {
+        dedupKey = digest({ fromId, toId, kind });
+      }
+
       const now = utcnow();
       const row: ObjectiveRelationRow = {
         relation_id: newId("REL"),
@@ -384,7 +407,7 @@ export class ObjectiveRelationService {
         note: input.note != null
           ? [...String(input.note)].slice(0, NOTE_CAP).join("") : null,
         created_by: actor,
-        dedup_key: input.dedup_key ?? digest({ fromId, toId, kind }),
+        dedup_key: dedupKey,
         created_at: now,
         updated_at: now,
         relation_digest: "",
@@ -462,7 +485,7 @@ export class ObjectiveRelationService {
       if (action === "RESUME" && row.kind === "DEPENDS_ON") {
         // Re-activation re-proves acyclicity — a graph that changed
         // under SUSPENDED must not silently revive into a cycle.
-        const edges = this.allProven().filter(
+        const edges = this.allProven(true).filter(
           (r) => r.business_id === row.business_id &&
             r.kind === "DEPENDS_ON" && r.state !== "REVOKED");
         this.assertAcyclic(edges, row.from_objective_id, row.to_objective_id);

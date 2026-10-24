@@ -181,7 +181,16 @@ export class PairEvidenceStore {
   }
 
   private verifiedEvent(row: Record<string, unknown>): Record<string, unknown> {
-    const metadata = row.metadata_json ? JSON.parse(String(row.metadata_json)) : null;
+    let metadata: unknown = null;
+    if (row.metadata_json) {
+      try {
+        metadata = JSON.parse(String(row.metadata_json));
+      } catch {
+        // Unparseable metadata is event corruption — carry the event
+        // id so callers can isolate it, never a bare SyntaxError.
+        throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
+      }
+    }
     const body = {
       event_id: row.event_id, entity_type: row.entity_type, entity_id: row.entity_id,
       event_type: row.event_type, old_state: row.old_state, new_state: row.new_state,
@@ -370,7 +379,15 @@ export class PairEvidenceStore {
     if (!row) {
       throw new NotFoundError(`${entityType}:${entityId}`);
     }
-    const payload = JSON.parse(row.payload) as T;
+    let payload: T;
+    try {
+      payload = JSON.parse(row.payload) as T;
+    } catch {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+        `${entityType}:${entityId}`,
+      );
+    }
     if (digest(payload) !== row.payload_hash) {
       throw new IntegrityError(
         "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
@@ -402,7 +419,12 @@ export class PairEvidenceStore {
       .all(...(this.readBudget ? [entityType, this.readBudget.entities + 1] : [entityType])) as Array<{ payload: string; payload_hash: string }>;
     this.charge("entities", rows.length);
     return rows.map((row) => {
-      const payload = JSON.parse(row.payload) as T;
+      let payload: T;
+      try {
+        payload = JSON.parse(row.payload) as T;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
+      }
       if (digest(payload) !== row.payload_hash) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
