@@ -19,7 +19,7 @@
  *   only decides WHICH mission runs, never bypasses approvals.
  */
 import { IntegrityError, PolicyError } from "./errors.js";
-import { newId, utcnow } from "./canonical.js";
+import { digest, newId, utcnow } from "./canonical.js";
 import {
   AgentContractService,
   type AgentContractPolicy,
@@ -171,10 +171,66 @@ const COMMENT_CAP = 200;
 /** (P2) Mutable work_item claim fields are observability mirrors only —
  *  never consulted as authority; kept for API/dashboard readability. */
 
+/** Phase C — the shared asynchronous delegated-planning seam signature.
+ *  Production wiring binds the SAME `planExpander` the Mission Control API
+ *  edge uses (the LLM Planner Pool: failover + canonicalize + durable
+ *  planner_run/attempt evidence). `context.work_item_id` carries the
+ *  delegated-open identity so server-internal callers can bind per-call
+ *  Objective cost admission to the canonical lineage — it is never part
+ *  of the caller-controlled request body. */
+export type DelegatedPlanExpander = (
+  input: Record<string, unknown>,
+  context?: {
+    work_item_id?: string;
+    /** AUDIT R1 F5 — caller-pinned planner-window bound (duration ms,
+     *  tighten-only): the expander min()'s it against the configured
+     *  run deadline so a planner invocation can never outlive the
+     *  authority that invoked it (auto-driver lease bound). */
+    deadlineMs?: number;
+  },
+) => Promise<{
+  input: Record<string, unknown>;
+  planner?: Record<string, unknown> | null;
+}>;
+
+/** Phase C — a delegated plan authorized for the EXACT enriched
+ *  bound-mission goal: the Planner Pool winner's canonical task list plus
+ *  the goal digest + durable planner provenance the open seam re-proves
+ *  before any new-open mutation commits. */
+export interface DelegatedPlanPreparation {
+  /** Digest over {work_item_id, business_id, department, org_agent_id,
+   *  goal} — binds the plan to THIS open's mission terms. */
+  goal_digest: string;
+  /** Canonical task list (planner-pool winner, fully canonicalized). */
+  tasks: Array<Record<string, unknown>>;
+  plan_source: string;
+  plan_model: string | null;
+  planner_run_id: string | null;
+  winner_attempt_no: number | null;
+}
+
+/** Phase C — canonical delegated-goal digest: binds a prepared plan to
+ *  the EXACT enriched bound-mission goal + open authority identity the
+ *  open seam will commit. */
+function delegatedGoalDigest(input: {
+  work_item_id: string;
+  business_id: string;
+  department: string | null;
+  org_agent_id: string | null;
+  goal: string;
+}): string {
+  return digest({ contract: "pair-delegated-mission-goal.v1", ...input });
+}
+
 export interface BusinessLayerDeps {
   store: PairEvidenceStore;
   control: MissionControl;
   schedules: MissionScheduleService;
+  /** Phase C — the ONE async Planner Pool seam shared with the API
+   *  preview/submit edge. Absent → prepareDelegatedPlan fails closed
+   *  FAIL_CLOSED_NO_PLANNER (delegated opens never fall back to a
+   *  template). Optional so legacy direct-open tests stay valid. */
+  planExpander?: DelegatedPlanExpander;
 }
 
 type Row = Record<string, unknown> & { version: number };
@@ -1502,27 +1558,202 @@ export class BusinessLayer {
     });
   }
 
-  /**
-   * The single seam where business work enters the governed engine:
-   * budget check (fail-closed) → enriched goal → canonical startMission →
-   * work_item IN_PROGRESS with mission_id recorded.
-   */
-  openWorkItem(
+  /** P12 §15 — the canonical enriched bound-mission goal, extracted so
+   *  the delegated-planning seam can plan against the EXACT terms
+   *  openWorkItem will commit: context injection respects the contract's
+   *  allowed_context_scopes — "business" gates the org prefix, "agent"
+   *  gates agent identity + outcome notes. Baseline grants all scopes,
+   *  so unmodified contracts see identical goals. */
+  private boundMissionGoal(
+    row: Row,
+    business: Row,
+    agentId: string | null,
+    agent: Row | null,
+  ): string {
+    const ctxScopes = agentId
+      ? new Set(
+          (this.agentContracts.resolve(agentId).contract.policy as AgentContractPolicy)
+            .allowed_context_scopes,
+        )
+      : new Set<string>();
+    const notes = ctxScopes.has("agent")
+      ? (((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
+          .slice(-AGENT_CONTEXT_INJECT)
+          .map((n) => `- ${String(n.note)}`))
+      : [];
+    return (
+      (ctxScopes.has("business") || !agentId
+        ? `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
+          (agent && ctxScopes.has("agent")
+            ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})`
+            : "") +
+          `]\n`
+        : "") +
+      `${String(row.goal)}` +
+      (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "")
+    );
+  }
+
+  /** Phase C — read-only delegated-goal context for planning: re-derives
+   *  the EXACT enriched bound-mission goal openWorkItem will commit and
+   *  its canonical digest. Pure read — never mutates, never admits. */
+  delegatedGoalContext(workItemId: string): {
+    goal: string;
+    /** R1 — the provenance-bound operator request (`work_item.goal`):
+     *  the only text that may mint contract/network/delivery/language
+     *  authority. `goal` is the full envelope for planner context +
+     *  mission commit; the two are never conflated. */
+    operator_goal: string;
+    goal_digest: string;
+    project_id: string;
+    business_id: string;
+    department: string | null;
+    org_agent_id: string | null;
+  } {
+    const row = this.store.get("work_item", workItemId) as Row;
+    const business = this.getBusiness(String(row.business_id));
+    const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    const agent = agentId ? (this.store.get("org_agent", agentId) as Row) : null;
+    const goal = this.boundMissionGoal(row, business, agentId, agent);
+    return {
+      goal,
+      operator_goal: String(row.goal),
+      goal_digest: delegatedGoalDigest({
+        work_item_id: workItemId,
+        business_id: String(row.business_id),
+        department: row.department != null ? String(row.department) : null,
+        org_agent_id: agentId,
+        goal,
+      }),
+      project_id: String(business.project_id),
+      business_id: String(row.business_id),
+      department: row.department != null ? String(row.department) : null,
+      org_agent_id: agentId,
+    };
+  }
+
+  /** Phase C — the ONE shared asynchronous delegated-planning seam:
+   *  re-derives the canonical enriched bound-mission goal (read-only)
+   *  and runs it through the SAME async Planner Pool the Mission Control
+   *  preview/submit edge uses — genuine LLM planning + canonicalization +
+   *  durable planner_run/attempt evidence for every delegated open
+   *  (direct API open, manual CEO cycle, autonomous Objective driver).
+   *  Planner unavailability or exhaustion propagates fail-closed —
+   *  never a deterministic template, never a synthesized minimal plan.
+   *  The returned plan is bound to THIS goal by digest; openWorkItem
+   *  re-proves the digest inside its dedup transaction so a goal or
+   *  authority drift between the await and the commit fails closed
+   *  before any intent/binding/mission write. */
+  async prepareDelegatedPlan(
     workItemId: string,
     operatorId: string,
-    admission?: {
-      /** P15.6 R2.C — optional objective-version admission pin: when
-       *  the caller is an objective-driven dispatcher, it observed an
-       *  exact canonical objective version and that authority must
-       *  still be live at the dedup write. Progress/budget/status
-       *  mutations all bump the objective version, so any drift aborts
-       *  the open atomically inside the same transaction — before any
-       *  intent/binding/mission write. */
-      objective_id?: string;
-      expected_objective_version?: number;
+    opts?: {
+      /** AUDIT R1 F5 — absolute epoch bound for the planner run, derived
+       *  by the Objective auto-driver from its claimed lease lifetime
+       *  (minus finalization allowance). Converted to the expandCtx
+       *  duration pin at invocation time so paid planning can never
+       *  outlive the authority that invoked it; absent = the configured
+       *  planner run deadline alone governs. */
+      planningDeadlineEpochMs?: number;
     },
-  ): Row {
-    if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+  ): Promise<DelegatedPlanPreparation> {
+    if (!operatorId) {
+      throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.prepareDelegatedPlan");
+    }
+    const expander = this.deps.planExpander;
+    if (!expander) {
+      // Missing planner dependency — typed fail-closed, ZERO provider
+      // calls, NO fabricated planner_run evidence (mirrors the draft and
+      // preview seams' FAIL_CLOSED_NO_PLANNER contract).
+      throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "work_item.prepareDelegatedPlan");
+    }
+    // AUDIT R1 F2 — the IDENTICAL open-eligibility gate sequence
+    // openWorkItem enforces, run BEFORE the paid planner invocation:
+    // an ineligible/dedup-blocked item fails closed here with the same
+    // typed error openWorkItem would raise — never after burning a
+    // provider request. The dedup transaction still re-proves every
+    // gate at commit time, so a race between this preflight and the
+    // open stays fail-closed.
+    const elig = this.openEligibilityRow(workItemId, operatorId);
+    // AUDIT R2 F3 — hard-stop headroom proof BEFORE the paid planner
+    // call: the SAME policy scan reserveBudget() applies (missions +
+    // live HELD reservations, period-scoped, per scope) but strictly
+    // read-only — no expiry sweep, no reservation write. A policy
+    // already saturated refuses planning spend here; the atomic
+    // reserveBudget() inside openWorkItem remains the final authority
+    // for the race between this preflight and the open.
+    this.assertBudgetHeadroom(
+      String(elig.row.business_id),
+      String(elig.row.department ?? ""),
+      elig.agentId,
+    );
+    const ctx = this.delegatedGoalContext(workItemId);
+    const expanded = await expander(
+      {
+        project_id: ctx.project_id,
+        goal: ctx.goal,
+        // R1 — provenance-bound operator authority travels WITH the
+        // envelope: the pool canonicalizes/authorizes against THIS
+        // text while `goal` (envelope + agent context) stays available
+        // to the model as supporting information.
+        operator_goal: ctx.operator_goal,
+        operator_id: operatorId,
+        metadata: {
+          business_id: ctx.business_id,
+          work_item_id: workItemId,
+          org_agent_id: ctx.org_agent_id,
+          department: ctx.department,
+          source: "business_layer",
+          delegated_goal_digest: ctx.goal_digest,
+        },
+      },
+      {
+        work_item_id: workItemId,
+        // AUDIT R1 F5 — a caller-pinned absolute bound becomes the
+        // remaining-duration pin; the expander min()'s it against the
+        // configured run deadline (tighten-only). A lapsed pin yields a
+        // non-positive window → the pool fails PLANNER_DEADLINE before
+        // any provider request.
+        ...(opts?.planningDeadlineEpochMs != null
+          ? {
+              deadlineMs: Math.max(
+                0, opts.planningDeadlineEpochMs - Date.now()),
+            }
+          : {}),
+      },
+    );
+    const exInput = (expanded as { input?: Record<string, unknown> }).input ??
+      (expanded as unknown as Record<string, unknown>);
+    const exMd = ((exInput as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>;
+    const tasks = exMd.llm_plan as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(tasks) || !tasks.length) {
+      // The pool returned without an authorized canonical plan — a
+      // planner-less/stub expander in effect. Never let a missing plan
+      // ride silently into the open seam as fake authority.
+      throw new PolicyError("FAIL_CLOSED_DELEGATED_PLAN_ABSENT", workItemId);
+    }
+    const planner = (expanded as { planner?: Record<string, unknown> | null }).planner ?? null;
+    const winner = (planner?.winner ?? null) as Record<string, unknown> | null;
+    return {
+      goal_digest: ctx.goal_digest,
+      tasks,
+      plan_source: String(exMd.plan_source ?? "DELEGATED_PLAN"),
+      plan_model: exMd.plan_model != null ? String(exMd.plan_model) : null,
+      planner_run_id: planner?.planner_run_id != null ? String(planner.planner_run_id) : null,
+      winner_attempt_no: winner?.attempt_no != null ? Number(winner.attempt_no) : null,
+    };
+  }
+
+  /** AUDIT R1 F2 — the FULL pre-intent open-eligibility gate sequence,
+   *  shared verbatim by openWorkItem (before its dedup write) and
+   *  prepareDelegatedPlan (before any paid planner invocation). One
+   *  implementation, zero drift: an item that cannot open can never
+   *  burn a provider request, and the dedup transaction re-proves the
+   *  same gates at commit time. */
+  private openEligibilityRow(
+    workItemId: string,
+    operatorId: string,
+  ): { row: Row; from: string; business: Row; agentId: string | null; agent: Row | null; priorMissionIds: string[] } {
     // P15.2 R2.B — the deterministic Objective-root namespace (OWI_*)
     // is permanently non-executable: an Objective root is a P14 graph
     // container only, never an openable work item. Guard sits at the
@@ -1638,6 +1869,46 @@ export class BusinessLayer {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
       }
     }
+    return { row, from, business, agentId, agent, priorMissionIds };
+  }
+
+  /**
+   * The single seam where business work enters the governed engine:
+   * budget check (fail-closed) → enriched goal → canonical startMission →
+   * work_item IN_PROGRESS with mission_id recorded.
+   */
+  openWorkItem(
+    workItemId: string,
+    operatorId: string,
+    admission?: {
+      /** P15.6 R2.C — optional objective-version admission pin: when
+       *  the caller is an objective-driven dispatcher, it observed an
+       *  exact canonical objective version and that authority must
+       *  still be live at the dedup write. Progress/budget/status
+       *  mutations all bump the objective version, so any drift aborts
+       *  the open atomically inside the same transaction — before any
+       *  intent/binding/mission write. */
+      objective_id?: string;
+      expected_objective_version?: number;
+    },
+    openOpts?: {
+      /** Phase C — a delegated plan prepared through prepareDelegatedPlan
+       *  (the shared async Planner Pool seam). When present, the digest
+       *  binding plan→goal is re-proved against the canonical enriched
+       *  mission goal INSIDE the dedup transaction — before any
+       *  intent/binding/mission write — so a plan authorized for a
+       *  different goal (or stale authority) can never commit. */
+      prepared_plan?: DelegatedPlanPreparation;
+    },
+  ): Row {
+    if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+    // AUDIT R1 F2 — the FULL pre-intent eligibility gate sequence is the
+    // one shared proof (extracted below): openWorkItem runs it before the
+    // dedup write; prepareDelegatedPlan runs the IDENTICAL gates before
+    // any paid planner invocation, so an ineligible or already-opened
+    // item can never burn a provider request.
+    const { row, from, business, agentId, agent, priorMissionIds } =
+      this.openEligibilityRow(workItemId, operatorId);
     // Durable open intent committed BEFORE mission creation: the transition
     // write is the dedup point, and the canonical `work_open_binding`
     // record ties this intent to the mission it will create — the binding
@@ -1645,6 +1916,11 @@ export class BusinessLayer {
     // observability and can never itself constitute authority (V2 §2-3).
     const openId = newId("OPI");
     const missionId = newId("MSN");
+    // Phase C — the canonical enriched mission goal is computed ONCE here
+    // (post-gates, pre-intent) so the prepared-plan digest can be re-proven
+    // against it inside the dedup transaction below and the committed
+    // mission replays the identical bytes.
+    const goal = this.boundMissionGoal(row, business, agentId, agent);
     row.status = "IN_PROGRESS";
     row.pending_open_id = openId;
     row.pending_open_at = utcnow();
@@ -1691,6 +1967,27 @@ export class BusinessLayer {
           );
         }
       }
+      // Phase C — goal-digest authority BEFORE the new-open mutation
+      // commits: the prepared plan was authorized for the EXACT enriched
+      // bound-mission goal; any drift between the asynchronous planning
+      // await and this dedup write (goal edit, reassignment, business or
+      // contract scope change) aborts atomically — no intent, no
+      // binding, no mission.
+      if (openOpts?.prepared_plan) {
+        const openDigest = delegatedGoalDigest({
+          work_item_id: workItemId,
+          business_id: String(row.business_id),
+          department: row.department != null ? String(row.department) : null,
+          org_agent_id: agentId,
+          goal,
+        });
+        if (openDigest !== openOpts.prepared_plan.goal_digest) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_DELEGATED_PLAN_GOAL_DRIFT",
+            `${workItemId}: prepared plan bound to a different delegated mission goal`,
+          );
+        }
+      }
       this.store.put("work_item", workItemId, row, Number(row.version));
     });
 
@@ -1714,31 +2011,14 @@ export class BusinessLayer {
       } as Row, 0);
       reservationId = this.reserveBudget(String(row.business_id), String(row.department ?? ""), agentId, openId);
 
-      // P12 §15: context injection respects the contract's
-      // allowed_context_scopes — "business" gates the org prefix, "agent"
-      // gates agent identity + outcome notes. Baseline grants all scopes,
-      // so unmodified contracts see identical goals.
-      const ctxScopes = agentId
-        ? new Set(
-            (this.agentContracts.resolve(agentId).contract.policy as AgentContractPolicy)
-              .allowed_context_scopes,
-          )
-        : new Set<string>();
-      const notes = ctxScopes.has("agent")
-        ? (((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
-            .slice(-AGENT_CONTEXT_INJECT)
-            .map((n) => `- ${String(n.note)}`))
-        : [];
-      const goal =
-        (ctxScopes.has("business") || !agentId
-          ? `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
-            (agent && ctxScopes.has("agent")
-              ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})`
-              : "") +
-            `]\n`
-          : "") +
-        `${String(row.goal)}` +
-        (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
+      // Phase C — a prepared delegated plan is pinned onto the mission as
+      // observability metadata: the canonical task list + planner
+      // provenance, verified against THIS commit's goal by the digest
+      // re-proof inside the dedup transaction above. Deterministic task
+      // synthesis for a new bound mission is gone — when a plan was
+      // prepared it travels with the mission; the mission runtime's own
+      // persisted-plan replay / failure evidence remains unchanged.
+      const prepared = openOpts?.prepared_plan ?? null;
 
       // Internal bound-mission seam: the mission identity is DERIVED
       // from the canonical binding (binding_open_id), never accepted as
@@ -1756,6 +2036,17 @@ export class BusinessLayer {
           org_agent_id: agentId,
           department: row.department ?? null,
           source: "business_layer",
+          ...(prepared
+            ? {
+                llm_plan: prepared.tasks,
+                plan_source: prepared.plan_source,
+                ...(prepared.plan_model ? { plan_model: prepared.plan_model } : {}),
+                delegated_goal_digest: prepared.goal_digest,
+                ...(prepared.planner_run_id
+                  ? { planner_run_id: prepared.planner_run_id }
+                  : {}),
+              }
+            : {}),
         },
         operator_id: operatorId,
       });
@@ -3459,6 +3750,68 @@ export class BusinessLayer {
       throw new PolicyError("FAIL_CLOSED_BUDGET_EXCEEDED", result.hardStop.detail);
     }
     return result.rid;
+  }
+
+  /** AUDIT R2 F3 — read-only hard-stop headroom proof for the paid-
+   *  planning preflight. Applies the IDENTICAL scope/period/usage scan
+   *  reserveBudget() enforces, but writes nothing: expired HELD rows
+   *  are excluded by predicate (not by the expiry sweep) and no
+   *  budget_reservation is minted. Only hard-stop saturation is a
+   *  preflight refusal — soft-limit exceedances never blocked an open.
+   *  The BUDGET_EXCEEDED audit event is still emitted so the refusal
+   *  has the same durable evidence the canonical rejection produces. */
+  private assertBudgetHeadroom(
+    businessId: string,
+    department: string,
+    agentId: string | null,
+  ): void {
+    const policies = this.listBudgetPolicies(businessId).filter((p) => p.enabled !== false);
+    if (policies.length === 0) return;
+    const missions = this.store.list("mission");
+    const now = utcnow();
+    const held = this.store.list("budget_reservation").filter(
+      (r) => String(r.status) === "HELD" && String(r.expires_at ?? "") > now,
+    );
+    for (const p of policies) {
+      if (!p.hard_stop) continue;
+      const scopeType = String(p.scope_type);
+      const scopeId = String(p.scope_id);
+      const applies =
+        (scopeType === "business" && scopeId === businessId) ||
+        (scopeType === "department" && scopeId === department) ||
+        (scopeType === "agent" && scopeId === agentId);
+      if (!applies) continue;
+      const since = periodStart(p.period as BudgetPeriod, new Date());
+      const key =
+        scopeType === "agent" ? "org_agent_id" : scopeType === "department" ? "department" : "business_id";
+      const usedMissions = missions.filter((m) => {
+        const md = m.metadata as Record<string, unknown> | undefined;
+        return String(md?.[key] ?? "") === scopeId && String(m.created_at ?? "") >= since;
+      }).length;
+      const usedHeld = held.filter((r) => {
+        const match =
+          scopeType === "business"
+            ? String(r.business_id) === scopeId
+            : scopeType === "department"
+              ? String(r.business_id) === businessId && String(r.department) === scopeId
+              : String(r.agent_id) === scopeId;
+        return match && String(r.created_at ?? "") >= since;
+      }).length;
+      const used = usedMissions + usedHeld;
+      if (used < Number(p.max_missions)) continue;
+      this.store.event({
+        entity_type: "budget_policy", entity_id: String(p.budget_policy_id),
+        event_type: "BUDGET_EXCEEDED", actor: "PAIR_BUSINESS_LAYER",
+        metadata: {
+          scope_type: scopeType, scope_id: scopeId, used,
+          max_missions: p.max_missions, period: p.period,
+        },
+      });
+      throw new PolicyError(
+        "FAIL_CLOSED_BUDGET_EXCEEDED",
+        `${scopeType}:${scopeId} ${used}/${p.max_missions} per ${p.period}`,
+      );
+    }
   }
 
   private consumeBudgetReservation(reservationId: string): void {

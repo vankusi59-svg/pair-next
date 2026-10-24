@@ -494,6 +494,9 @@ describe("P15.8-HF1 E2E", () => {
       conversation: sessions,
       control: s.control,
       store: s.store,
+      // Phase C — same async Planner Pool seam; passthrough keeps the
+      // sync test planner as the preview's plan source.
+      planExpander: async (input) => ({ input }),
     });
     const session = sessions.createSession({ owner_operator_id: OP });
     const draft = drafts.createDraft({

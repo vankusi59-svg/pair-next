@@ -1810,7 +1810,21 @@ describe("Schedules — recurring mission triggers", () => {
 function makeBizCtx(name: string) {
   const ctx = makeCtx(name);
   const schedules = new MissionScheduleService(ctx.service);
-  const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+  // Phase C — HTTP /open plans through the shared async Planner Pool
+  // seam; tests stub it with a canonical llm_plan.
+  const biz = new BusinessLayer({
+    store: ctx.store, control: ctx.control, schedules,
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata ?? {}),
+          llm_plan: [{ task_id: "T1", title: "t", instructions: "t", required_capabilities: [] }],
+          plan_source: "LLM",
+        },
+      },
+    }),
+  });
   return { ctx, biz, schedules };
 }
 
@@ -1897,7 +1911,19 @@ describe("business layer (one-person-business skeleton)", () => {
   it("server exposes business routes end-to-end", async () => {
     const ctx = makeCtx("b7");
     const schedules = new MissionScheduleService(ctx.service);
-    const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+    const biz = new BusinessLayer({
+      store: ctx.store, control: ctx.control, schedules,
+      planExpander: async (input) => ({
+        input: {
+          ...input,
+          metadata: {
+            ...(input.metadata ?? {}),
+            llm_plan: [{ task_id: "T1", title: "t", instructions: "t", required_capabilities: [] }],
+            plan_source: "LLM",
+          },
+        },
+      }),
+    });
     const server = createMissionControlServer({ control: ctx.control, business: biz });
     await new Promise<void>((r) => server.listen(0, r));
     const port = (server.address() as { port: number }).port;

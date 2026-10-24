@@ -55,7 +55,10 @@ test("business switcher stores manual business_id, never enumerates", async ({ p
   expect(calls.filter((u) => u.includes("/api/businesses"))).toEqual([]);
 });
 
-test("/ still serves the legacy dashboard unchanged", async ({ page }) => {
+test("/ still serves the legacy dashboard unchanged under the rollback flag", async ({ page }) => {
+  // P15.9-A2: absent preference on the production build redirects to /app;
+  // the legacy tree is exercised through the explicit per-browser override.
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Task Entry" })).toBeVisible();
@@ -177,6 +180,8 @@ function contrast(fg: string, bg: string): number {
 }
 
 test("legacy theme tokens are not overridden by the new shell", async ({ page }) => {
+  // P15.9-A2: assert the legacy stylesheet under the explicit rollback flag.
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/");
   const accent = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim());
   expect(accent).toBe("#3b82f6"); // legacy app.css value, not the appshell token

@@ -21,7 +21,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDatabase } from "../dist/state/database.js";
 import {
-  llmPlan,
   ApprovalQueue,
   CodexCliExecutorAdapter,
   DevinExecutorAdapter,
@@ -69,8 +68,9 @@ import {
   PolicyError,
   modelProbeTimeoutMs,
   modelDiscoveryTimeoutMs,
-  llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
+  plannerRunDeadlineMs,
+  replanGenerationDeadlineMs,
   ceoCliTimeoutMs,
   codexPlannerPlan,
   assertCodexPlannerCandidateEligibleWithRefresh,
@@ -83,9 +83,11 @@ import {
   devinBlockedGraceMs,
   resolveMcToken,
   runPlannerFailover,
+  plannerCandidateRequestBound,
   dedupePlannerCandidates,
   reconcileModelRoleAssignments,
   resolveConfiguredModelRoleRoute,
+  composeConfiguredRoleRoutes,
   assertCanonicalModelRoleStateDisjoint,
   assertPlannerModelRole,
   assertPlannerCandidateEligible,
@@ -96,7 +98,15 @@ import {
   markPlannerAttemptReask,
   finishPlannerRun,
   validatePlanProposal,
+  operatorGoalOf,
+  missionOperatorGoalOf,
+  ReplanGenerationService,
+  makeReplanGenerationDriver,
+  replanWorkItemId,
   makeServePlanner,
+  plannerExecutorCapSets,
+  assertCodexOnlyPlannerRoute,
+  assertCodexCliPlannerTransport,
   SERVE_LLM_WORK_CAPS,
   ConversationSessionService,
   ConversationReasoningService,
@@ -105,6 +115,9 @@ import {
   MissionDraftService,
   TelegramConversationService,
   ObjectiveAutoPolicyService,
+  ObjectiveCapabilityGapService,
+  ScopedMemoryReader,
+  AUTONOMOUS_EXECUTOR_IDS,
   createObjectiveAutoReconcile,
   createObjectiveAutoDriver,
   createDefaultObjectiveOperatingService,
@@ -115,7 +128,12 @@ import {
   assertTelegramDeliveryTiming,
   modelRoleOf,
   MODEL_ROLE,
+  digest,
   utcnow,
+  resolveMcAdminToken,
+  operationalStatusMaxChars,
+  OperationalQueryService,
+  ConversationReadGrantService,
 } from "../dist/pair/index.js";
 
 // Phase E §15 — declared credential VALUES are registered with the
@@ -143,8 +161,10 @@ fs.mkdirSync(journalRoot, { recursive: true });
 // bounded; malformed input FAILS CLOSED here, before any side effects.
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgDiscoveryTimeoutMs = modelDiscoveryTimeoutMs(); // PAIR_MODEL_DISCOVERY_TIMEOUT_MS (ms, 500..120000)
-const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
+// PAIR_LLM_PLANNER_TIMEOUT_MS retired — no HTTP planner transport exists (PR #120).
 const cfgCodexPlannerTimeoutMs = codexPlannerTimeoutMs(); // PAIR_CODEX_PLANNER_TIMEOUT_MS (ms, 5000..900000)
+const cfgPlannerRunDeadlineMs = plannerRunDeadlineMs(); // PAIR_PLANNER_RUN_DEADLINE_MS (ms, 5000..3600000)
+const cfgReplanGenerationDeadlineMs = replanGenerationDeadlineMs(); // PAIR_REPLAN_GENERATION_DEADLINE_MS (ms, 5000..3600000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
@@ -164,6 +184,22 @@ console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTa
 const mcToken = resolveMcToken();
 console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 
+// Phase 1 — the SEPARATE operational-status admin credential. ENV-only:
+// never generated, never persisted — unset means NO admin principal can
+// exist (status queries stay scoped). It must be a distinct secret from
+// the MC token; an equal value disables the admin lane rather than
+// silently widening every MC-token holder into an admin.
+const mcAdminToken = resolveMcAdminToken({ env: process.env });
+const adminTokenEffective =
+  mcAdminToken && mcAdminToken !== mcToken.token ? mcAdminToken : undefined;
+if (mcAdminToken && !adminTokenEffective) {
+  console.error(
+    "PAIR_MC_ADMIN_TOKEN equals PAIR_MC_TOKEN — the MC token can never " +
+    "be an admin credential; operational-status admin lane DISABLED",
+  );
+}
+console.log(`MC_ADMIN_TOKEN: ${adminTokenEffective ? "configured (env)" : "unset — admin status queries disabled"}`);
+
 // Phase A — canonical model-role pools. PAIR_PLANNER_MODEL_ROUTE names the
 // planner's model route; PAIR_DSH_* routes name DSH_EXECUTION candidates.
 // The two pools must be canonically disjoint — enforced below via
@@ -179,20 +215,29 @@ console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 // _EXTRA_ROUTES keep full operator override — an explicit env setting
 // always wins over these defaults; an empty fallback disables it.
 const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "codex-cli:gpt-6.1-sol").trim();
-const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
-const PLANNER_ROUTES = [PLANNER_PRIMARY_ROUTE];
-if (PLANNER_FALLBACK_ROUTE) PLANNER_ROUTES.push(PLANNER_FALLBACK_ROUTE);
-for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",")) {
-  const r = extra.trim();
-  if (r && !PLANNER_ROUTES.includes(r)) PLANNER_ROUTES.push(r);
-}
+// PR #120 — subscription-only LLM policy: the ONLY permitted Planner
+// transport is the authenticated Codex CLI / ChatGPT subscription
+// session. The default Gemini HTTP fallback is REMOVED (empty = no
+// fallback, same convention as DSH); every configured route — primary,
+// fallback, extras — must be `codex-cli:<model>` or boot fails closed
+// BEFORE any provider discovery, HTTP probe, or model invocation.
+const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "").trim();
+const PLANNER_ROUTES = composeConfiguredRoleRoutes({
+  primary: PLANNER_PRIMARY_ROUTE,
+  fallback: PLANNER_FALLBACK_ROUTE,
+  extras: process.env.PAIR_PLANNER_EXTRA_ROUTES,
+}).map(assertCodexOnlyPlannerRoute);
 const DSH_PRIMARY_ROUTE = String(process.env.PAIR_DSH_MODEL_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash").trim();
 const DSH_FALLBACK_ROUTE = String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b").trim();
-const DSH_ROUTES = [DSH_PRIMARY_ROUTE, DSH_FALLBACK_ROUTE];
-for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "").split(",")) {
-  const r = extra.trim();
-  if (r && !DSH_ROUTES.includes(r)) DSH_ROUTES.push(r);
-}
+// P0-F2 — canonical composition: an explicit empty/whitespace fallback is
+// DISABLED (never an "" candidate reaching strict resolution); configured
+// routes dedupe without reordering; malformed non-empty routes still fail
+// closed at resolveConfiguredModelRoleRoute below.
+const DSH_ROUTES = composeConfiguredRoleRoutes({
+  primary: DSH_PRIMARY_ROUTE,
+  fallback: DSH_FALLBACK_ROUTE,
+  extras: process.env.PAIR_DSH_EXTRA_ROUTES,
+});
 // Cheap static pre-check: identical route spelling across pools fails fast;
 // the canonical model_entry_id overlap check runs after discovery.
 for (const pr of PLANNER_ROUTES) {
@@ -242,7 +287,11 @@ if (process.env.PAIR_DSH_HOME) {
   });
   governed.set(DSH_EXECUTOR_ID, dshAdapter);
 }
-if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
+// AUDIT R1 F1 — the canonical store seam lets the governed Codex adapter
+// resolve driver-attributed provenance (mission → bound_open →
+// work_open_binding.created_by): autonomous dispatches run
+// subscription-only, with metered API keys stripped from the child env.
+if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot, store }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
 // Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the
@@ -291,6 +340,11 @@ const registry = new ExecutorRegistry(service);
 const experience = new ExperienceService(service);
 const experienceExtractor = new ExperienceExtractor(service, experience);
 const experienceVerifier = new ExperienceVerifier(service, experience);
+// P17 — scoped Layer-A memory recall for the Brain context: the
+// automaton DB carries the V13 tenancy columns; rows without a
+// business/objective binding stay unscoped and are never admitted
+// to an objective's advisory surface.
+const scopedMemoryReader = new ScopedMemoryReader(automaton.raw);
 const routingAdvisor = new VerifiedExperienceRoutingAdvisor(service, experience);
 const PAIR_ENV = {
   os: process.platform,
@@ -308,46 +362,48 @@ const selfmod = new SelfImprovementController(service, {
   selfmodRoot: path.join(dir, "selfmod"),
 });
 // Planner (P-UI-6): when the mission carries metadata.llm_plan — a
-// sanitized task list produced by llmPlan() at the API edge — the planner
-// returns it verbatim (re-validated by validatePlanProposal downstream,
-// and pinned by the confirm digest). Without it, the template planner
-// below runs: T1 PAIR_NATIVE records the goal, T2 DSH/Gemini analysis,
-// optional T3 Codex when the goal mentions code/script/python.
+// sanitized task list produced by the Planner Pool at the API edge — the
+// planner returns it verbatim (re-validated by validatePlanProposal
+// downstream, and pinned by the confirm digest). Phase C removed the
+// deterministic template fallback: without llm_plan evidence there is NO
+// valid plan source — the mission fails closed as plan_less_legacy and
+// never mints generated tasks.
 // LLM plan capability allowlist lives in serve-planner.ts — one source.
 // PRV2-A R1.A — the model-visible planner vocabulary is WORK-only:
 // AUTOMATON_TASK_EXECUTION is PAIR-reserved (injected T1) and never
 // shown to the planner. SERVE_LLM_PLANNER_CAPS stays the final canonical
 // vocabulary for validatePlanProposal.
 const LLM_PLANNER_CAPS = SERVE_LLM_WORK_CAPS;
-// Capability sets of the currently-qualified executors — sanitizePlan drops
-// any task whose required_capabilities no single executor can serve.
-const executorCapSets = () =>
-  [...adapters.values()]
-    .map((a) => {
-      try {
-        const c = a.capabilities();
-        if (c.qualified === false) return [];
-        return c.capability_ids ?? c.capabilities ?? [];
-      } catch {
-        return [];
-      }
-    })
-    .filter((s) => s.length);
+// Capability sets of the currently ENABLED, qualified executors —
+// sanitizePlan drops any task whose required_capabilities no single
+// eligible executor can serve. PR#119-audit F1: derived from canonical
+// state at call time (src/pair/serve-planner.ts plannerExecutorCapSets)
+// so an operator ON/OFF toggle takes effect for planning without a
+// restart; a DISABLED executor can never make a task canonicalizable.
+const executorCapSets = plannerExecutorCapSets(service, adapters);
 // THE ONE canonical LLM-plan preparation seam + the production runtime
 // planner now live in src/pair/serve-planner.ts (compiled to dist) so the
 // EXACT production composition is importable by tests — a test drives the
 // same function object this wiring instantiates.
-// F3 R1.1 — replan provider: the LLM planner (llmPlan) is async and
-// cannot run inside the synchronous RuntimePlanner contract; no governed
-// synchronous replan provider exists in this composition, so
-// replanProvider is unset and production REPLAN explicitly reports
-// FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE — recovery falls through to a
-// fresh bounded RecoveryController decision instead of replaying the
-// stored plan as a fake candidate.
+// F3 R1.1 — replan provider: the LLM planner (codexPlannerPlan) is async and
+// cannot run inside the synchronous RuntimePlanner contract. The
+// governed bridge stages async Planner Pool candidates in a durable
+// `replan_generation` row (src/pair/replan-generation.ts) — wired as the
+// replanProvider ONLY under PAIR_ASYNC_REPLAN_PROVIDER=1 (default OFF).
+// With the flag unset no generation service exists, production REPLAN
+// explicitly reports FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE, and
+// recovery falls through to a fresh bounded RecoveryController decision
+// instead of replaying the stored plan as a fake candidate.
+const replanGenerationEnabled = process.env.PAIR_ASYNC_REPLAN_PROVIDER === "1";
+const replanGeneration = replanGenerationEnabled
+  ? new ReplanGenerationService(store, { deadlineMs: cfgReplanGenerationDeadlineMs })
+  : null;
+console.log(`ASYNC_REPLAN_PROVIDER: ${replanGeneration ? `ENABLED (deadline=${cfgReplanGenerationDeadlineMs}ms)` : "disabled"}`);
 const { planner, canonicalizeLlmTasks } = makeServePlanner({
-  hasExecutor: (id) => governed.has(id),
   executorCapSets,
-  replanProvider: null,
+  replanProvider: replanGeneration
+    ? (input) => replanGeneration.requestCandidate(input)
+    : null,
 });
 const runtime = new MissionRuntime({
   service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
@@ -420,7 +476,18 @@ const control = new MissionControl({
   // (PAIR_TG_DELIVERY_STALE_AFTER_MS, bounded, validated at startup).
   telegramDeliveryStaleAfterMs: cfgTgStaleAfterMs,
 });
-const business = new BusinessLayer({ store, control, schedules });
+// Phase C — the delegated-open planner seam: EVERY newly opened bound
+// mission plans through the SAME Planner Pool (codexPlannerPlan → planner_run /
+// planner_attempt durable evidence). The planExpander const is
+// declared below at planner-composition time; BusinessLayer invokes it
+// through a late-bound closure so construction order never creates a
+// second planning path.
+const business = new BusinessLayer({
+  store,
+  control,
+  schedules,
+  planExpander: (input, ctx) => planExpander(input, ctx),
+});
 const workforce = new WorkforceService({ store, business });
 
 // P15.10-B — durable Objective wake/reconcile intake only. The scheduler
@@ -438,7 +505,10 @@ const objectiveAutoReconcile = createObjectiveAutoReconcile({
   policy: objectiveAutoPolicy,
   intervalMs: objectiveReconcileMs,
 });
-objectiveAutoReconcile.runtime.start();
+// Phase C — the reconcile sweep is started AFTER the Planner Pool
+// composition below exists: delegated planning is planner-gated, and a
+// reconcile that woke before planExpander was initialized would have no
+// governed path to mint missions.
 
 // P15.10-C — governed autonomous Objective driver. Explicit deployment
 // opt-in ONLY (PAIR_OBJECTIVE_AUTO_DRIVER=1): the driver consumes the
@@ -466,6 +536,12 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
       workstreams: new ObjectiveWorkstreamService({
         store, business, workforce, objectives: business.objectives,
       }),
+      // P17 — tenancy-scoped advisory surfaces: verified experience
+      // (canonical, advisory tier) + scoped Layer-A memory recall.
+      // The BrainContext inside the CEO cycle consumes only rows bound
+      // to the objective's business/objective scope.
+      experience,
+      scopedMemory: scopedMemoryReader,
     });
     return objectiveCeoOps;
   };
@@ -476,13 +552,35 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
   // the value is env-validated here so a bad PAIR_CEO_CLI_TIMEOUT_MS
   // fails boot closed rather than binding an unvalidated bound.
   const objectiveCeoTimeoutMs = ceoCliTimeoutMs();
+  // PR #121 — the autonomous cost-binding projection is the canonical
+  // AUTONOMOUS_EXECUTOR_IDS set (CODEX + PAIR_NATIVE), not the raw
+  // registered adapter list: [...governed.keys()] wrongly included
+  // DEVIN even when DISABLED and never included PAIR_NATIVE. Eligibility
+  // is still re-proven live against canonical executor/route/binding
+  // rows inside the driver on every admission — a dashboard toggle can
+  // never silently authorize DEVIN/DSH for autonomous work (the
+  // assertAndReserve autonomous gate denies their reservations
+  // outright), and DECLARE the codex-cli billing identity once: the
+  // ChatGPT subscription session, SUBSCRIPTION mode. Never overwrite
+  // an existing declaration — a contradictory METERED/UNKNOWN profile
+  // stays visible to the envelope and fails closed.
+  {
+    const codexProfileId =
+      `CPRO_executor_${digest(`executor:${CODEX_EXECUTOR_ID}`).slice(0, 20)}`;
+    if (!store.tryGet("cost_profile", codexProfileId)) {
+      service.cost.upsertCostProfile({
+        ref_type: "executor", ref_id: CODEX_EXECUTOR_ID,
+        billing_mode: "SUBSCRIPTION",
+      }, "objective-auto-driver-boot");
+    }
+  }
   objectiveAutoDriver = createObjectiveAutoDriver({
     store,
     objectives: business.objectives,
     policy: objectiveAutoPolicy,
     scheduler: objectiveAutoReconcile.scheduler,
     runPass: (input) => objectivePassRunner(input),
-    executors: [...governed.keys()],
+    executors: [...AUTONOMOUS_EXECUTOR_IDS],
     billingFor: (executorId, routeId) => service.cost.billingFor(executorId, routeId),
     costHaltActive: () =>
       process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE),
@@ -495,10 +593,18 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
     // recovery; a restart never re-invokes an invocation already made.
     reconcileStaleAttempts: (objectiveId) =>
       resolveObjectiveCeoOps().ceoCycle.reconcileStaleAttempts(objectiveId),
+    // P16-E — capability-gap advisory: every durable DRIVER_* denial
+    // projects into a canonical, owner-visible objective_capability_gap
+    // row; a settled pass closes it. Observability-only — never masks
+    // the denial/settle it annotates.
+    capabilityGaps: new ObjectiveCapabilityGapService(store),
+    onGapFault: (e) =>
+      console.error("capability-gap advisory:", String(e).slice(0, 200)),
     onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
   });
-  objectiveAutoDriver.runtime.start();
-  console.log(`OBJECTIVE AUTO DRIVER: ENABLED (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
+  // Phase C — deferred: the driver only mints missions through the
+  // delegated planner seam; it starts AFTER the Planner Pool exists.
+  console.log(`OBJECTIVE AUTO DRIVER: ENABLED pending planner init (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
 }
 
 // P15.8-D — conversation layer composition. Session/draft services are
@@ -507,11 +613,29 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
 // entry cannot be seeded/resolved at boot, ONLY the turn endpoint is
 // unavailable — every other Mission Control surface keeps serving.
 const conversationSessions = new ConversationSessionService(store);
+// P16-D — canonical verified read grants for the operational-status
+// surface. Pure canonical service (no model dependency) — always wired:
+// grant mint/control/status keep working even when the turn path is
+// unavailable; OperationalQueryService consumes scopeForPrincipal to
+// verify granted operator/telegram principals.
+const conversationReadGrants = new ConversationReadGrantService({ store });
 const missionDrafts = new MissionDraftService({
   conversation: conversationSessions, control, store,
+  // Phase C — draft confirmation plans through the SAME Planner Pool
+  // (late-bound: the composition below exists before any request runs).
+  planExpander: (input, ctx) => planExpander(input, ctx),
 });
 let conversationReasoning = null;
 try {
+  // Phase 1 — the read-only operational query authority. Pure read
+  // composition over canonical rows + Mission Control projections; it
+  // holds no mutation surface at all.
+  const operationalQuery = new OperationalQueryService({
+    store,
+    control,
+    status_max_chars: operationalStatusMaxChars(),
+    readGrants: conversationReadGrants,
+  });
   // TEST-ONLY seam: PAIR_CONVERSATION_STUB_REPLY replaces the codex-cli
   // invoker with a deterministic echo so Playwright/CI never calls a
   // paid/real model. Never set it in production.
@@ -531,6 +655,13 @@ try {
     store,
     invoker: convInvoker,
     model_entry_id: ensureConversationModel(store),
+    // Phase 1 — grounded operational status: the read-only evidence
+    // seam behind Chat. Authorization keys on the verified principal
+    // minted at the request boundary (admin token ⇒ global scope;
+    // MC-token operators ⇒ canonically-proven scope only; telegram ⇒
+    // scoped). The service composes canonical projections only — it
+    // can never mint missions/drafts or mutate state.
+    observeOperatorContext: (ctx) => operationalQuery.statusForConversation(ctx),
   });
 } catch (e) {
   console.error(
@@ -561,7 +692,12 @@ registry.register({
   executor_type: "AUTOMATON_WORKER",
   capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
   health_state: "READY",
-  status: "ENABLED",
+  // Executor ON/OFF — a persisted status (whatever it says) is operator
+  // intent and survives every restart; only the audited toggle seam
+  // flips it. Registration owns identity/capability/health only.
+  status:
+    String(store.tryGet("executor", PAIR_NATIVE_EXECUTOR_ID)?.status ?? "") ||
+    "ENABLED",
   metadata: {
     qualification_state: "QUALIFIED", max_concurrency: 2,
     permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
@@ -574,6 +710,10 @@ for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTIO
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
     priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60, DEVIN: 80 },
+    // Product defaults: remote/harness executors start OFF (operator
+    // opt-in via Dashboard → Settings → Executor Management); a
+    // persisted operator status always wins over this seeding default.
+    default_disabled: [DEVIN_EXECUTOR_ID, DSH_EXECUTOR_ID],
   });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
@@ -778,17 +918,14 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       await qualifyCodexPlannerRoute(r);
       continue;
     }
-    const q = await qualifyRoute(r, false);
-    if (q) {
-      plannerCandidates.push({
-        model_entry_id: r.model_entry_id,
-        ref: r.ref,
-        provider: r.pid,
-        model: r.mid,
-        endpoint: endpointOf(q.prov),
-        credentialEnv: String(q.prov.credential_reference_name ?? ""),
-      });
-    }
+    // PR #120 — subscription-only policy: the route-compose gate makes
+    // a non-codex planner ref unreachable; refuse it here rather than
+    // spending a single HTTP qualification probe (defense in depth —
+    // an HTTP planner candidate can never exist in production).
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED",
+      `planner candidate ${r.ref} resolves to provider ${r.pid} — only codex-cli is permitted`,
+    );
   }
 
   if (governed.has(DSH_EXECUTOR_ID)) {
@@ -826,6 +963,13 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   }
 }
 sup.resume();
+// Phase C — autonomous Objective drivers (reconcile sweep + auto-driver)
+// start only AFTER the Planner Pool composition below is declared. Their
+// every delegated-open path is planner-gated through planExpander; a
+// driver that ran ahead of it could claim durable wake generations with
+// no governed plan path, so the starts are bound to boot order here.
+objectiveAutoReconcile.runtime.start();
+objectiveAutoDriver?.runtime.start();
 
 // Phase B plan proposer: runs the canonical Planner failover chain at the
 // API edge — deterministic order, one whole canonically-valid plan wins.
@@ -836,20 +980,172 @@ sup.resume();
 // FAIL_CLOSED_PLANNER_NO_ELIGIBLE — never a silent template/T1 fallback.
 const knownCapabilityIds = () =>
   new Set(store.list("capability").map((c) => String(c.capability_id)));
-const planExpander = async (input) => {
-  // TEST-ONLY seam: PAIR_MC_TEMPLATE_PLANNER=1 skips the LLM planner
-  // edge entirely — the request falls back to the deterministic template
-  // planner inside the SAME canonical preview/confirm path (digest
-  // binding, gates, evidence unchanged). For e2e/CI where no qualified
-  // paid/CLI provider exists. Never set it in production.
-  if (process.env.PAIR_MC_TEMPLATE_PLANNER === "1") {
-    return { input };
-  }
+// Phase C / governed async replan — the ONE Planner Pool invocation
+// seam, shared verbatim by the initial-plan expander edge AND the
+// governed async replan-generation driver: identical failover chain,
+// per-attempt canonical eligibility re-proof, canonicalize +
+// validatePlanProposal winner-check, transport branch (codex-cli
+// codexPlannerPlan only — no HTTP planner invocation exists), latency
+// budgets, durable attempt evidence
+// and the absolute run deadline. `replanContext` is present only on a
+// REPLAN generation and propagates into the canonical
+// prompt builder; `externalInputArtifacts` binds cross-mission consume
+// edges at canonicalization for replan candidates (undefined for
+// initial planning — identical prior behavior).
+const invokePlannerPool = ({
+  goal,
+  authorityGoal,
+  candidates,
+  plannerRunId,
+  projectId,
+  deadlineAt,
+  replanContext,
+  externalInputArtifacts,
+}) =>
+  runPlannerFailover({
+    candidates,
+    // §9 — full canonical eligibility re-proved before EVERY invocation
+    // (role still held, model usable, provider still eligible, never a
+    // DSH_EXECUTION model/alias borrowed into planning).
+    // CPL-1 R1 — codex-cli candidates run the SAME canonical eligibility
+    // as HTTP candidates plus the codex-first rule: an availability
+    // rejection earns ONE bounded canonical refresh (re-probe +
+    // requalify through the canonical evidence seams, cfgProbeTimeoutMs
+    // authoritative) then a full re-proof — PASS keeps codex #1,
+    // still-fail settles the typed attempt and failover continues.
+    // Authority violations throw before any refresh (never retried).
+    // AUDIT R1 F4 — `providerCounter` is the pool-owned per-attempt
+    // counter: codex refresh probes count as real provider requests,
+    // and both transports increment it at their invocation seam, so a
+    // STARTED attempt row never masquerades as a made provider call.
+    assertEligible: (c, providerCounter, runCtx) =>
+      c.transport === "codex_cli"
+        ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
+            refresh: () =>
+              refreshCodexPlannerQualification(store, {
+                provider_id: c.provider,
+                model_entry_id: c.model_entry_id,
+                model: c.model,
+                scratchDir: codexPlannerScratch,
+                timeoutMs: cfgProbeTimeoutMs,
+                // AUDIT R2 F2 — the refresh's probes consume the SAME
+                // run deadline as the plan invocations: no probe may
+                // START after it and each probe's timeout is min()'d
+                // to the remaining window.
+                deadlineMs: runCtx?.deadlineMs ?? undefined,
+                actor: "PAIR_PLANNER",
+                providerCounter,
+              }),
+          })
+        : assertPlannerCandidateEligible(store, c.model_entry_id),
+    // §6/§7 — ONE canonical task-preparation seam: sanitize + native
+    // contract enrichment + the same validatePlanProposal the preview
+    // pins. A non-empty raw plan failing canonical validation is
+    // FAILED/PLAN_INVALID and the next candidate is tried.
+    canonicalize: (tasks, _c, evidence) => {
+      // HOTFIX 1 R1 — true raw emission evidence captured inside the
+      // planner transport BEFORE its own sanitize pass; threaded from
+      // THIS invocation's planFn result (INITIAL/REASK/candidate
+      // isolated by runPlannerFailover).
+      const canon = canonicalizeLlmTasks(tasks, goal, {
+        provenance: "fresh",
+        authorityGoal,
+        raw_delivery_emission_count:
+          evidence?.raw_delivery_emission_count,
+        raw_delivery_emission_state:
+          evidence?.raw_delivery_emission_state,
+        external_input_artifacts: externalInputArtifacts,
+      });
+      validatePlanProposal({ tasks: canon }, knownCapabilityIds());
+      return canon;
+    },
+    // CPL-1 — transport branch: codex-cli candidates invoke the
+    // dedicated CodexPlannerProvider spawn transport. PR #120 —
+    // subscription-only: there is no HTTP planner branch; a non-codex
+    // candidate is an authority violation refused BEFORE any HTTP
+    // model invocation can be constructed (the compose-time gate +
+    // the candidate-pool gate already make this unreachable).
+    planFn: (c, invocation) => {
+      // Subscription-only — the invocation seam itself re-proves the
+      // transport before a model call can be constructed; a non-codex
+      // candidate throws an authority violation (never an HTTP request).
+      assertCodexCliPlannerTransport(c);
+      return codexPlannerPlan(goal, {
+        model: c.model,
+        authorityGoal,
+        // P-REASK R3 — the re-ask runs inside the remaining
+        // candidate budget, never a second full timeout.
+        timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
+        scratchDir: codexPlannerScratch,
+        allowedCapabilities: LLM_PLANNER_CAPS,
+        capabilitySets: executorCapSets(),
+        // EXTERNAL_INPUT_AWARENESS — the eligible sibling-artifact set
+        // the canonicalizer binds against reaches the canonical prompt
+        // verbatim (initial planning previously rendered none).
+        externalInputArtifacts,
+        // Governed async replan — the structured failure context
+        // minted on the durable generation row reaches the SAME
+        // canonical prompt builder the HTTP transport uses.
+        replanContext: replanContext ?? undefined,
+        rejectionContext: invocation?.rejectionContext,
+        providerCounter: invocation?.providerCounter,
+      });
+    },
+    // P-REASK R3 — hard per-candidate latency ceiling, measured from
+    // attempt START: Codex = its single-invocation timeout (no HTTP
+    // planner branch exists to bound). The re-ask spends only what
+    // the envelope left over.
+    latencyBudget: () => ({
+      ceilingMs: cfgCodexPlannerTimeoutMs,
+      requestTimeoutMs: cfgCodexPlannerTimeoutMs,
+    }),
+    onAttemptStart: (base) =>
+      persistPlannerAttemptStart(store, {
+        planner_run_id: plannerRunId,
+        project_id: projectId,
+        record: base,
+        actor: "PAIR_PLANNER",
+      }).planner_attempt_id,
+    // P-REASK R4 — durable re-ask initiation on the SAME attempt row
+    // before the second model invocation (never a second row).
+    onAttemptReask: (paid, code) =>
+      markPlannerAttemptReask(store, {
+        planner_attempt_id: String(paid),
+        validation_code: String(code),
+        actor: "PAIR_PLANNER",
+      }),
+    onAttemptEnd: (paid, rec) =>
+      settlePlannerAttempt(store, {
+        planner_attempt_id: String(paid),
+        record: rec,
+        winner: rec.outcome === "SUCCESS",
+        actor: "PAIR_PLANNER",
+      }),
+    onExhausted: () =>
+      finishPlannerRun(store, {
+        planner_run_id: plannerRunId,
+        outcome: "EXHAUSTED",
+        actor: "PAIR_PLANNER",
+      }),
+    // Phase C — one absolute deadline across the whole failover chain.
+    deadlineMs: deadlineAt,
+  });
+const planExpander = async (input, expandCtx) => {
+  // Phase C — the ONE planner for every new-Mission ingress. The
+  // PAIR_MC_TEMPLATE_PLANNER bypass is gone: there is no environment
+  // switch that mints a plan without the Planner Pool.
   const candidates = dedupePlannerCandidates(plannerCandidates);
   if (typeof input.goal !== "string" || !input.goal.trim()) {
     return { input };
   }
   const goal = String(input.goal);
+  // R1 — the provenance-bound operator goal (input.operator_goal, set by
+  // the delegated WorkItem seam) is the ONLY text that may mint contract,
+  // network, delivery, or output-language authority; `goal` — the full
+  // envelope with appended agent context — stays informational in the
+  // prompt. Direct submissions carry no operator_goal → goal itself is
+  // the operator request.
+  const authorityGoal = operatorGoalOf(input);
   // The planner_run row opens before any candidate check so even a
   // zero-eligible request leaves durable canonical evidence (run FAILED
   // / FAIL_CLOSED_PLANNER_NO_ELIGIBLE), never a silent template fallback.
@@ -859,6 +1155,16 @@ const planExpander = async (input) => {
     routes: candidates.map((c) => c.ref),
     actor: "PAIR_PLANNER",
   });
+  // Phase C — the ONE run-level deadline: absolute epoch, spanning every
+  // candidate's eligibility, INITIAL call, transport retries and REASK.
+  // A caller pin (delegated-open ctx.deadlineMs) may TIGHTEN the window;
+  // it can never widen past the env-validated bound.
+  const deadlineAt = Date.now() +
+    Math.min(cfgPlannerRunDeadlineMs, expandCtx?.deadlineMs ?? cfgPlannerRunDeadlineMs);
+  // Phase C — the admission row (when the invocation carries objective
+  // lineage) settles from canonical run evidence in BOTH the winner and
+  // the failure paths; hoisted so the catch can see it.
+  let admission = null;
   try {
     if (PLANNER_ROUTES.length && !candidates.length) {
       throw new IntegrityError(
@@ -866,114 +1172,54 @@ const planExpander = async (input) => {
         JSON.stringify({ configured_routes: PLANNER_ROUTES }),
       );
     }
-    const res = await runPlannerFailover({
+    // EXTERNAL_INPUT_AWARENESS — the delegated-open edge carries the
+    // consumer work_item_id in expandCtx; resolve the SAME canonical
+    // sibling scope the mission will re-prove at commit so the model is
+    // shown the real eligible artifacts and the pool canonicalizer can
+    // stamp a cross-mission consume it would otherwise reject closed.
+    // Absent ctx (preview/draft/direct submission) → undefined, the
+    // identical prior behavior.
+    const externalInputArtifacts = expandCtx?.work_item_id != null
+      ? service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+          String(expandCtx.work_item_id),
+        )
+      : undefined;
+    // Phase C — planner cost governance: when the invocation carries a
+    // delegated work_item_id, the SAME objective cap that binds governed
+    // dispatch binds this pre-spend boundary. The envelope reserves the
+    // full worst case (Σ per-request bound × request-count bound over
+    // every eligible candidate, INITIAL + REASK) atomically before the
+    // first call; the reservation settles from the canonical run outcome.
+    admission = service.cost.admitPlannerInvocation({
+      planner_run_id: String(run.planner_run_id),
+      work_item_id: expandCtx?.work_item_id ?? null,
+      est_microusd: candidates.reduce((sum, c) => {
+        const bound = service.cost.plannerRequestBoundMicrousd(c);
+        // AUDIT R2 F1 — the monetary envelope must cover EVERY provider
+        // call a candidate can initiate, not just plan transports: for
+        // codex_cli the eligibility re-proof runs TWICE (pre-INITIAL +
+        // pre-REASK) and each may trigger ONE bounded canonical
+        // qualification refresh spawning up to 2 real probes
+        // (validateAccess + probeModel) → 6 worst case; HTTP/LLM
+        // candidates emit ≤2 requests inside INITIAL + 1 REASK → 3.
+        // plannerCandidateRequestBound encodes the structural bound in
+        // lockstep with runPlannerFailover — never re-derive it here.
+        return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
+      }, 0),
+      unbounded_unknown: candidates.some(
+        (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
+      ),
+      candidates: candidates.length,
+      actor: "PAIR_PLANNER",
+    });
+    const res = await invokePlannerPool({
+      goal,
+      authorityGoal,
       candidates,
-      // §9 — full canonical eligibility re-proved before EVERY invocation
-      // (role still held, model usable, provider still eligible, never a
-      // DSH_EXECUTION model/alias borrowed into planning).
-      // CPL-1 R1 — codex-cli candidates run the SAME canonical eligibility
-      // as HTTP candidates plus the codex-first rule: an availability
-      // rejection earns ONE bounded canonical refresh (re-probe +
-      // requalify through the canonical evidence seams, cfgProbeTimeoutMs
-      // authoritative) then a full re-proof — PASS keeps codex #1,
-      // still-fail settles the typed attempt and failover continues.
-      // Authority violations throw before any refresh (never retried).
-      assertEligible: (c) =>
-        c.transport === "codex_cli"
-          ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
-              refresh: () =>
-                refreshCodexPlannerQualification(store, {
-                  provider_id: c.provider,
-                  model_entry_id: c.model_entry_id,
-                  model: c.model,
-                  scratchDir: codexPlannerScratch,
-                  timeoutMs: cfgProbeTimeoutMs,
-                  actor: "PAIR_PLANNER",
-                }),
-            })
-          : assertPlannerCandidateEligible(store, c.model_entry_id),
-      // §6/§7 — ONE canonical task-preparation seam: sanitize + native
-      // contract enrichment + the same validatePlanProposal the preview
-      // pins. A non-empty raw plan failing canonical validation is
-      // FAILED/PLAN_INVALID and the next candidate is tried.
-      canonicalize: (tasks, _c, evidence) => {
-        // HOTFIX 1 R1 — true raw emission evidence captured inside the
-        // planner transport BEFORE its own sanitize pass; threaded from
-        // THIS invocation's planFn result (INITIAL/REASK/candidate
-        // isolated by runPlannerFailover).
-        const canon = canonicalizeLlmTasks(tasks, goal, {
-          provenance: "fresh",
-          raw_delivery_emission_count:
-            evidence?.raw_delivery_emission_count,
-          raw_delivery_emission_state:
-            evidence?.raw_delivery_emission_state,
-        });
-        validatePlanProposal({ tasks: canon }, knownCapabilityIds());
-        return canon;
-      },
-      // CPL-1 — transport branch: codex-cli candidates invoke the
-      // dedicated CodexPlannerProvider spawn transport (planner-side
-      // only — no governed dispatch); every other route keeps the
-      // OpenAI-compatible llmPlan call. Both return the same
-      // {tasks, warnings} contract into the SAME canonicalize seam.
-      planFn: (c, invocation) =>
-        c.transport === "codex_cli"
-          ? codexPlannerPlan(goal, {
-              model: c.model,
-              // P-REASK R3 — the re-ask runs inside the remaining
-              // candidate budget, never a second full timeout.
-              timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
-              scratchDir: codexPlannerScratch,
-              allowedCapabilities: LLM_PLANNER_CAPS,
-              capabilitySets: executorCapSets(),
-              rejectionContext: invocation?.rejectionContext,
-            })
-          : llmPlan(goal, {
-              endpoint: `${c.endpoint}/chat/completions`,
-              credentialEnv: c.credentialEnv,
-              model: c.model,
-              timeoutMs: invocation?.timeoutMs ?? cfgPlannerTimeoutMs,
-              allowedCapabilities: LLM_PLANNER_CAPS,
-              capabilitySets: executorCapSets(),
-              rejectionContext: invocation?.rejectionContext,
-              maxProviderRequests: invocation?.maxProviderRequests,
-            }),
-      // P-REASK R3 — hard per-candidate latency ceiling, measured from
-      // attempt START: HTTP = 2×per-request timeout (its INITIAL call may
-      // make up to two provider requests); Codex = its single-invocation
-      // timeout. The re-ask spends only what the envelope left over.
-      latencyBudget: (c) =>
-        c.transport === "codex_cli"
-          ? { ceilingMs: cfgCodexPlannerTimeoutMs, requestTimeoutMs: cfgCodexPlannerTimeoutMs }
-          : { ceilingMs: 2 * cfgPlannerTimeoutMs, requestTimeoutMs: cfgPlannerTimeoutMs },
-      onAttemptStart: (base) =>
-        persistPlannerAttemptStart(store, {
-          planner_run_id: String(run.planner_run_id),
-          project_id: input.project_id != null ? String(input.project_id) : undefined,
-          record: base,
-          actor: "PAIR_PLANNER",
-        }).planner_attempt_id,
-      // P-REASK R4 — durable re-ask initiation on the SAME attempt row
-      // before the second model invocation (never a second row).
-      onAttemptReask: (paid, code) =>
-        markPlannerAttemptReask(store, {
-          planner_attempt_id: String(paid),
-          validation_code: String(code),
-          actor: "PAIR_PLANNER",
-        }),
-      onAttemptEnd: (paid, rec) =>
-        settlePlannerAttempt(store, {
-          planner_attempt_id: String(paid),
-          record: rec,
-          winner: rec.outcome === "SUCCESS",
-          actor: "PAIR_PLANNER",
-        }),
-      onExhausted: () =>
-        finishPlannerRun(store, {
-          planner_run_id: String(run.planner_run_id),
-          outcome: "EXHAUSTED",
-          actor: "PAIR_PLANNER",
-        }),
+      plannerRunId: String(run.planner_run_id),
+      projectId: input.project_id != null ? String(input.project_id) : undefined,
+      deadlineAt,
+      externalInputArtifacts,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
@@ -981,6 +1227,12 @@ const planExpander = async (input) => {
       winner_attempt_no: res.winner.attempt_no,
       actor: "PAIR_PLANNER",
     });
+    // Phase C — a selected winner proves at least one provider request
+    // ran; the planner reservation settles COMMITTED at reserved max
+    // (unaccounted usage stays reserved — never under-counted).
+    if (admission.reservation_id) {
+      service.cost.settlePlannerInvocation(admission.reservation_id, "CALLS_MADE", null);
+    }
     return {
       input: {
         ...input,
@@ -1010,8 +1262,161 @@ const planExpander = async (input) => {
         actor: "PAIR_PLANNER",
       });
     }
+    // Phase C + AUDIT R1 F4 — settle the planner reservation from
+    // canonical run evidence: a terminal run whose attempts provably
+    // invoked providers (provider_requests — transport-reported, never
+    // the STARTED-row count) stays COMMITTED at reserved; a terminal
+    // run with zero proven provider requests provably spent nothing
+    // (RELEASED — e.g. every attempt died at eligibility before any
+    // call). The run row is the authority; rows predating the F4 field
+    // fall back to the conservative attempts>0 semantics.
+    if (admission?.reservation_id) {
+      const settled = store.tryGet("planner_run", String(run.planner_run_id));
+      service.cost.settlePlannerInvocation(
+        admission.reservation_id,
+        Number(settled?.provider_requests ?? settled?.attempts ?? 0) > 0
+          ? "CALLS_MADE"
+          : "NO_CALLS",
+      );
+    }
     throw e;
   }
+};
+// Governed async replan provider (PAIR_ASYNC_REPLAN_PROVIDER=1, default
+// OFF) — the async half of the durable staging bridge. The sync tick
+// mints a `replan_generation` row and returns PENDING; this wrapper runs
+// the SAME Planner Pool composition for the claimed row — identical
+// eligibility re-proof, canonicalize + validatePlanProposal winner
+// check, both transports (replan_context propagated), planner_run/
+// planner_attempt durable evidence — under canonical Objective lineage
+// cost admission, bounded by the row's durable deadline.
+const runReplanPoolGeneration = async (gen) => {
+  const mission = service.getMission(String(gen.mission_id));
+  const goal = String(mission.goal ?? "");
+  // R2-F2 — operator authority resolves through the EXACT seam
+  // MissionRuntime uses (bound_open_id → work_open_binding →
+  // work_item.goal, validated every resolution — never the pin alone).
+  const authorityGoal = missionOperatorGoalOf(store, mission);
+  // HOTFIX-A — replan candidates bind the same canonical cross-mission
+  // input authority runReplan recomputes at commit time.
+  const externalInputs =
+    service.artifactResolver.listEligibleExternalInputSources(mission);
+  const candidates = dedupePlannerCandidates(plannerCandidates);
+  const run = beginPlannerRun(store, {
+    project_id: mission.project_id != null ? String(mission.project_id) : undefined,
+    operator_id: mission.operator_id,
+    routes: candidates.map((c) => c.ref),
+    actor: "PAIR_REPLAN_GENERATION",
+  });
+  // The generation row's durable deadline bounds this run; the env
+  // planner-run deadline may tighten, never widen it.
+  const genDeadline = Number.isFinite(Date.parse(String(gen.deadline_at)))
+    ? Date.parse(String(gen.deadline_at))
+    : Date.now() + cfgReplanGenerationDeadlineMs;
+  const deadlineAt = Math.min(
+    Date.now() + cfgPlannerRunDeadlineMs,
+    genDeadline,
+  );
+  let admission = null;
+  try {
+    if (PLANNER_ROUTES.length && !candidates.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+        JSON.stringify({ configured_routes: PLANNER_ROUTES }),
+      );
+    }
+    // Same canonical Objective lineage + worst-case reservation as the
+    // initial-plan edge: bound_open_id → work_open_binding.work_item_id;
+    // broken lineage or a cap breach fails closed BEFORE any model call.
+    admission = service.cost.admitPlannerInvocation({
+      planner_run_id: String(run.planner_run_id),
+      work_item_id: replanWorkItemId(store, mission),
+      est_microusd: candidates.reduce((sum, c) => {
+        const bound = service.cost.plannerRequestBoundMicrousd(c);
+        return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
+      }, 0),
+      unbounded_unknown: candidates.some(
+        (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
+      ),
+      candidates: candidates.length,
+      actor: "PAIR_REPLAN_GENERATION",
+    });
+    const res = await invokePlannerPool({
+      goal,
+      authorityGoal,
+      candidates,
+      plannerRunId: String(run.planner_run_id),
+      projectId: mission.project_id != null ? String(mission.project_id) : undefined,
+      deadlineAt,
+      replanContext: gen.replan_context,
+      externalInputArtifacts: externalInputs,
+    });
+    finishPlannerRun(store, {
+      planner_run_id: String(run.planner_run_id),
+      outcome: "WINNER_SELECTED",
+      winner_attempt_no: res.winner.attempt_no,
+      actor: "PAIR_REPLAN_GENERATION",
+    });
+    if (admission.reservation_id) {
+      service.cost.settlePlannerInvocation(admission.reservation_id, "CALLS_MADE", null);
+    }
+    return { tasks: res.tasks, planner_run_id: String(run.planner_run_id) };
+  } catch (e) {
+    if (!(e instanceof IntegrityError && e.code === "FAIL_CLOSED_PLANNER_EXHAUSTED")) {
+      finishPlannerRun(store, {
+        planner_run_id: String(run.planner_run_id),
+        outcome: "FAILED",
+        error_code: e instanceof IntegrityError || e instanceof PolicyError ? e.code : "REQUEST_ERROR",
+        actor: "PAIR_REPLAN_GENERATION",
+      });
+    }
+    // Same reservation-settle semantics as planExpander: proven
+    // provider requests stay COMMITTED at reserved; zero provable
+    // spend RELEASES.
+    if (admission?.reservation_id) {
+      const settled = store.tryGet("planner_run", String(run.planner_run_id));
+      service.cost.settlePlannerInvocation(
+        admission.reservation_id,
+        Number(settled?.provider_requests ?? settled?.attempts ?? 0) > 0
+          ? "CALLS_MADE"
+          : "NO_CALLS",
+      );
+    }
+    e.planner_run_id = String(run.planner_run_id);
+    throw e;
+  }
+};
+const replanGenerationSweep = replanGeneration
+  ? makeReplanGenerationDriver({
+      service: replanGeneration,
+      generate: runReplanPoolGeneration,
+      owner_id: `replan-generation:${process.pid}`,
+      // The lease outlives the whole pool run inside it — a healthy
+      // owner never loses mid-run; a crashed claim is reclaimable only
+      // after expiry, bounded by the durable deadline either way.
+      lease_ms: cfgReplanGenerationDeadlineMs,
+      max_claims_per_sweep: 4,
+      // AUDIT R2-F1 — the per-sweep bound is NOT the global bound:
+      // sweeps overlap every second and each could otherwise claim 4
+      // more rows without limit. This shared in-flight capacity lives
+      // in the driver closure, so a claimed-but-unsettled generation
+      // occupies a slot across every overlapping sweep invocation.
+      max_in_flight: 4,
+    })
+  : null;
+// AUDIT R1-F1 — no busy-flag serialization: overlapping sweeps are
+// safe and REQUIRED for fairness. The durable CAS lease + epoch is the
+// single-flight authority (a second sweep cannot claim an in-flight
+// row; it claims only newly-due pending rows), claimNext skips live
+// leases, and settle() revalidates deadline/recovery/slot inside its
+// transaction so a stale result can never stage. Serializing sweeps
+// behind one stalled generation would let a slow Mission A starve
+// Mission B's freshly-minted pending row.
+const driveReplanGenerations = () => {
+  if (!replanGenerationSweep) return;
+  replanGenerationSweep().catch((e) =>
+    console.error("replan-generation:", String(e).slice(0, 200)),
+  );
 };
 const uiDir = process.env.PAIR_MC_UI_DIR ?? path.join(root, "apps/mission-control-ui/dist");
 const server = createMissionControlServer({
@@ -1022,6 +1427,10 @@ const server = createMissionControlServer({
   // SSE). Unset = open local mode; always set it when the port is reachable
   // by anyone but you (e.g. a public preview URL).
   authToken: mcToken.token,
+  // Phase 1 — the separate admin credential for operational-status
+  // reads (PAIR_MC_ADMIN_TOKEN). Absent → no admin principal exists;
+  // the MC token is never admin.
+  adminToken: adminTokenEffective,
   // Narrow-scope upload token for remote executor file deliverables
   // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
   // agents see this value in their prompt, so it must not grant API access.
@@ -1051,6 +1460,10 @@ const server = createMissionControlServer({
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
+  // Executor Management read model — the runtime's merged adapter map
+  // is the bound-this-process truth for the executors projection
+  // (enabled-but-unbound ⇒ requires_restart in the dashboard).
+  executorBoundIds: () => [...adapters.keys()],
   autoScheduler: objectiveAutoReconcile.scheduler,
   // P15.10-C — present only under PAIR_OBJECTIVE_AUTO_DRIVER=1;
   // absent keeps scheduler status driver_ready:false and 404s the
@@ -1066,6 +1479,8 @@ const server = createMissionControlServer({
     drafts: missionDrafts,
     // P15.8-E — telegram ingress authority.
     telegram: telegramConversation,
+    // P16-D — verified read-grant management (mint/control/status).
+    readGrants: conversationReadGrants,
   },
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
@@ -1078,4 +1493,8 @@ setInterval(() => {
   // through the same LLM plan seam the API edge uses
   control.tickSchedules(undefined, planExpander).catch((e) =>
     console.error("tickSchedules:", String(e).slice(0, 200)));
+  // Governed async replan provider — durable generation rows minted by
+  // REPLANNING ticks are claimed/generated/settled here; a no-op while
+  // the flag is off or a sweep is already in flight.
+  driveReplanGenerations();
 }, 1000).unref();

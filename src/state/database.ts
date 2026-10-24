@@ -52,6 +52,10 @@ import {
   MIGRATION_V12_KNOWLEDGE_TRUST,
   MIGRATION_V12_KNOWLEDGE_SOURCE_KIND,
   MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS,
+  MIGRATION_V13_SEMANTIC_SCOPE_BUSINESS,
+  MIGRATION_V13_SEMANTIC_SCOPE_OBJECTIVE,
+  MIGRATION_V13_PROCEDURAL_SCOPE_BUSINESS,
+  MIGRATION_V13_PROCEDURAL_SCOPE_OBJECTIVE,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -642,6 +646,24 @@ function applyMigrations(db: DatabaseType): void {
           MIGRATION_V12_KNOWLEDGE_TRUST,
           MIGRATION_V12_KNOWLEDGE_SOURCE_KIND,
           MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS,
+        ]) {
+          try {
+            db.exec(stmt);
+          } catch {
+            /* column may already exist */
+          }
+        }
+      },
+    },
+    {
+      // P17: business/objective tenancy scope on model-writable memory.
+      version: 13,
+      apply: () => {
+        for (const stmt of [
+          MIGRATION_V13_SEMANTIC_SCOPE_BUSINESS,
+          MIGRATION_V13_SEMANTIC_SCOPE_OBJECTIVE,
+          MIGRATION_V13_PROCEDURAL_SCOPE_BUSINESS,
+          MIGRATION_V13_PROCEDURAL_SCOPE_OBJECTIVE,
         ]) {
           try {
             db.exec(stmt);

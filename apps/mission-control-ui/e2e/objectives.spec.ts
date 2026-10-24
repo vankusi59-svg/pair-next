@@ -590,7 +590,10 @@ test("configure dialog: defaults proposed from objective terms, editable", async
   await page.goto(`/app/objectives/${oid}`);
   await page.getByRole("button", { name: "Configure policy" }).click();
   const dlg = page.getByRole("dialog");
-  await expect(dlg.getByLabel(/expires_at/)).toHaveValue("2030-12-31T00:00");
+  // datetime-local renders LOCAL time — compare the instant, not the
+  // display string, so the assertion is timezone-agnostic.
+  const expVal = await dlg.getByLabel(/expires_at/).inputValue();
+  expect(new Date(expVal).toISOString()).toBe("2030-12-31T00:00:00.000Z");
   await expect(dlg.getByLabel("max ceo calls")).toHaveValue("20");
   await expect(dlg.getByLabel("max missions")).toHaveValue("5");
   await expect(dlg.getByLabel("budget cap usd")).toHaveValue("0.5");

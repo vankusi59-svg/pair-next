@@ -46,6 +46,8 @@
 
 import { utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { DriverDenial, type DriverFaultLabel } from "./objective-driver-fault.js";
+import type { ObjectiveCapabilityGapService } from "./objective-capability-gap.js";
 import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
@@ -67,12 +69,21 @@ import type {
 } from "./objective-auto-scheduler.js";
 import type { OperatingPassResult } from "./objective-operating-loop.js";
 import { CEO_DECISION_ATTEMPT_ENTITY, CEO_MAX_ATTEMPTS_PER_OBSERVATION } from "./ceo-planning-cycle.js";
+import { ExecutorRegistry } from "./executor-registry.js";
+import { REJECTED_ROUTE_HEALTH } from "./route-registry.js";
+import { providerEntryId } from "./provider-catalog.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  codexChatgptSessionProven,
+} from "./codex-cli-transport.js";
+import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import {
   WORKFORCE_ALLOCATION_ENTITY,
   assertCanonicalWorkforceAllocationProvenance,
 } from "./workforce-allocation-evidence.js";
 
-export const DRIVER_ACTOR = "objective-auto-driver";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
+export { DRIVER_ACTOR };
 export const DRIVER_STATE = "objective_auto_driver_state";
 export const DRIVER_SCHEMA = "pair.os.vnext.objective-auto-driver.v1";
 /** How many passes one driver tick may drain; bounded so a tick always
@@ -95,29 +106,9 @@ const HISTORY_LIMIT = 32;
 
 type Row = Record<string, unknown> & { version: number };
 
-/** Typed driver fault labels — durable vocabulary only, never raw
- *  error text. Mirrored into the scheduler FAULT_LABELS allowlist. */
-export const DRIVER_FAULT_LABELS = [
-  "DRIVER_CAP_EXHAUSTED",
-  "DRIVER_COST_UNVERIFIED",
-  "DRIVER_COST_HALTED",
-  "DRIVER_AUTHORITY_LOST",
-  "DRIVER_PASS_FAULT",
-  "DRIVER_ADMISSION_DENIED",
-] as const;
-export type DriverFaultLabel = (typeof DRIVER_FAULT_LABELS)[number];
-
-export class DriverDenial extends IntegrityError {
-  constructor(
-    public readonly label: DriverFaultLabel,
-    detail: string,
-    /** Transient denials release the lease for a later retry;
-     *  permanent denials quarantine for owner action. */
-    public readonly transient: boolean,
-  ) {
-    super(`FAIL_CLOSED_${label}`, detail);
-  }
-}
+/* Public DriverDenial API retained; class lives in the shared module. */
+export { DriverDenial, DRIVER_FAULT_LABELS } from "./objective-driver-fault.js";
+export type { DriverFaultLabel } from "./objective-driver-fault.js";
 
 function invalid(reason: string): never {
   throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_AUTO_DRIVER", reason);
@@ -160,9 +151,21 @@ export interface DriverDeps {
     objective_id: string;
     actor: string;
     authority_gate: () => void;
+    /** AUDIT R1 F5 — absolute epoch bound for any delegated planning
+     *  inside this pass, derived from the claimed lease's canonical
+     *  started_at + max_lifetime_ms minus the finalization allowance.
+     *  Always supplied by the driver; forwarded into the planner
+     *  invocation's deadline pin so paid planning can never outlive
+     *  the lease that authorizes it. */
+    planning_deadline_epoch_ms: number;
   }) => Promise<OperatingPassResult>;
-  /** Eligible executor ids for the dispatch-cost bound (governed
-   *  executor catalog — static composition, never per-pass lookups). */
+  /** The deployment's DECLARED autonomous executor ids — production
+   *  wires AUTONOMOUS_EXECUTOR_IDS (CODEX + PAIR_NATIVE). Membership is
+   *  re-proven against live canonical Executor/Route/Binding rows on
+   *  every envelope derivation; a listed id that is disabled,
+   *  unqualified or auth-blocked simply contributes no supply. The
+   *  canonical backstop for driver-attributed dispatches (absolute
+   *  AUTONOMOUS_EXECUTOR_IDS gate) lives inside assertAndReserve. */
   executors: string[];
   /** billingFor seam from the P13 cost service. */
   billingFor: (
@@ -191,6 +194,20 @@ export interface DriverDeps {
    *  made; recovery resolves through canonical settle anchors only.
    *  Production wires ceoCycle.reconcileStaleAttempts. */
   reconcileStaleAttempts?: (objectiveId: string) => void;
+  /** P16-E — capability-gap advisory projection: every durable
+   *  DriverDenial (admission AND mid-pass) is classified into the
+   *  canonical objective_capability_gap row, and a settled pass closes
+   *  it. Optional + observability-only: a projection fault can never
+   *  mask the denial or block the settle it annotates — the driver
+   *  wraps every call in try{} exactly like recordDenial. */
+  capabilityGaps?: Pick<ObjectiveCapabilityGapService,
+    "recordGap" | "resolveGap" | "gapFor">;
+  /** P16-E — observability hook for gap-projection faults: every
+   *  advisory call site swallows projection errors by contract (they
+   *  may never mask a denial/settle), so this hook is how a swallowed
+   *  fault stays VISIBLE. Production wires console.error — a silent
+   *  wedge is never acceptable for a canonical surface. */
+  onGapFault?: (e: unknown) => void;
 }
 
 interface LeaseRow {
@@ -319,13 +336,43 @@ export class ObjectiveAutoDriverService {
       // check in the driver.
       const claim = this.deps.scheduler.claimable(objectiveId);
       if (!claim.eligible) push(String(claim.reason));
+      // PR #121 — the separate canonical Objective budget authority:
+      // ceiling ≤ 0 forbids NEW spend-bearing work entirely (assertAnd-
+      // Reserve hard-blocks it as OBJECTIVE_ZERO_BUDGET), so readiness
+      // must say so truthfully rather than pretending the pass is free.
+      const obj = this.deps.objectives.get(objectiveId);
+      if (Number((obj.budget as Record<string, unknown> | undefined)
+          ?.ceiling_microusd ?? 0) <= 0) {
+        push("OBJECTIVE_ZERO_BUDGET");
+      }
       const limits = st.limits as { budget_microusd_cap?: number } | null;
-      if (limits?.budget_microusd_cap != null) {
+      const cap = limits?.budget_microusd_cap;
+      // Executor availability is objective-level truth regardless of a
+      // money cap — with no eligible autonomous executor nothing the
+      // CEO plans can ever be dispatched.
+      const env = this.dispatchCostEnvelope();
+      if (!env.executorAvailable) push("EXECUTOR_UNAVAILABLE");
+      // AUDIT R1 F4 — the CEO runs on the codex-cli subscription lane
+      // no matter WHICH executors can take tasks: its binding + live
+      // session are proven here, independently of executor supply. A
+      // PAIR_NATIVE-only fleet is never proof the CEO can run.
+      const ceoBilling = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
+      if (!(ceoBilling.mode === "SUBSCRIPTION" &&
+            ceoBilling.profile != null && !ceoBilling.unbounded)) {
+        push("COST_BINDING_UNVERIFIED");
+      } else if (!this.codexSubscriptionAuthProven()) {
+        push("SUBSCRIPTION_AUTH_UNVERIFIED");
+      }
+      // AUDIT R1 F2 — subscription-only is unconditional: envelope
+      // reasons and metered-pairing presence are readiness truth under
+      // an absent, zero or positive monetary cap alike.
+      for (const r of env.reasons) push(r);
+      if (env.metered) push("METERED_ROUTE_FORBIDDEN");
+      if (cap != null) {
         const usage = this.usage(objectiveId);
         if (usage.cost_unverified) push("COST_UNVERIFIED");
-        const bound = this.dispatchCostBound();
-        if (bound === null) push("COST_BINDING_UNVERIFIED");
-        else if (usage.microusd + bound > limits.budget_microusd_cap) {
+        if (env.bound !== null &&
+            usage.microusd + env.bound > cap) {
           push("BUDGET_EXHAUSTED");
         }
       }
@@ -360,6 +407,7 @@ export class ObjectiveAutoDriverService {
         last_fence: st?.last_fence ?? null,
         admissions: (st?.admissions as unknown[])?.slice(-8) ?? [],
         denials: (st?.denials as unknown[])?.slice(-8) ?? [],
+        capability_gap: this.gapForStatus(objectiveId),
         lease: lease
           ? { state: lease.state, fence: lease.fence, expires_at: lease.expires_at }
           : null,
@@ -385,6 +433,7 @@ export class ObjectiveAutoDriverService {
         last_fence: st?.last_fence ?? null,
         admissions: (st?.admissions as unknown[])?.slice(-8) ?? [],
         denials: (st?.denials as unknown[])?.slice(-8) ?? [],
+        capability_gap: this.gapForStatus(objectiveId),
         lease: lease
           ? { state: lease.state, fence: lease.fence, expires_at: lease.expires_at }
           : null,
@@ -399,6 +448,7 @@ export class ObjectiveAutoDriverService {
       worker_id: this.deps.workerId,
       boot_id: this.deps.bootId,
       max_passes_per_tick: this.maxPassesPerTick,
+      autonomous_executors: [...this.deps.executors],
     };
   }
 
@@ -450,31 +500,139 @@ export class ObjectiveAutoDriverService {
     };
   }
 
-  /** Provable worst-case microusd bound for ONE new dispatch — the max
-   *  reserve over every (executor, route) pairing the governed task
-   *  could take: billingFor resolves route profile → model profile →
-   *  executor profile, so executor-only (route=null) bounds would miss
-   *  a pricier route override (R3 F2). Any UNKNOWN or unbounded billing
-   *  on a reachable pairing makes the bound unprovable → fail closed.
-   *  The admission bound stays a PRELIMINARY check — the real cap
-   *  enforcement lives inside assertAndReserve per governed task. */
-  private dispatchCostBound(): number | null {
-    let bound = 0;
-    const routeIds = (this.deps.store.list("route") as Row[])
-      .map((r) => String(r.route_id));
+  /** PR #121 — autonomous supply derived from canonical
+   *  Executor/Route/Binding state, re-read at every call (never a
+   *  boot-time snapshot). The configured `deps.executors` list is only
+   *  the deployment's declared intent: an executor enters the envelope
+   *  only while its canonical row proves ENABLED + READY + AVAILABLE +
+   *  QUALIFIED + auth-acceptable + not quota/rate hard-blocked. A route
+   *  enters only through a QUALIFIED executor_supply_binding while the
+   *  route itself is enabled, never-rejected and live — disabled,
+   *  unqualified and unrelated routes can no longer poison (or
+   *  silently shrink) the cost envelope. Recoverable states
+   *  (QUOTA_EXHAUSTED/COOLDOWN eligibility, DECLARED qualification)
+   *  are deliberately OVER-included: the bound may never under-count a
+   *  dispatch that could still happen. */
+  private dispatchSupply(): {
+    pairings: Array<{ executor_id: string; route_id: string | null }>;
+    eligible: string[];
+  } {
+    const pairings: Array<{ executor_id: string; route_id: string | null }> = [];
+    const eligible: string[] = [];
+    const bindings = this.deps.store.list("executor_supply_binding") as Row[];
     for (const executorId of this.deps.executors) {
-      for (const routeId of [null, ...routeIds] as Array<string | null>) {
-        const b = this.deps.billingFor(executorId, routeId);
-        if (b.mode === "UNKNOWN" || b.unbounded) return null;
-        if (b.mode === "METERED_API") {
-          const reserve = Number(b.profile?.reserve_microusd ?? 0);
-          const fixed = Number(b.profile?.fixed_microusd ?? 0);
-          bound = Math.max(bound, reserve > 0 ? reserve : fixed);
-        }
-        // SUBSCRIPTION/FREE/UNMETERED: provably no per-dispatch money.
+      const rec = this.deps.store.tryGet("executor", executorId);
+      const md = (rec?.metadata ?? {}) as Record<string, unknown>;
+      const ok = rec != null &&
+        String(rec.status) === "ENABLED" &&
+        ExecutorRegistry.availabilityState(rec) === "AVAILABLE" &&
+        String(md.qualification_state ?? "") === "QUALIFIED" &&
+        ExecutorRegistry.authState(md) !== "AUTH_REQUIRED" &&
+        String(md.quota_state ?? "") !== "QUOTA_EXHAUSTED" &&
+        !["RATE_LIMITED", "COOLDOWN"].includes(String(md.rate_limit_state ?? ""));
+      if (!ok) continue;
+      eligible.push(executorId);
+      pairings.push({ executor_id: executorId, route_id: null });
+      for (const b of bindings) {
+        if (String(b.executor_id) !== executorId) continue;
+        if (String(b.qualification_state) !== "QUALIFIED") continue;
+        const route = this.deps.store.tryGet("route", String(b.route_id));
+        if (!route || route.enabled !== true) continue;
+        if (String(route.qualification_state) === "FAIL_CLOSED") continue;
+        if (["DISABLED", "RETIRED"].includes(String(route.eligibility_state))) continue;
+        const health = String(
+          (route.health as Record<string, unknown> | undefined)?.state ?? "");
+        if (REJECTED_ROUTE_HEALTH.has(health)) continue;
+        pairings.push({ executor_id: executorId, route_id: String(b.route_id) });
       }
     }
-    return bound;
+    return { pairings, eligible };
+  }
+
+  /** The codex-cli pairing is the ChatGPT SUBSCRIPTION transport — its
+   *  $0 billing is provable only while BOTH hold: (a) the provider row
+   *  carries a live authenticated session (probe-derived AUTH_OK), and
+   *  (b) AUDIT R2 F1 — the persisted session file itself resolves to
+   *  ChatGPT auth mode at THIS moment: a stored OPENAI_API_KEY in
+   *  auth.json is metered API-key billing even with no env keys, a
+   *  missing file is no session, and an ambiguous shape is unproven —
+   *  all fail closed. Neither the row alone nor file existence alone
+   *  is proof; the live re-read is re-run at every gate call. */
+  private codexSubscriptionAuthProven(): boolean {
+    const p = this.deps.store.tryGet(
+      "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
+    return String(p?.auth_state ?? "") === "AUTH_OK" &&
+      codexChatgptSessionProven(undefined);
+  }
+
+  /** AUDIT R1 F4 + R2 F1 — the complete CEO subscription authority:
+   *  ACTIVE SUBSCRIPTION billing identity on the codex-cli lane AND a
+   *  proven ChatGPT-mode session — checked independently of which
+   *  executors can take tasks (a PAIR_NATIVE-only supply never implies
+   *  the CEO can run). */
+  private ceoSubscriptionProven(): boolean {
+    const b = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
+    return b.mode === "SUBSCRIPTION" &&
+      b.profile != null && !b.unbounded &&
+      this.codexSubscriptionAuthProven();
+  }
+
+  /** PR #121 — provable cost envelope over the canonical autonomous
+   *  supply. billingFor resolves route profile → model profile →
+   *  executor profile, so a pricier route override still binds (R3 F2).
+   *  - UNKNOWN / unbounded on ANY reachable pairing → unprovable.
+   *  - METERED_API → real bound math (legitimate only under a positive
+   *    cap; under cap 0 it denies through arithmetic + METERED_ROUTE_
+   *    FORBIDDEN readiness).
+   *  - SUBSCRIPTION / FREE / UNMETERED → $0, EXCEPT codex-cli where the
+   *    only honest $0 is an ACTIVE SUBSCRIPTION profile plus a proven
+   *    authenticated session — anything weaker is contradictory and
+   *    fails closed instead of pretending zero-cost.
+   *  Admission stays a PRELIMINARY check — the real enforcement lives
+   *  inside assertAndReserve per governed task. */
+  private dispatchCostEnvelope(): {
+    bound: number | null;
+    reasons: string[];
+    metered: boolean;
+    executorAvailable: boolean;
+  } {
+    const supply = this.dispatchSupply();
+    const reasons = new Set<string>();
+    let bound: number | null = 0;
+    let metered = false;
+    for (const p of supply.pairings) {
+      const b = this.deps.billingFor(p.executor_id, p.route_id);
+      if (b.mode === "UNKNOWN" || b.unbounded) {
+        reasons.add("COST_BINDING_UNVERIFIED");
+        bound = null;
+        continue;
+      }
+      if (b.mode === "METERED_API") {
+        metered = true;
+        const reserve = Number(b.profile?.reserve_microusd ?? 0);
+        const fixed = Number(b.profile?.fixed_microusd ?? 0);
+        bound = bound === null ? null
+          : Math.max(bound, reserve > 0 ? reserve : fixed);
+        continue;
+      }
+      if (p.executor_id === CODEX_EXECUTOR_ID) {
+        if (b.mode !== "SUBSCRIPTION") {
+          reasons.add("COST_BINDING_UNVERIFIED");
+          bound = null;
+        } else if (!this.codexSubscriptionAuthProven()) {
+          reasons.add("SUBSCRIPTION_AUTH_UNVERIFIED");
+          bound = null;
+        }
+      }
+      // else SUBSCRIPTION/FREE/UNMETERED on non-codex: provable $0.
+    }
+    if (supply.eligible.length === 0) reasons.add("EXECUTOR_UNAVAILABLE");
+    return {
+      bound,
+      reasons: [...reasons],
+      metered,
+      executorAvailable: supply.eligible.length > 0,
+    };
   }
 
   /* ---------------- admission (C1 + C2) ------------------------------ */
@@ -512,20 +670,43 @@ export class ObjectiveAutoDriverService {
           `max_missions ${usage.missions}+1>${limits.max_missions}`, false);
       }
       let dispatchBound: number | null = null;
-      if (limits?.budget_microusd_cap != null) {
-        if (usage.cost_unverified) {
-          throw new DriverDenial("DRIVER_COST_UNVERIFIED",
-            "attributed dispatch has unbounded/unknown cost", false);
-        }
-        dispatchBound = this.dispatchCostBound();
-        if (dispatchBound === null) {
-          throw new DriverDenial("DRIVER_COST_UNVERIFIED",
-            "cannot bound next dispatch cost under budget cap", false);
-        }
-        if (usage.microusd + dispatchBound > limits.budget_microusd_cap) {
-          throw new DriverDenial("DRIVER_CAP_EXHAUSTED",
-            `budget ${usage.microusd}+${dispatchBound}>${limits.budget_microusd_cap}`, false);
-        }
+      // AUDIT R1 F2 — subscription-only is UNCONDITIONAL: the provable
+      // cost envelope is required under an absent, zero or positive
+      // monetary cap alike. The cap binds what is allowed; it is not
+      // itself the metered gate.
+      if (usage.cost_unverified) {
+        throw new DriverDenial("DRIVER_COST_UNVERIFIED",
+          "attributed dispatch has unbounded/unknown cost", false);
+      }
+      // Envelope re-derived from LIVE canonical executor/route/binding
+      // state inside this same atomic admission tx: a toggle, unqualify
+      // or profile flip since the claim cannot slip through.
+      const env = this.dispatchCostEnvelope();
+      if (env.metered) {
+        // Any reachable METERED_API pairing could settle positive —
+        // forbidden for autonomous work regardless of the money cap.
+        throw new DriverDenial("DRIVER_METERED_FORBIDDEN",
+          "autonomous supply includes a metered billing pairing", false);
+      }
+      // AUDIT R1 F4 — the CEO invocation itself is subscription-only:
+      // prove the codex-cli billing identity + live ChatGPT session
+      // authority INDEPENDENTLY of which executors can take tasks. A
+      // PAIR_NATIVE-only supply never authorizes a metered-CEO fallback.
+      // R2: this precedes the generic envelope-bound denial so an
+      // auth-mode failure reports its precise label.
+      if (!this.ceoSubscriptionProven()) {
+        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
+          "codex-cli CEO subscription binding/session not proven", false);
+      }
+      if (env.bound === null) {
+        throw new DriverDenial("DRIVER_COST_UNVERIFIED",
+          "cannot prove non-metered dispatch billing", false);
+      }
+      dispatchBound = env.bound;
+      if (limits?.budget_microusd_cap != null &&
+          usage.microusd + dispatchBound > limits.budget_microusd_cap) {
+        throw new DriverDenial("DRIVER_CAP_EXHAUSTED",
+          `budget ${usage.microusd}+${dispatchBound}>${limits.budget_microusd_cap}`, false);
       }
       writeSchedulerRow(this.deps.store, SCHEDULER_RECEIPT, receiptId, {
         objective_id: objectiveId,
@@ -585,6 +766,18 @@ export class ObjectiveAutoDriverService {
       if (this.deps.costHaltActive()) {
         throw new DriverDenial("DRIVER_COST_HALTED", "cost halt asserted mid-pass", true);
       }
+      // AUDIT R2 F1 — the subscription session is re-proven at EVERY
+      // external authority crossing (CEO call, planner call, review
+      // commit, allocation, openWorkItem): a `codex logout` or
+      // `login --with-api-key` between admission and the next
+      // invocation flips the live auth mode to API_KEY/UNAUTHENTICATED
+      // and this gate stops the pass before another subscription
+      // invocation is attempted. Non-transient — operator action is
+      // required to restore ChatGPT auth.
+      if (!this.ceoSubscriptionProven()) {
+        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
+          "codex-cli subscription authority lost mid-pass", false);
+      }
     };
   }
 
@@ -605,6 +798,20 @@ export class ObjectiveAutoDriverService {
       return { objective_id: objectiveId, skipped: true, fault: faultCode(e) };
     }
     const opId = `drive-pass:${objectiveId}:${handle.fence}`;
+    // AUDIT R1 F5 — the pass's absolute planning deadline, derived from
+    // the SAME durable lease row the scheduler's lifetime gate enforces:
+    // started_at + max_lifetime_ms is the canonical authority bound, and
+    // the bounded finalization allowance is reserved for settle/commit.
+    // Threaded down into prepareDelegatedPlan → planExpander.deadlineMs
+    // so a planner run inside this pass can never outlive the lease —
+    // a too-long invocation fails PLANNER_DEADLINE (fail-closed) instead
+    // of running unauthorized after the lifetime gate kills the lease.
+    const leaseRow = readSchedulerRow<Row>(
+      this.deps.store, LEASE_STATE, objectiveId);
+    const planningDeadlineEpochMs =
+      Number(leaseRow?.started_at ?? this.instant()) +
+      Number(leaseRow?.max_lifetime_ms ?? this.leaseLifetimeBoundMs()) -
+      DRIVER_FINALIZATION_ALLOWANCE_MS;
     try {
       // F1-D: reconcile any STARTED/UNKNOWN CEO attempt the previous
       // worker left behind BEFORE admitting a new pass — never a
@@ -623,7 +830,11 @@ export class ObjectiveAutoDriverService {
         return { objective_id: objectiveId, denied: e.label, transient: e.transient };
       }
       // Unexpected admission fault — release into bounded retry, never
-      // quarantine an unproven failure.
+      // quarantine an unproven failure. The driver itself classifies it
+      // DRIVER_PASS_FAULT — project it so the advisory is not blind to
+      // genuine execution-layer breakage.
+      this.noteGap(objectiveId, { label: "DRIVER_PASS_FAULT", transient: true },
+        handle.fence);
       this.tryRelease(handle, opId);
       return { objective_id: objectiveId, denied: "DRIVER_PASS_FAULT",
         transient: true, fault: faultCode(e) };
@@ -639,6 +850,7 @@ export class ObjectiveAutoDriverService {
         objective_id: objectiveId,
         actor: DRIVER_ACTOR,
         authority_gate: this.authorityGate(handle),
+        planning_deadline_epoch_ms: planningDeadlineEpochMs,
       });
       // F1-A: a renewal fault means this worker is deemed unauthorized
       // — the outcome is never settled under a lost lease.
@@ -656,8 +868,14 @@ export class ObjectiveAutoDriverService {
         last_fence: handle.fence,
         last_result: { fault: faultCode(e) },
       }, "PASS_FAULT", opId);
-      if (e instanceof DriverDenial && !e.transient) {
-        this.tryQuarantine(objectiveId, e.label);
+      if (e instanceof DriverDenial) {
+        this.noteGap(objectiveId, e, handle.fence);
+        if (!e.transient) this.tryQuarantine(objectiveId, e.label);
+      } else {
+        // Untyped mid-pass fault — the durable state row already labels
+        // it PASS_FAULT; project the same closed vocabulary into the gap.
+        this.noteGap(objectiveId, { label: "DRIVER_PASS_FAULT", transient: true },
+          handle.fence);
       }
       this.tryRelease(handle, opId);
       return {
@@ -693,6 +911,12 @@ export class ObjectiveAutoDriverService {
         detail: result.detail ?? null,
       },
     }, "SETTLED", opId);
+    // P16-E — a settled pass proves the capability chain end-to-end;
+    // close the gap projection. try{} like every advisory write.
+    try { this.deps.capabilityGaps?.resolveGap(objectiveId); }
+    catch (e) {
+      try { this.deps.onGapFault?.(e); } catch { /* hook is advisory too */ }
+    }
     return { objective_id: objectiveId, outcome: result.outcome, settled: true };
   }
 
@@ -703,6 +927,45 @@ export class ObjectiveAutoDriverService {
         denials: [{ at: utcnow(), fence: handle.fence, label: e.label }],
       }, "DENIED", `${objectiveId}:${handle.fence}:${e.label}`);
     } catch { /* driver state is observability only — never mask the denial */ }
+    // The gap projection records through noteGap so a driver-state write
+    // fault is never misattributed as a gap fault (R3 F4).
+    this.noteGap(objectiveId, e, handle.fence);
+  }
+
+  /** Mid-pass DriverDenials never reach recordDenial (the admit catch
+   *  owns it) but carry the same closed-vocabulary fault — the gap
+   *  projection must see them or a mid-pass AUTHORITY_LOST would leave
+   *  the advisory surface blind to the real blocker. The unexpected-
+   *  fault paths also report through here as DRIVER_PASS_FAULT — the
+   *  same label the driver's own denial/result strings already use, so
+   *  the advisory covers every path the driver itself classifies. */
+  private noteGap(objectiveId: string,
+    e: { label: DriverFaultLabel; transient: boolean }, fence: number): void {
+    try {
+      this.deps.capabilityGaps?.recordGap({
+        objective_id: objectiveId, label: e.label,
+        transient: e.transient, fence,
+      });
+    } catch (err) {
+      try { this.deps.onGapFault?.(err); } catch { /* hook is advisory too */ }
+    }
+  }
+
+  /** Status-read seam: gapFor must never throw into the owner status
+   *  read — a hostile or failing seam impl degrades to the same
+   *  UNVERIFIED marker the service itself uses, never a 500, never
+   *  fabricated data. */
+  private gapForStatus(objectiveId: string): Record<string, unknown> | null {
+    try {
+      return this.deps.capabilityGaps?.gapFor(objectiveId) ?? null;
+    } catch (e) {
+      try { this.deps.onGapFault?.(e); } catch { /* hook is advisory too */ }
+      return {
+        state: "UNVERIFIED",
+        reason: "FAIL_CLOSED_CAPABILITY_GAP_READ",
+        objective_id: objectiveId,
+      };
+    }
   }
 
   private tryRelease(handle: LeaseHandle, opId: string): void {

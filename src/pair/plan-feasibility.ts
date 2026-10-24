@@ -385,6 +385,14 @@ export function structuredFailureSignatureSuffix(
 
 export const MAX_REPLAN_CANDIDATES_PER_DECISION = 2;
 
+/** Governed async replan provider wait signal — deliberately NOT a
+ *  FAIL_CLOSED_* code. Thrown by the durable replan_generation bridge
+ *  (replan-generation.ts) while an async candidate is minted / in
+ *  flight; MissionRuntime.runReplan treats it as "still waiting" —
+ *  no candidate slot consumed, no failure classification, the runtime
+ *  stays REPLANNING until staging resolves the row. */
+export const REPLAN_GENERATION_PENDING = "REPLAN_GENERATION_PENDING";
+
 export type ReplanAttemptStatus =
   | "CANDIDATE"
   | "PREPARED"

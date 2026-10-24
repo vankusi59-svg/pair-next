@@ -18,6 +18,7 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import type { ExperienceService } from "./experience.js";
+import { deriveMissionScope } from "./experience-extraction.js";
 import { IntegrityError } from "./errors.js";
 import type { ProposedTask } from "./proposal.js";
 import type { PairControlPlane } from "./service.js";
@@ -109,7 +110,9 @@ export class VerifiedExperiencePlannerAdvisor {
   /**
    * Retrieve compatible ACTIVE/QUALIFIED experience for a mission goal and
    * emit an advisory context + persisted receipt. The planner (Automaton)
-   * remains the proposer; this only feeds context.
+   * remains the proposer; this only feeds context. P17: the read is
+   * tenancy-scoped to the mission's canonical binding — a foreign-scope
+   * row can never advise this mission.
    */
   advise(opts: {
     goal: string;
@@ -118,11 +121,19 @@ export class VerifiedExperiencePlannerAdvisor {
     correlation_id?: string;
     now?: string;
   }): Record<string, unknown> {
+    const scope = opts.mission_id
+      ? deriveMissionScope(this.service.store, opts.mission_id)
+      : { scope_business_id: null, scope_objective_id: null };
     const query = {
       text: opts.goal,
       mission_id: opts.mission_id,
       environment: opts.environment,
       now: opts.now,
+      ...(scope.scope_objective_id
+        ? { objective_id: scope.scope_objective_id, business_id: scope.scope_business_id ?? undefined }
+        : scope.scope_business_id
+          ? { business_id: scope.scope_business_id }
+          : {}),
     };
     const all = this.experience.retrieve(query);
     const byType = (t: string) => all.filter((e) => e.type === t);
@@ -164,6 +175,10 @@ export class VerifiedExperiencePlannerAdvisor {
    * nothing — capabilities/deps only. Callers must still run
    * validatePlanProposal + commitPlan; no permissions/executors carry over.
    */
+  /** By-id read — bypasses scopeAdmits by design (the caller already
+   *  named the row). Pre-P17 this was the only surface; if a scoped
+   *  consumer ever wires it, the tenancy check must be added here.
+   *  Currently zero production callers. */
   reusePlanTemplate(
     experienceId: string,
   ): { proposal: { tasks: ProposedTask[] }; template_id: string } {
@@ -290,11 +305,25 @@ export class VerifiedExperienceRoutingAdvisor {
     );
     const perExpDelta: Record<string, Record<string, number>> = {};
 
+    // P17 — tenancy-scoped advisory reads: the mission's canonical
+    // binding decides which scope's experience may advise this route.
+    // A foreign-scope row can never re-rank an executor here.
+    const missionId = (opts.task?.mission_id as string) ?? null;
+    const missionScope = missionId
+      ? deriveMissionScope(this.service.store, missionId)
+      : { scope_business_id: null, scope_objective_id: null };
+    const scopeQuery = missionScope.scope_objective_id
+      ? { objective_id: missionScope.scope_objective_id, business_id: missionScope.scope_business_id ?? undefined }
+      : missionScope.scope_business_id
+        ? { business_id: missionScope.scope_business_id }
+        : {};
+
     for (const executorId of eligibleIds) {
       const rows = this.experience.retrieve({
         executor_id: executorId,
         environment: opts.environment,
         now,
+        ...scopeQuery,
       });
       for (const exp of rows) {
         const expId = String(exp.experience_id);

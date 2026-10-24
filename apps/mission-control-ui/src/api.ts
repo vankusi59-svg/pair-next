@@ -175,6 +175,66 @@ export const api = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* P15.9 Step-0 — owner-scoped measurement / evidence / amendment
+     seams. Owner proof derives from x-operator-id at the edge only;
+     the UI never sends an owner/verifier field — the server sets the
+     evidence verifier to the header-derived actor and the authority
+     service enforces actor === owner_authority_id. evidence_key /
+     idempotency_key are minted per operation and replayed verbatim on
+     retry (ledger dedup keeps an ambiguous retry from double-minting). */
+  objectiveRecordProgressApp: (
+    id: string,
+    body: {
+      business_id: string; kpi_id: string; value: number;
+      /* No source field — the route pins source:"owner-console"
+         itself; a client-chosen provenance label is never accepted. */
+      evidence_key?: string; note?: string;
+    },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/progress`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  objectiveAttachEvidenceApp: (
+    id: string,
+    body: { business_id: string; evidence_key?: string; note?: string },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/evidence`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  objectiveAmendApp: (
+    id: string,
+    body: {
+      business_id: string; patch: Record<string, unknown>; reason?: string;
+      /* Canonical dedup anchor (R2 M2′): minted once per operation —
+         a committed-but-lost response retried with the same key+patch
+         replays idempotently instead of bumping terms_version twice. */
+      idempotency_key?: string;
+    },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/amend`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  /* P15.10-D KPI-verifier grant plane (route already existed; this is
+     the first UI caller). action: grant | status | revoke | disable.
+     Grant wakes the scheduler inside the same store.immediate commit. */
+  objectiveKpiVerificationApp: (
+    id: string,
+    body: {
+      action: "grant" | "status" | "revoke" | "disable";
+      kpi_id?: string;
+      rule?: Record<string, unknown>;
+      expires_at?: string;
+      authorization_id?: string;
+      idempotency_key?: string;
+    },
+  ) =>
+    req<Record<string, unknown>>(`/vnext/objectives/${encodeURIComponent(id)}/kpi-verification`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
   createObjectiveApp: (input: import("./types").VnextObjectiveInput) =>
     req<import("./types").CanonicalObjective>("/vnext/objectives", {
       method: "POST",
@@ -191,6 +251,20 @@ export const api = {
   autoPolicyStatusApp: (id: string, signal?: AbortSignal) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(
       `/vnext/objectives/${id}/auto-policy`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  /* Autonomous-loop observability reads (owner-scoped GETs, poll-safe).
+     Abortable; noAuthPrompt so failures render honest states. */
+  autoSchedulerStatusApp: (id: string, signal?: AbortSignal) =>
+    req<{ auto_scheduler: import("./types").AutoSchedulerStatus }>(
+      `/vnext/objectives/${id}/auto-scheduler`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  autoDriverStatusApp: (id: string, signal?: AbortSignal) =>
+    req<{ auto_driver: import("./types").AutoDriverStatus }>(
+      `/vnext/objectives/${id}/auto-driver`,
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
@@ -416,6 +490,20 @@ export const apiAdmin = {
     req<import("./app/types").RoutineRow>(`/routines/${id}/${action}`, {
       method: "POST",
       body: "{}",
+    }, { noAuthPrompt: true }),
+  /* Executor Management — operator intent projection + audited toggle.
+     The backend's CapabilityRouter + GovernedTaskGate enforce the
+     durable status on every dispatch path. */
+  executors: (signal?: AbortSignal) =>
+    req<{ executors: import("./app/types").ExecutorRow[] }>(
+      "/executors",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  setExecutorEnabled: (id: string, enabled: boolean) =>
+    req<Record<string, unknown>>(`/executors/${encodeURIComponent(id)}/state`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
     }, { noAuthPrompt: true }),
   legacyObjectives: (businessId: string, signal?: AbortSignal) =>
     req<{ objectives: import("./app/types").LegacyObjectiveRow[] }>(

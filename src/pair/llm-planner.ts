@@ -151,7 +151,41 @@ export const LLM_PLAN_RESERVED_CAPABILITY_WARNING =
 /** Strong recency markers — unambiguous "newest/now" vocabulary that can
  *  lift a research or retrieval request into current-data territory. */
 const STRONG_CURRENCY_RE =
+  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now|this\s+week|current[-\s]?week)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay|tuần này|tuần hiện tại/iu;
+
+/** Non-week strong markers — always free recency. Week markers are
+ *  evaluated separately because "tuần này"/"this week" can also mark
+ *  WHEN work happens, not that the subject is current (R3-F6). */
+const STRONG_NONWEEK_CURRENCY_RE =
   /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay/iu;
+
+/** Current-week recency markers (global — scanned per clause). */
+const WEEK_CURRENCY_RE =
+  /\bthis\s+week\b|\bcurrent[-\s]?week\b|tuần\s+này|tuần\s+hiện\s+tại/giu;
+
+/** R3-F6 — schedule/meeting/delivery-deadline roles: when one of these
+ *  governs a week marker inside the same clause, the marker binds the
+ *  EVENT time ("buổi họp tuần này", "delivered this week"), not the
+ *  researched subject. Bounded rule — the schedule word must precede
+ *  the week marker inside the clause; a week marker in a clause
+ *  without a preceding schedule role keeps full recency authority. */
+const SCHEDULE_ROLE_RE =
+  /\b(họp|meeting|schedule[sd]?|lịch|deadline|hạn|nộp|bàn\s+giao|giao\s+(?!dịch)|deliver(?:ed|y|s|ing)?|submit(?:ted|s|ting)?|present(?:ed|s|ing|ation)?|trình\s+bày|gửi|send(?:s|t|ing)?|đăng|post(?:ed|s|ing)?|publish(?:ed|es|ing)?|share[sd]?)\b/iu;
+
+/** TRUE when the goal carries at least one week-recency marker that is
+ *  NOT governed by a schedule/deadline role within its own clause. */
+function hasUnboundWeekCurrency(goal: string): boolean {
+  const clauses = String(goal ?? "").split(/[,.;:!?\n]+/);
+  for (const clause of clauses) {
+    WEEK_CURRENCY_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = WEEK_CURRENCY_RE.exec(clause)) !== null) {
+      const before = clause.slice(Math.max(0, m.index - 32), m.index);
+      if (!SCHEDULE_ROLE_RE.test(before)) return true;
+    }
+  }
+  return false;
+}
 
 /** Generic current-state markers — ambiguous LOCAL-or-EXTERNAL; never
  *  sufficient alone (see R3.A rules). */
@@ -166,7 +200,7 @@ const ONLINE_RE =
  *  repo, not on the network. Presence suppresses the requirement unless
  *  an online marker coexists. */
 const LOCAL_SOURCE_RE =
-  /\b(repos?|repository|branch(?:es)?|workspace|files?|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|tệp|dự án|nhánh|cục bộ|\brepo\b/iu;
+  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)\b|\b(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
 
 /** Information-retrieval verbs. Word-bounded so "fetched", "scraper"
  *  do NOT match — only an explicit request to retrieve. */
@@ -193,7 +227,8 @@ const DATA_OBJECT_RE =
 export function goalRequiresCurrentExternalData(goal: string): boolean {
   const g = String(goal ?? "");
   const online = ONLINE_RE.test(g);
-  const strong = STRONG_CURRENCY_RE.test(g);
+  const strong =
+    STRONG_NONWEEK_CURRENCY_RE.test(g) || hasUnboundWeekCurrency(g);
   const generic = GENERIC_CURRENT_RE.test(g);
   if (!online && !strong && !generic) return false;
   // R3.A — LOCAL_CURRENT_STATE: an explicit local source without an
@@ -504,6 +539,18 @@ export interface LlmPlannerConfig {
    *  retry on degenerate output); a rejection-feedback re-ask passes 1 —
    *  exactly one provider request, never a recursive retry layer. */
   maxProviderRequests?: number;
+  /** AUDIT R1 F3 — absolute run deadline (epoch ms) propagated from the
+   *  Planner Pool invocation. `timeoutMs` bounds a single request measured
+   *  at call time, but the internal retry loop used to be able to START a
+   *  fresh provider request after the run deadline; a request may now only
+   *  begin while `Date.now() < deadlineMs`, and each request's clock is
+   *  min()'d against the remaining deadline. */
+  deadlineMs?: number;
+  /** AUDIT R1 F4 — mutable counter the Planner Pool owns per attempt;
+   *  incremented at the exact point this transport initiates a provider
+   *  request, so the settled attempt row records requests that PROVABLY
+   *  ran — never the attempt-row count. */
+  providerCounter?: { requests: number };
   /** F3 — bounded structured failure context on a REPLAN: the planner must
    *  propose a feasible ALTERNATIVE, never a semantic re-emission of the
    *  failed plan; the rejected digests are named in the prompt. */
@@ -520,6 +567,22 @@ export interface LlmPlannerConfig {
    *  re-ask: MINIMAL-REPAIR semantics (fix the named defect, preserve all
    *  other structure) — never F3's alternative-plan semantics. */
   rejectionContext?: PlannerRejectionContext;
+  /** R1 — the provenance-bound operator goal: the ONLY text allowed to
+   *  mint Goal Contract requirements, host/network authorization, and
+   *  the work-task budget inside the prompt. `goal` remains the full
+   *  mission text the model reads (envelope context included); absent
+   *  → `goal` itself is the operator request. */
+  authorityGoal?: string;
+  /** EXTERNAL_INPUT_AWARENESS — the eligible cross-mission input set the
+   *  canonicalizer will bind against, rendered verbatim into the prompt
+   *  so the model can consume a real sibling artifact by exact logical
+   *  name instead of guessing a filename from the goal text. Context
+   *  only — the binding authority stays the canonicalizer's re-proof. */
+  externalInputArtifacts?: ReadonlyArray<{
+    logical_name: string;
+    source_mission_id?: string;
+    source_task_id?: string;
+  }>;
 }
 
 export interface LlmPlanResult {
@@ -872,6 +935,8 @@ export function sanitizePlan(
 export function repairNetworkCapabilityBinding(
   tasks: Array<Record<string, unknown>>,
   opts: {
+    /** R1 — the provenance-bound operator goal (authority text), never
+     *  the enriched envelope: hosts/network demand mint from it only. */
     goal: string;
     allowedCapabilities: string[];
     capabilitySets?: string[][];
@@ -959,15 +1024,28 @@ export function buildPlannerUserPrompt(
     maxTasks?: number;
     replanContext?: LlmPlannerConfig["replanContext"];
     rejectionContext?: LlmPlannerConfig["rejectionContext"];
+    /** R1 — provenance-bound operator goal (defaults to `goal`). The
+     *  contract + work-task budget derive from it; the MISSION GOAL
+     *  block still renders `goal` verbatim so appended context stays
+     *  informational. */
+    authorityGoal?: string;
+    /** EXTERNAL_INPUT_AWARENESS — eligible sibling-mission artifacts,
+     *  same shape as LlmPlannerConfig.externalInputArtifacts. */
+    externalInputArtifacts?: ReadonlyArray<{
+      logical_name: string;
+      source_mission_id?: string;
+      source_task_id?: string;
+    }>;
   },
 ): string {
-  const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  const workTasks = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
   // PRV2-B — the planner receives the canonical Goal Contract alongside
   // the raw goal. The contract is read-only authority: the model must
   // cover it, never mutate it, never invent requirements, and never
   // downgrade quantities — PAIR verifies every requirement
   // independently and a fabricated claim fails closed.
-  const contract = extractGoalContract(goal);
+  const contract = extractGoalContract(authorityGoal);
   const reqLines = [
     ...contract.obligations.map((r) => `${r.id} obligation: ${r.text}`),
     ...contract.deliverables.map((r) => `${r.id} deliverable: ${r.text}`),
@@ -987,6 +1065,32 @@ export function buildPlannerUserPrompt(
     contractBlock +
     (cfg.capabilitySets?.length
       ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
+      : "") +
+    (cfg.externalInputArtifacts?.length
+      ? `EXTERNAL INPUT ARTIFACTS — files already produced and ACCEPTED by ` +
+        `authorized sibling work under the same objective; a task may consume ` +
+        `one ONLY by its exact logical name:\n` +
+        cfg.externalInputArtifacts
+          .slice(0, 24)
+          .map(
+            (a) =>
+              `- ${a.logical_name}` +
+              (a.source_mission_id
+                ? ` (produced by mission ${a.source_mission_id}` +
+                  (a.source_task_id ? `, task ${a.source_task_id}` : "") +
+                  `)`
+                : ""),
+          )
+          .join("\n") +
+        (cfg.externalInputArtifacts.length > 24
+          ? `\n- … ${cfg.externalInputArtifacts.length - 24} more`
+          : "") +
+        `\nA task's consumes may name ONLY a file produced by an earlier task ` +
+        `in this plan or listed above — never a file merely because it is a ` +
+        `desired output of this mission. When several entries share a logical ` +
+        `name, consuming that name binds the newest listed version with that ` +
+        `exact name — a staged outbox/<name> listing binds only when no ` +
+        `exact-name artifact exists.\n`
       : "") +
     (cfg.replanContext
       ? `\nREPLAN CONTEXT — this is a recovery replan after a governed failure:\n` +
@@ -1015,7 +1119,7 @@ export function buildPlannerUserPrompt(
           : "") +
         (cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT" ||
          cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_ORDER"
-          ? `Specific fix: a task consumes an artifact with no earlier producer — use ONE consistent path per artifact, declare the producing task earlier, and never restate the same file under a different path form or verb; preserve the artifact/dependency relationship.\n`
+          ? `Specific fix: a task consumes an artifact with no earlier producer — use ONE consistent path per artifact, declare the producing task earlier (or consume a file listed under EXTERNAL INPUT ARTIFACTS by its exact logical name — never a desired output name), and never restate the same file under a different path form or verb; preserve the artifact/dependency relationship.\n`
           : "") +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
@@ -1029,7 +1133,10 @@ export function plannerSystemPrompt(): string {
 }
 
 export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
-  const maxTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  // R1 — authority derivations bind the provenance-bound operator goal;
+  // the enriched mission text is context only.
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  const maxTasks = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
   // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
   // bookkeeping-shaped emission survives to the canonicalize seam for
   // deterministic normalization (drop + dependency remap onto injected
@@ -1040,6 +1147,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     ? cfg.allowedCapabilities
     : [...cfg.allowedCapabilities, "AUTOMATON_TASK_EXECUTION"];
   const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
+  const deadlineAt = cfg.deadlineMs;
   const apiKey = envGet(cfg.env, cfg.credentialEnv);
   const fetchImpl = cfg.fetchFn ?? fetch;
 
@@ -1062,6 +1170,9 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number; raw_delivery_emission_state?: RawDeliveryEmissionState }> => {
     let text: string;
     try {
+      // AUDIT R1 F4 — counted at the initiation point: a request that
+      // then fails/times out still provably reached the provider.
+      if (cfg.providerCounter) cfg.providerCounter.requests += 1;
       const resp = await fetchImpl(cfg.endpoint, {
         method: "POST",
         headers: {
@@ -1077,7 +1188,11 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
           temperature: 0.2,
           max_tokens: 2048,
         }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(
+          deadlineAt != null
+            ? Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()))
+            : timeoutMs,
+        ),
       });
       if (!resp.ok) return { tasks: [], warnings: [`LLM_PLANNER_HTTP_${resp.status}`] };
       const data = (await resp.json()) as {
@@ -1116,7 +1231,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     // missing NETWORK_ACCESS gets it added deterministically (same helper the
     // codex planner lane uses) instead of dying on the annotation omission.
     const repair = repairNetworkCapabilityBinding(tasks, {
-      goal,
+      goal: authorityGoal,
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
     });
@@ -1134,6 +1249,13 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     Math.min(2, cfg.maxProviderRequests ?? 2),
   );
   for (let i = 0; i < maxProviderRequests; i++) {
+    // AUDIT R1 F3 — never START a provider request once the run deadline
+    // has passed; the in-flight request's own timeout is additionally
+    // min()'d against the deadline inside `attempt`.
+    if (deadlineAt != null && Date.now() >= deadlineAt) {
+      warnings.push("LLM_PLANNER_RUN_DEADLINE_EXCEEDED");
+      break;
+    }
     const a = await attempt();
     const usable = a.tasks.filter(
       (t) => !isBookkeepingShapedTask(t, sanitizeCaps),

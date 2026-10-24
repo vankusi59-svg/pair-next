@@ -18,6 +18,15 @@
 import fs from "node:fs";
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
+import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
+import { AUTONOMOUS_EXECUTOR_IDS } from "./executor-registry.js";
+import { providerEntryId } from "./provider-catalog.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  codexAuthMode,
+} from "./codex-cli-transport.js";
+import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -39,6 +48,13 @@ export type CostScope = (typeof COST_SCOPES)[number];
 
 export const RESERVATION_STATES = ["HELD", "COMMITTED", "SETTLED", "RELEASED"] as const;
 export type ReservationState = (typeof RESERVATION_STATES)[number];
+
+/** Phase C — canonical executor identity for LLM Planner Pool provider
+ *  invocations that are NOT the codex_cli transport (codex_cli planner
+ *  calls carry CODEX_EXECUTOR_ID — the real governed executor class).
+ *  An executor cost_profile with ref_id "PAIR_PLANNER" prices generic
+ *  planner calls; model profiles (ref_id = model_entry_id) always win. */
+export const PLANNER_EXECUTOR_ID = "PAIR_PLANNER";
 
 const POLICY_KEYS = new Set([
   "scope_type",
@@ -467,6 +483,15 @@ export class CostService {
     if (!wob) return "BROKEN"; // binding claimed but the binding row is gone
     const wi = wob.work_item_id;
     if (!wi) return "BROKEN";
+    return this.objectiveScopeForWorkItemId(String(wi));
+  }
+
+  /** Phase C — the same canonical lineage walk, entered at the work
+   *  item: shared by mission-scoped reservations (via work_open_binding)
+   *  and by pre-mission planner invocations (delegated opens, where the
+   *  mission does not exist yet). */
+  private objectiveScopeForWorkItemId(wi: string):
+      { objective_id: string; cap: number | null } | "BROKEN" | null {
     // Binding-claim authority: the work_item's own objective_id, or the
     // objective_id inherited through its parent chain (delegated
     // children carry parent_work_item_id, not their own marker). Walk
@@ -509,6 +534,15 @@ export class CostService {
     return { objective_id: oid, cap: cap == null ? null : Number(cap) };
   }
 
+  /** Phase C — public objective-scope read for the shared
+   *  planner-admission seam (a delegated open's lineage resolved BEFORE
+   *  its mission exists). Same verdicts as the mission-scoped walk. */
+  objectiveScopeForWorkItem(
+    workItemId: string,
+  ): { objective_id: string; cap: number | null } | "BROKEN" | null {
+    return this.objectiveScopeForWorkItemId(workItemId);
+  }
+
   /** Sum of every live reservation traceable to the objective — HELD /
    *  COMMITTED at reserved, SETTLED at settled, RELEASED skipped. */
   private objectiveAttributedMicrousd(objectiveId: string, reservations: Array<Record<string, unknown>>): number {
@@ -527,12 +561,19 @@ export class CostService {
     }
     let total = 0;
     for (const r of reservations) {
-      if (!mids.has(String(r.mission_id ?? ""))) continue;
       const st = String(r.status);
       if (st === "RELEASED") continue;
-      total += st === "SETTLED"
+      const amount = st === "SETTLED"
         ? Number(r.settled_microusd ?? 0)
         : Number(r.reserved_microusd ?? 0);
+      if (mids.has(String(r.mission_id ?? ""))) { total += amount; continue; }
+      // Phase C — planner invocations attribute through the delegated
+      // work item they planned for; no mission exists yet, and a
+      // planner row can never alias a governed-task reservation
+      // (different identity fields → never double-counted).
+      if (r.planner_run_id != null && wis.has(String(r.work_item_id ?? ""))) {
+        total += amount;
+      }
     }
     return total;
   }
@@ -791,6 +832,97 @@ export class CostService {
           }
         }
       }
+      // PR #121 — autonomous dispatch authority, proven INSIDE the same
+      // atomic check-and-reserve. A work_open_binding minted by the
+      // objective auto driver (created_by = DRIVER_ACTOR) marks this
+      // dispatch as autonomous work: it may only reserve through the
+      // canonical AUTONOMOUS_EXECUTOR_IDS set — a dashboard toggle, an
+      // adapter composition or a route edit can never make DEVIN/DSH
+      // autonomous — and the pairing's billing identity must be
+      // provably non-metered (a $0-reserved METERED row can still
+      // SETTLE positive, so it is forbidden categorically, not merely
+      // over-cap). AUDIT R1 F2: subscription-only is UNCONDITIONAL —
+      // the monetary cap binds what is allowed but is not itself the
+      // metered gate, so METERED_API / UNKNOWN / unbounded billing is
+      // denied under an absent, zero or positive cap alike. Live state
+      // is re-read inside THIS transaction: an executor enable, profile
+      // flip or route change between driver admission and this reserve
+      // is never trusted from a snapshot. Reservations already proven
+      // (COMMITTED/SETTLED re-hold of a RELEASED row) return through
+      // the existing paths above and are never re-gated.
+      const openId = String(params.mission.bound_open_id ?? "");
+      const driverWob = openId
+        ? this.store.tryGet("work_open_binding", openId)
+        : null;
+      if (driverWob && String(driverWob.created_by) === DRIVER_ACTOR) {
+        if (!(AUTONOMOUS_EXECUTOR_IDS as readonly string[])
+            .includes(params.executorId)) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: String(params.executorId),
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_EXECUTOR",
+            used_microusd: null, requested_microusd: null,
+            max_microusd: null,
+          });
+        }
+        if (billing.mode === "METERED_API" || billing.mode === "UNKNOWN" ||
+            billing.unbounded) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: routeId ?? params.executorId,
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_METERED",
+            used_microusd: null,
+            requested_microusd: requested,
+            max_microusd: objScope && objScope !== "BROKEN"
+              ? objScope.cap : null,
+          });
+        }
+        // AUDIT R1 F3 + R2 F2 — final atomic re-proof for the
+        // subscription transport: a driver-attributed CODEX dispatch
+        // requires THIS dispatch's resolved billing identity — the
+        // SELECTED route's profile, then model, then executor
+        // (billingFor order) — to be exactly SUBSCRIPTION, not merely
+        // an executor-level declaration. A route profile flipped to
+        // FREE/UNMETERED/METERED/UNKNOWN (or any unbounded/
+        // contradictory binding) between admission and reserve is
+        // denied here. Plus a live canonical provider session
+        // (auth_state === AUTH_OK). Fresh in-txn state only — never a
+        // caller snapshot.
+        if (params.executorId === CODEX_EXECUTOR_ID) {
+          const subscriptionProven =
+            billing.mode === "SUBSCRIPTION" &&
+            billing.profile != null &&
+            !billing.unbounded;
+          const provider = this.store.tryGet(
+            "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
+          const sessionProven =
+            String(provider?.auth_state ?? "") === "AUTH_OK";
+          if (!subscriptionProven || !sessionProven) {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: routeId ?? CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
+            });
+          }
+          // AUDIT R2 F1 — AUTH_OK proves a probe succeeded, not that the
+          // session is ChatGPT-billed: the live auth-mode re-proof reads
+          // the persisted session file's structure inside this txn.
+          // API_KEY / UNAUTHENTICATED / AMBIGUOUS fail closed.
+          if (codexAuthMode(undefined) !== "CHATGPT") {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
+            });
+          }
+        }
+      }
       if (violations.length) return { violations, warnings, saved: null };
       // R1 §2: pin the authoritative pricing evidence into the
       // reservation at authorization time — settlement later uses THIS
@@ -1027,6 +1159,384 @@ export class CostService {
     this.settle(governedTaskId, actual);
   }
 
+  /* ---------------- Phase C — planner invocation governance --------------
+   * The LLM Planner Pool spends provider requests BEFORE any mission or
+   * governed task exists. When a delegated open carries objective
+   * lineage, the SAME cap binds at this pre-spend boundary — atomically
+   * inside one check-and-reserve transaction against lineage resolved
+   * fresh (never the caller's snapshot). Planner reservations use the
+   * same HELD → COMMITTED → SETTLED / RELEASED lifecycle with the
+   * planner_run as their canonical evidence anchor. */
+
+  /** Resolve planner pricing for ONE pool candidate through the
+   *  canonical profile chain: model profile (ref_id = model_entry_id —
+   *  the same identity planner_attempt rows bind) → executor profile
+   *  (codex_cli transport → CODEX_EXECUTOR_ID, the real governed
+   *  executor class; every other planner transport →
+   *  PLANNER_EXECUTOR_ID) → UNKNOWN. UNKNOWN is never coerced to FREE. */
+  billingForPlanner(candidate: {
+    model_entry_id: string;
+    transport?: string;
+  }): { mode: BillingMode; profile: Record<string, unknown> | null; unbounded: boolean } {
+    const profile =
+      this.profileFor("model", String(candidate.model_entry_id)) ??
+      this.profileFor(
+        "executor",
+        candidate.transport === "codex_cli" ? CODEX_EXECUTOR_ID : PLANNER_EXECUTOR_ID,
+      );
+    if (!profile) {
+      return { mode: "UNKNOWN", profile: null, unbounded: true };
+    }
+    const mode = String(profile.billing_mode) as BillingMode;
+    if (mode !== "METERED_API") return { mode, profile, unbounded: false };
+    const reserve = Number(profile.reserve_microusd ?? 0);
+    const hasRates =
+      Number(profile.input_microusd_per_mtok ?? 0) > 0 ||
+      Number(profile.output_microusd_per_mtok ?? 0) > 0;
+    const statedFixed = Number(profile.fixed_microusd ?? 0);
+    const bounded = reserve > 0 || (!hasRates && statedFixed > 0);
+    return { mode, profile, unbounded: !bounded };
+  }
+
+  /** Bounded per-provider-request charge for a candidate's resolved
+   *  profile (reserve_microusd wins, else stated fixed fee). */
+  plannerRequestBoundMicrousd(candidate: {
+    model_entry_id: string;
+    transport?: string;
+  }): { per_request_microusd: number; billing: { mode: BillingMode; unbounded: boolean } } {
+    const billing = this.billingForPlanner(candidate);
+    return {
+      per_request_microusd: billing.unbounded ? 0 : this.reserveAmount(billing.profile),
+      billing: { mode: billing.mode, unbounded: billing.unbounded },
+    };
+  }
+
+  /**
+   * Atomic pre-call budget admission for a planner run. Called AFTER
+   * beginPlannerRun (the run row is the evidence anchor) and BEFORE the
+   * first candidate invocation:
+   *   work_item_id absent        → no objective lineage possible →
+   *                                scope NONE, no reservation.
+   *   lineage BROKEN             → FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED.
+   *   no objective claim         → scope NONE, no reservation.
+   *   cap present + unprovable   → FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED.
+   *   attributed + est > cap     → FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED.
+   *   otherwise                  → one HELD planner reservation
+   *                                (CRSV_PLN_<run>) pinning the bounded
+   *                                envelope — idempotent on replay.
+   * The reservation counts toward the SAME objectiveAttributedMicrousd
+   * the governed tasks draw from, so concurrent planner runs and task
+   * dispatches can never silently exceed the objective budget together.
+   */
+  admitPlannerInvocation(input: {
+    planner_run_id: string;
+    /** Delegated-open identity — resolves the objective lineage. */
+    work_item_id?: string | null;
+    /** Bounded envelope: Σ per-request bound × request-count bound over
+     *  every eligible candidate (INITIAL internal calls + REASK). */
+    est_microusd: number;
+    /** Any candidate's pricing UNKNOWN or METERED_API-unbounded. */
+    unbounded_unknown?: boolean;
+    candidates?: number;
+    actor?: string;
+  }): { reservation_id: string | null; scope: "NONE" | "UNCAPPED" | "CAPPED"; objective_id: string | null } {
+    const est = assertMicrousd("est_microusd", input.est_microusd);
+    const wi = input.work_item_id != null ? String(input.work_item_id) : null;
+    if (!wi) {
+      return { reservation_id: null, scope: "NONE", objective_id: null };
+    }
+    const scope = this.objectiveScopeForWorkItemId(wi);
+    if (scope === "BROKEN") {
+      throw new PolicyError(
+        "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+        `planner admission for ${wi}: broken objective lineage`,
+      );
+    }
+    if (!scope) {
+      return { reservation_id: null, scope: "NONE", objective_id: null };
+    }
+    const resId = `CRSV_PLN_${String(input.planner_run_id)}`;
+    return this.store.immediate(() => {
+      const existing = this.store.tryGet("cost_reservation", resId);
+      if (existing) {
+        // Idempotent replay — the committed row is the authority.
+        return {
+          reservation_id: resId,
+          scope: scope.cap !== null ? "CAPPED" : "UNCAPPED",
+          objective_id: scope.objective_id,
+        };
+      }
+      /* AUDIT R2-F2 — canonical Objective budget authority. The
+       * auto-policy cap (limits.budget_microusd_cap) is only ONE of the
+       * two budget authorities; PR #117's canonical authority is the
+       * objective row's own budget{ceiling,consumed} proven by the
+       * strict spend-ledger reconciliation. When the objective row
+       * exists, this seam enforces it INSIDE the reservation txn — a
+       * fresh read at reserve time, so a budget amended while an async
+       * generation is in flight applies to the next admission.
+       *   - ceiling ≤ 0 → OBJECTIVE_ZERO_BUDGET: a hard bound, NEVER
+       *     uncapped/exhausted — blocks every spend-bearing envelope
+       *     (est>0 or unprovable). A provable $0 envelope is the
+       *     explicitly-authorized continuation: it can never spend, so
+       *     it needs no budget — same zero-cap treatment as the
+       *     policy-cap seam.
+       *   - ceiling > 0 → EXHAUSTED/headroom: unbounded envelopes
+       *     cannot be proven within the remaining budget; a bounded
+       *     envelope must fit consumed+outstanding+est ≤ ceiling
+       *     (R3 — HELD/COMMITTED reservations encumber the remaining
+       *     ceiling inside this same txn).
+       * An absent objective row leaves the lineage exactly as before
+       * — the auto-policy cap remains the resolved authority
+       * (existing seam semantics are unchanged there). */
+      const objRow = this.store.tryGet("objective", scope.objective_id) as
+        | (Record<string, unknown> & { version: number })
+        | null;
+      if (objRow) {
+        try {
+          assertCanonicalObjectiveBudget(this.store, objRow);
+        } catch {
+          throw new PolicyError(
+            "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+            `planner admission for ${wi}: canonical objective ` +
+              `${scope.objective_id} budget authority unprovable`,
+          );
+        }
+        const budget = objRow.budget as Record<string, unknown>;
+        const ceiling = Number(budget.ceiling_microusd);
+        const consumed = Number(budget.consumed_microusd);
+        if (ceiling <= 0) {
+          if (est > 0 || input.unbounded_unknown === true) {
+            this.store.event({
+              entity_type: "objective",
+              entity_id: scope.objective_id,
+              event_type: "COST_OBJECTIVE_ZERO_BUDGET",
+              actor: "PAIR_COST_GOVERNANCE",
+              metadata: {
+                scope_type: "objective",
+                scope_id: scope.objective_id,
+                requested_microusd: est,
+                planner_run_id: String(input.planner_run_id),
+              },
+            });
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET",
+              `objective:${scope.objective_id} canonical ceiling=0 — new spend-bearing work is hard-blocked`,
+            );
+          }
+        } else {
+          if (input.unbounded_unknown === true) {
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+              `planner pricing unbounded under objective ${scope.objective_id} canonical budget ceiling`,
+            );
+          }
+          /* AUDIT R3 — consumed alone is NOT the used budget:
+           * outstanding HELD/COMMITTED reservations already encumber
+           * the remaining ceiling, and this check must reconcile them
+           * inside the same atomic admission txn or two 80µ planners
+           * both pass under ceiling=100. RELEASED rows carry no
+           * encumbrance. SETTLED rows need care: their spend is a REAL
+           * liability, but settlePlannerInvocation/settleFromResult can
+           * settle without any canonical spend event landing — so a
+           * settled row is excluded ONLY when its actual cost is provably
+           * inside consumed_microusd. The canonical correlation is
+           * spend_key === reservation_id in the strict-proven
+           * applied_spend_keys ledger (accountBudget is key-idempotent;
+           * the reservation id is its natural idempotent key). A settled
+           * row without that key keeps its settled liability. */
+          const allRes = this.store.list("cost_reservation") as Array<Record<string, unknown>>;
+          const outstanding = this.objectiveAttributedMicrousd(
+            scope.objective_id,
+            allRes.filter((r) => {
+              const st = String(r.status);
+              return st === "HELD" || st === "COMMITTED";
+            }),
+          );
+          const accountedKeys = new Set(
+            ((objRow.applied_spend_keys ?? []) as Array<Record<string, unknown>>)
+              .map((e) => String(e.key)),
+          );
+          const unaccountedSettled = this.objectiveAttributedMicrousd(
+            scope.objective_id,
+            allRes.filter((r) =>
+              String(r.status) === "SETTLED" &&
+              !accountedKeys.has(String(r.reservation_id ?? ""))),
+          );
+          const used = consumed + outstanding + unaccountedSettled;
+          if (used + est > ceiling) {
+            this.store.event({
+              entity_type: "objective",
+              entity_id: scope.objective_id,
+              event_type: "COST_BUDGET_EXCEEDED",
+              actor: "PAIR_COST_GOVERNANCE",
+              metadata: {
+                scope_type: "objective",
+                scope_id: scope.objective_id,
+                consumed_microusd: consumed,
+                outstanding_reserved_microusd: outstanding,
+                unaccounted_settled_microusd: unaccountedSettled,
+                used_microusd: used,
+                requested_microusd: est,
+                max_microusd: ceiling,
+                planner_run_id: String(input.planner_run_id),
+              },
+            });
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
+              `objective:${scope.objective_id} canonical ${consumed}+${outstanding}outstanding+${unaccountedSettled}settled_unaccounted+${est}>${ceiling}`,
+            );
+          }
+        }
+      }
+      if (input.unbounded_unknown && scope.cap !== null) {
+        // An unprovable charge under an objective cap is never $0.
+        throw new PolicyError(
+          "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+          `planner pricing unbounded under objective ${scope.objective_id} cap`,
+        );
+      }
+      if (this.haltActive() && est > 0) {
+        throw new PolicyError("FAIL_CLOSED_COST_HALT", `planner run ${String(input.planner_run_id)}`);
+      }
+      if (scope.cap !== null) {
+        const attributed = this.objectiveAttributedMicrousd(
+          scope.objective_id,
+          this.store.list("cost_reservation"),
+        );
+        if (attributed + est > scope.cap) {
+          this.store.event({
+            entity_type: "objective",
+            entity_id: scope.objective_id,
+            event_type: "COST_BUDGET_EXCEEDED",
+            actor: "PAIR_COST_GOVERNANCE",
+            metadata: {
+              scope_type: "objective",
+              scope_id: scope.objective_id,
+              used_microusd: attributed,
+              requested_microusd: est,
+              max_microusd: scope.cap,
+              planner_run_id: String(input.planner_run_id),
+            },
+          });
+          throw new PolicyError(
+            "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
+            `objective:${scope.objective_id} ${attributed}+${est}>${scope.cap}`,
+          );
+        }
+      }
+      const wRow = this.store.tryGet("work_item", wi) as Record<string, unknown> | null;
+      const row = {
+        schema: COST_SCHEMA,
+        reservation_id: resId,
+        governed_task_id: null,
+        planner_run_id: String(input.planner_run_id),
+        attribution: "planner",
+        work_item_id: wi,
+        objective_id: scope.objective_id,
+        mission_id: null,
+        task_id: null,
+        executor_id: null,
+        route_id: null,
+        business_id: wRow?.business_id != null ? String(wRow.business_id) : null,
+        department: wRow?.department != null ? String(wRow.department) : null,
+        agent_id: null,
+        billing_mode: est > 0 ? "METERED_API" : "UNMETERED",
+        cost_profile_id: null,
+        cost_profile_version: null,
+        cost_profile_digest: null,
+        profile_fixed_microusd: null,
+        profile_input_microusd_per_mtok: null,
+        profile_output_microusd_per_mtok: null,
+        profile_reserve_microusd: null,
+        pricing_source: "planner_envelope",
+        pricing_effective_at: utcnow(),
+        currency: "USD",
+        reserved_microusd: est,
+        settled_microusd: null,
+        usage_state: null,
+        unbounded: input.unbounded_unknown === true,
+        status: "HELD",
+        created_at: utcnow(),
+        updated_at: utcnow(),
+        version: 0,
+      };
+      this.store.put("cost_reservation", resId, row, 0);
+      return {
+        reservation_id: resId,
+        scope: scope.cap !== null ? "CAPPED" : "UNCAPPED",
+        objective_id: scope.objective_id,
+      };
+    });
+  }
+
+  /**
+   * Settle a planner-run reservation from the run's canonical outcome:
+   *   "NO_CALLS"    — the run provably made ZERO provider requests
+   *                   (no STARTED attempt ever invoked planFn) → RELEASED.
+   *   "CALLS_MADE"  — at least one provider request may have spent;
+   *                   actual_microusd settles exactly, unknown usage
+   *                   stays COMMITTED at reserved max (never under-count).
+   */
+  settlePlannerInvocation(
+    reservationId: string,
+    outcome: "CALLS_MADE" | "NO_CALLS",
+    actualMicrousd?: number | null,
+  ): void {
+    const r = this.store.tryGet("cost_reservation", reservationId);
+    if (!r || r.planner_run_id == null) return;
+    if (String(r.status) === "RELEASED" || String(r.status) === "SETTLED") return;
+    if (outcome === "NO_CALLS") {
+      this.transitionIfCurrent(reservationId, ["HELD"], "RELEASED");
+      return;
+    }
+    if (actualMicrousd != null) {
+      assertMicrousd("actual_microusd", actualMicrousd);
+      this.transitionIfCurrent(reservationId, ["HELD", "COMMITTED"], "SETTLED", {
+        settled_microusd: actualMicrousd,
+        usage_state: "ACTUAL_SETTLED",
+      });
+      return;
+    }
+    this.transitionIfCurrent(reservationId, ["HELD", "COMMITTED"], "COMMITTED", {
+      usage_state: "ACTUAL_USAGE_UNKNOWN",
+    });
+  }
+
+  /**
+   * Sweep planner-run reservations: a HELD row settles from its
+   * canonical planner_run row — RUNNING stays HELD (still in flight, or
+   * crashed mid-call — never guessed); a terminal run with proven
+   * provider requests → COMMITTED at reserved; a terminal run with
+   * zero proven provider requests proves no spend → RELEASED; a missing
+   * run row stays conservatively HELD. Mirrors reconcileForTask's
+   * evidence-only rule.
+   *
+   * AUDIT R1 F4 — the discriminator is `provider_requests` (transport-
+   * reported requests that PROVABLY initiated), never the STARTED
+   * attempt-row count: an eligibility-rejected attempt that never
+   * reached a provider provably spent nothing → RELEASED. Run rows
+   * predating the F4 field fall back to the conservative attempts>0
+   * semantics (never under-count ambiguous legacy evidence).
+   */
+  reconcilePlannerInvocations(): number {
+    let touched = 0;
+    for (const r of this.store.list("cost_reservation")) {
+      if (r.planner_run_id == null || String(r.status) !== "HELD") continue;
+      const run = this.store.tryGet("planner_run", String(r.planner_run_id));
+      if (!run || String(run.state) === "RUNNING") continue;
+      const resId = String(r.reservation_id);
+      if (Number(run.provider_requests ?? run.attempts ?? 0) > 0) {
+        this.transitionIfCurrent(resId, ["HELD"], "COMMITTED", {
+          usage_state: "ACTUAL_USAGE_UNKNOWN",
+        });
+      } else {
+        this.transitionIfCurrent(resId, ["HELD"], "RELEASED");
+      }
+      touched += 1;
+    }
+    return touched;
+  }
+
   /* ---------------- crash / reconciliation ------------------------------- */
 
   /**
@@ -1075,6 +1585,10 @@ export class CostService {
       const after = String(this.store.tryGet("cost_reservation", `CRSV_${gtid}`)?.status ?? "");
       if (before !== after) touched += 1;
     }
+    // Phase C — planner-run reservations reconcile from their canonical
+    // planner_run evidence (terminal+proven provider requests →
+    // COMMITTED, terminal+0 → RELEASED, RUNNING/missing → stays HELD).
+    touched += this.reconcilePlannerInvocations();
     return touched;
   }
 

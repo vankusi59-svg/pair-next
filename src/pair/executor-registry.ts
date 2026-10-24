@@ -98,6 +98,16 @@ export const CANONICAL_IDENTITIES: Record<
   },
 };
 
+/** PR #121 — the ONLY executor identities an autonomous Objective pass
+ *  (driver-attributed work) may ever dispatch through. Frozen at the
+ *  identity layer: dashboard executor toggles, adapter composition and
+ *  route edits can never add an id to this set. CODEX bills through its
+ *  ChatGPT subscription session; PAIR_NATIVE through UNMETERED local
+ *  execution. DEVIN / DEEPSEEK_HARNESS are explicitly excluded even when
+ *  ENABLED for manual governed work. */
+export const AUTONOMOUS_EXECUTOR_IDS = ["CODEX", "PAIR_NATIVE"] as const;
+export type AutonomousExecutorId = (typeof AUTONOMOUS_EXECUTOR_IDS)[number];
+
 const IDENTITY_FIELDS = ["logical_provider", "adapter_id", "transport_type"] as const;
 
 const VOLATILE_FIELDS = new Set([
@@ -111,7 +121,8 @@ const VOLATILE_FIELDS = new Set([
   "runtime_version",
 ]);
 
-const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+// Canonical execution-terminal set — mirrors MissionRuntime.TERMINAL_EXECUTION.
+const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
 function sortedStrList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -131,17 +142,19 @@ export class ExecutorRegistry {
       .filter(
         (e) =>
           e.executor_id === executorId &&
-          !EXECUTION_TERMINAL.has(String(e.execution_state)),
+          !EXECUTION_TERMINAL.has(String(e.execution_state)) &&
+          // Phase D §5 / P0-F1 — terminal_outcome is durably settled.
+          !e.terminal_outcome,
       ).length;
   }
 
-  private static availabilityState(record: Record<string, unknown>): string {
+  static availabilityState(record: Record<string, unknown>): string {
     if (record.status === "DISABLED" || record.health_state === "DISABLED") return "DISABLED";
     if (record.health_state === "READY") return "AVAILABLE";
     return "UNKNOWN";
   }
 
-  private static authState(metadata: Record<string, unknown>): string {
+  static authState(metadata: Record<string, unknown>): string {
     if (metadata.auth_state) return String(metadata.auth_state);
     const mode = String(metadata.authentication_mode ?? "").toUpperCase();
     if (["CHATGPT_SESSION", "CLI_SESSION", "AUTHENTICATED"].includes(mode)) return "AUTHENTICATED";
@@ -267,6 +280,61 @@ export class ExecutorRegistry {
 
   describe(executorId: string): Record<string, unknown> {
     return this.normalizeDescriptor(this.store.get("executor", executorId));
+  }
+
+  /**
+   * Executor ON/OFF — the operator intent seam (Executor Management on
+   * the Mission Control dashboard). Flips the durable `status` field the
+   * CapabilityRouter already gates on (`EXECUTOR_DISABLED` is gate #1),
+   * so OFF prevents every NEW dispatch — fresh routes, retries, and
+   * reroutes — while already-proven executions stay history and keep
+   * settling. ON flips status only: capability/health/permission/route
+   * gates still apply on every dispatch. Audited via the canonical
+   * event journal; concurrent flips are OCC-safe (a version-conflicted
+   * write retries the whole transaction, never a lost update).
+   */
+  setExecutorEnabled(
+    executorId: string,
+    enabled: boolean,
+    actor: string,
+  ): Record<string, unknown> {
+    const next = enabled ? "ENABLED" : "DISABLED";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return this.store.immediate(() => {
+          const existing = this.store.get("executor", executorId);
+          const current = String(existing.status ?? "ENABLED");
+          if (current === next) return existing; // idempotent — no event
+          const saved = this.store.put(
+            "executor",
+            executorId,
+            { ...existing, status: next },
+            Number(existing.version),
+          );
+          this.store.event({
+            entity_type: "executor",
+            entity_id: executorId,
+            event_type: enabled ? "EXECUTOR_ENABLED" : "EXECUTOR_DISABLED",
+            old_state: current,
+            new_state: next,
+            actor,
+            metadata: { executor_id: executorId },
+          });
+          return saved;
+        });
+      } catch (error) {
+        // OCC retry: a racing write (registration reconcile, another
+        // toggle) bumps the row between read and CAS — re-read inside a
+        // fresh transaction and retry; persistent conflict fails closed.
+        if (
+          (error as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT" ||
+          attempt === 2
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new IntegrityError("FAIL_CLOSED_VERSION_CONFLICT", executorId);
   }
 
   listDescriptors(): Array<Record<string, unknown>> {

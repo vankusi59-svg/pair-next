@@ -21,7 +21,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError } from "./errors.js";
 import { atomicWriteJson, digest, sha256File, utcnow, workerExecutionId } from "./canonical.js";
+import {
+  codexAuthMode,
+  resolveCodexExecutableSystem,
+  windowsSpawnTarget,
+} from "./codex-cli-transport.js";
 import type { ExecutorAdapter } from "./adapter.js";
+import type { PairEvidenceStore } from "./store.js";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
 import { buildGovernedPrompt, snapshotWorkspace } from "./acp-executor.js";
 
 export const CODEX_EXECUTOR_ID = "CODEX";
@@ -54,6 +61,9 @@ interface CodexExecution {
   finished_at?: string;
   error?: string | null;
   recovered?: boolean;
+  /** Resolved at dispatch from canonical lineage — when true the child
+   *  env is subscription-only (no metered API key inheritance). */
+  autonomous?: boolean;
 }
 
 export function codexRunRoot(journalRoot: string, executionId: string): string {
@@ -78,6 +88,13 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       /** Extra argv inserted before `exec` (e.g. fixture wrappers). */
       executableArgs?: string[];
       envReader?: (name: string) => string | undefined;
+      /** Canonical store seam — resolves driver-attributed provenance
+       *  (mission → bound_open_id → work_open_binding.created_by ===
+       *  DRIVER_ACTOR). Required in any composition that may run
+       *  autonomous work: proven driver lineage strips metered API
+       *  credentials from the child env (subscription-only session
+       *  auth). Absent the store the adapter keeps manual semantics. */
+      store?: PairEvidenceStore;
     },
   ) {}
 
@@ -102,12 +119,11 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
         prefixArgs: this.deps.executableArgs ?? [],
       };
     }
-    try {
-      const resolved = execFileSync("which", ["codex"], { encoding: "utf8" }).trim();
-      return resolved ? { command: resolved, prefixArgs: [] } : null;
-    } catch {
-      return null;
-    }
+    // Executor lane seam: PAIR_CODEX_EXECUTABLE overrides discovery.
+    const configured = this.env("PAIR_CODEX_EXECUTABLE");
+    if (configured) return { command: configured, prefixArgs: [] };
+    const resolved = resolveCodexExecutableSystem((n) => this.env(n));
+    return resolved ? { command: resolved, prefixArgs: [] } : null;
   }
 
   probe(): Record<string, unknown> {
@@ -133,11 +149,18 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     }
     let version: string | null = null;
     try {
+      const vt = windowsSpawnTarget(exe.command, [...exe.prefixArgs, "--version"]);
+      if (!vt) throw new Error("spawn target unsafe");
       version =
-        execFileSync(exe.command, [...exe.prefixArgs, "--version"], {
+        // windowsVerbatimArguments is honored at runtime but absent from
+        // this @types/node's ExecFileSyncOptions — the .cmd COMSPEC line
+        // is pre-quoted and must not gain a Node quoting layer.
+        execFileSync(vt.command, vt.args, {
           encoding: "utf8",
           timeout: 10_000,
-        }).trim() || null;
+          windowsVerbatimArguments: vt.verbatim,
+        } as import("node:child_process").ExecFileSyncOptionsWithStringEncoding,
+        ).trim() || null;
     } catch {
       limitations.push("CODEX_VERSION_CHECK_FAILED");
     }
@@ -270,6 +293,22 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const executionId = workerExecutionId(this.executor_id, governedTaskId);
     const existing = this.executions.get(executionId);
     if (existing) return this.recordFor(existing);
+    // AUDIT R1 F1 — provenance is resolved ONCE at dispatch from
+    // canonical lineage only (never task metadata) and pinned into the
+    // journal: subscription-only autonomous dispatches must not inherit
+    // metered API credentials across respawn/rehydrate ambiguity.
+    const autonomous = this.autonomousProvenance(task);
+    // AUDIT R2 F1 — the autonomous spawn boundary re-proves the session
+    // AUTH MODE live: a ChatGPT tokens session is the only subscription
+    // identity. A persisted API key in auth.json, an absent file, or an
+    // unreadable shape fails closed HERE — at the last authority
+    // crossing before spawn — even with env keys already stripped.
+    // Manual (owner-created) lineage keeps credential forwarding and
+    // never hits this check.
+    if (autonomous && codexAuthMode((n) => this.env(n)) !== "CHATGPT") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CODEX_AUTH_MODE", "autonomous dispatch requires ChatGPT session auth");
+    }
 
     const runRoot = codexRunRoot(this.deps.journalRoot, executionId);
     const journalPath = path.join(runRoot, "execution_journal.json");
@@ -315,6 +354,14 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       "--color", "never",
       "--config", "approval_policy=never",
       "--config", `web_search=${netAllowed ? "live" : "disabled"}`,
+      // Windows-native runtime: --ignore-user-config drops the user's
+      // `[windows] sandbox = "elevated"`, and without it every governed
+      // shell tool call is rejected by policy (CreateProcess blocked).
+      // Re-pinning it explicitly restores governed execution — the
+      // sandbox itself still enforces the permission profile below.
+      ...(process.platform === "win32"
+        ? ["--config", "windows.sandbox='elevated'"]
+        : []),
       ...this.permissionArgs(task, netAllowed),
       "-C", workspace,
       "--output-schema", schemaPath,
@@ -337,6 +384,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       status: "DISPATCHED",
       created_at: utcnow(),
       attempt_id: context?.attempt_id ?? null,
+      autonomous_dispatch: autonomous,
     };
     atomicWriteJson(journalPath, journal);
 
@@ -349,6 +397,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       run_root: runRoot,
       status: "RUNNING",
       started_at: utcnow(),
+      autonomous,
     };
     this.executions.set(executionId, rec);
     void this.runProcess(rec, task, exe.command, args, prompt, before).catch(() => undefined);
@@ -382,11 +431,17 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const timeoutMs = Number(task.timeout ?? this.deps.timeoutSeconds ?? 300) * 1000;
     const events: string[] = [];
     let child: ChildProcess;
+    const target = windowsSpawnTarget(command, args);
+    if (!target) {
+      this.finish(rec, task, before, "FAILED", "CODEX_SPAWN_FAILED:spawn_target_unsafe");
+      return;
+    }
     try {
-      child = spawn(command, args, {
+      child = spawn(target.command, target.args, {
         cwd: String(task.workspace),
-        env: this.childEnv(),
+        env: this.childEnv(rec.autonomous === true),
         stdio: ["pipe", "pipe", "pipe"],
+        windowsVerbatimArguments: target.verbatim,
       });
     } catch (error) {
       this.finish(rec, task, before, "FAILED", `CODEX_SPAWN_FAILED:${(error as Error).message}`);
@@ -420,6 +475,16 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
         }
         resolve({ status: "TIMEOUT", error: "CODEX_TIMEOUT" });
       }, timeoutMs);
+      // Async spawn failure (ENOENT/EACCES resolved AFTER spawn returns
+      // — the normal win32 miss path) must settle the outcome, not hang
+      // until TIMEOUT: settle FAILED immediately.
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        resolve({
+          status: "FAILED",
+          error: `CODEX_SPAWN_FAILED:${(error as Error).message}`.slice(0, 200),
+        });
+      });
       child.on("exit", (code, signal) => {
         clearTimeout(timer);
         if (rec.status === "CANCELLED") {
@@ -436,17 +501,53 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     this.finish(rec, task, before, outcome.status, outcome.error);
   }
 
-  private childEnv(): Record<string, string> {
+  /** AUDIT R1 F1 — autonomous provenance is derived ONLY from trusted
+   *  canonical lineage: mission.bound_open_id → work_open_binding.
+   *  created_by === DRIVER_ACTOR. Caller-supplied task fields are never
+   *  trusted as provenance. A task without provable driver lineage keeps
+   *  manual executor semantics; a canonical lookup failure fails CLOSED
+   *  (credentials stripped) — never a silent metered-key leak. */
+  private autonomousProvenance(task: Record<string, unknown>): boolean {
+    const store = this.deps.store;
+    if (!store) return false;
+    try {
+      const missionId = task.mission_id;
+      if (missionId == null) return false;
+      const mission = store.tryGet("mission", String(missionId));
+      const openId = mission?.bound_open_id;
+      if (openId == null) return false;
+      const wob = store.tryGet("work_open_binding", String(openId));
+      return String(wob?.created_by ?? "") === DRIVER_ACTOR;
+    } catch {
+      return true;
+    }
+  }
+
+  private childEnv(autonomous: boolean): Record<string, string> {
     const env: Record<string, string> = {};
-    for (const k of ["PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH"]) {
+    for (const k of [
+      "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
+      // Windows process essentials — whitelist-forwarded (never ambient):
+      // the child needs SystemRoot for CreateProcess/DNS/TLS internals,
+      // a writable Temp, and its own install/config roots.
+      "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS",
+      "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+      "USERDOMAIN", "APPDATA", "LOCALAPPDATA", "ProgramData", "PUBLIC",
+      "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+    ]) {
       const v = this.env(k);
       if (v) env[k] = v;
     }
     // Donor parity: resolved credentials are pinned into the child env, never
-    // recorded into evidence.
-    for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY"]) {
-      const v = this.env(k);
-      if (v) env[k] = v;
+    // recorded into evidence. AUDIT R1 F1: a driver-attributed (autonomous)
+    // dispatch is subscription-only — metered API keys must NOT cross the
+    // spawn boundary; the child authenticates through the CODEX_HOME
+    // subscription session forwarded above.
+    if (!autonomous) {
+      for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY"]) {
+        const v = this.env(k);
+        if (v) env[k] = v;
+      }
     }
     return env;
   }

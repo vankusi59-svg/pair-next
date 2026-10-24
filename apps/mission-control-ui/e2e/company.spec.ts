@@ -278,6 +278,9 @@ test("legacy routes keep the old 401 window.prompt behavior", async ({ page }) =
     route.fulfill({ status: 401, contentType: "application/json",
       body: JSON.stringify({ error: "UNAUTHORIZED", detail: "invalid token" }) }));
   await seedSession(page);
+  // P15.9-A2: legacy api client lives behind the explicit rollback flag on
+  // production builds.
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/");
   // legacy api client still invokes the token prompt on 401 (returns null = cancel)
   await expect.poll(() =>

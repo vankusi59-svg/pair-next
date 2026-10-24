@@ -172,6 +172,33 @@ function assertOptStr(field: string, value: unknown): string | null {
   return assertStr(field, value);
 }
 
+/* Refs that must never become an owner_authority_id — String()-coercion
+   artifacts minted at any edge (missing header/body, object values).
+   Mirror of mission-control-server's OPERATOR_COERCION_ARTIFACTS: the
+   canonical layer enforces the shape so NO caller — HTTP or service —
+   can mint an unclaimable owner (R2 M1′). */
+const OWNER_REF_ARTIFACTS = new Set([
+  "", "undefined", "null", "NaN", "Infinity", "[object Object]",
+]);
+
+/** Owner authority must be `operator:<ref>` — a whitespace-free,
+ *  non-artifact ref. An owner that is not exactly this shape is
+ *  permanently UNCLAIMABLE (every actor edge canonicalizes to
+ *  operator:<x>, and coercion-artifact refs are rejected there), so
+ *  minting one orphans the objective forever — even amend() could not
+ *  repair it because assertOwner requires the unreachable actor. */
+export function assertOwnerAuthorityRef(field: string, value: unknown): string {
+  const s = assertStr(field, value);
+  const ref = s.startsWith("operator:") ? s.slice("operator:".length) : null;
+  if (ref === null || !ref || /\s/.test(ref) || OWNER_REF_ARTIFACTS.has(ref)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_OBJECTIVE_FIELD",
+      `${field} must be operator:<ref> — a non-canonical owner is permanently unclaimable`,
+    );
+  }
+  return s;
+}
+
 function assertNum(field: string, value: unknown): number {
   const n = Number(value);
   if (!Number.isFinite(n)) {
@@ -276,7 +303,7 @@ function normalizeKpis(
 
 /** Terms identity — the digest domain. Mutable progress/budget/status
  *  fields are deliberately outside it. */
-function termsOf(row: Row): Record<string, unknown> {
+export function termsOf(row: Row): Record<string, unknown> {
   const budget = (row.budget ?? {}) as Record<string, unknown>;
   return {
     title: row.title,
@@ -439,6 +466,43 @@ export class ObjectiveAuthorityService {
     const all = this.store.list(OBJECTIVE_ENTITY);
     return (businessId ? all.filter((o) => String(o.business_id) === businessId) : all)
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  }
+
+  /** Strict org-wide enumeration for scope-proven read projections
+   *  (company cockpit, business portfolio). Enumerates by PERSISTED
+   *  entity key — entityPage proves stored entity_id ↔ payload.entity_id
+   *  ↔ payload_hash ↔ version consistent — then strict-reads EVERY
+   *  actual stored row by its proven key and requires the canonical
+   *  payload objective_id to equal that key. A tampered or forged
+   *  objective ANYWHERE fails the whole enumeration closed: an honest
+   *  scope proof cannot silently omit a corrupt row (filtering by
+   *  payload claims first would let forged business_id/owner rows
+   *  evade validation entirely). Callers filter the returned rows by
+   *  their scope — the enumeration itself proves the org-wide set. */
+  strictEnumerate(): Row[] {
+    const out: Row[] = [];
+    let after = "";
+    for (;;) {
+      const page = this.store.entityPage<Row>({
+        entity_type: OBJECTIVE_ENTITY,
+        after_id: after,
+        limit: 1024,
+      });
+      if (page.length === 0) break;
+      for (const p of page) {
+        const key = String(p.entity_id); // proven === persisted key
+        const strict = this.get(key) as Row;
+        if (String(strict.objective_id) !== key) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_IDENTITY",
+            `${key}: payload objective_id=${String(strict.objective_id)}`,
+          );
+        }
+        out.push(strict);
+      }
+      after = String(page[page.length - 1]!.entity_id);
+    }
+    return out;
   }
 
   /** Canonical row contract — recomputed digest must self-verify AND
@@ -681,11 +745,18 @@ export class ObjectiveAuthorityService {
     // persisted under the old double-prefix convention are NOT
     // silently re-aliased — their stored owner stays canonical truth.
     const rawOperator = assertStr("operator_id", input.operator_id);
-    const ownerAuthority = input.owner_authority_id
-      ? assertStr("owner_authority_id", input.owner_authority_id)
-      : rawOperator.startsWith("operator:")
-        ? rawOperator
-        : `operator:${rawOperator}`;
+    // The FINAL owner is shape-gated either way — explicit
+    // owner_authority_id AND the operator-derived default. A garbage
+    // input at either field mints a permanently-unclaimable row, so
+    // both paths run the same canonical gate (R2 M1′).
+    const ownerAuthority = assertOwnerAuthorityRef(
+      "owner_authority_id",
+      input.owner_authority_id
+        ? input.owner_authority_id
+        : rawOperator.startsWith("operator:")
+          ? rawOperator
+          : `operator:${rawOperator}`,
+    );
     // F11 — the creator actor canonicalizes on the same once-only rule,
     // kept DISTINCT from ownerAuthority: an explicit owner_authority_id
     // must not leak into `actor` (creator ≠ owner is a real contract).
@@ -1069,14 +1140,23 @@ export class ObjectiveAuthorityService {
    */
   amend(
     objectiveId: string,
-    input: { business_id: string; patch: Record<string, unknown>; reason?: string; actor: string },
+    input: { business_id: string; patch: Record<string, unknown>; reason?: string; actor: string; idempotency_key?: string },
   ): Row {
     if (!input.actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective.amend");
     const businessId = assertStr("business_id", input.business_id);
     if (!input.patch || typeof input.patch !== "object" || Array.isArray(input.patch)) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must be an object");
     }
-    for (const k of Object.keys(input.patch)) {
+    const patchKeys = Object.keys(input.patch);
+    // A patch with no EFFECTIVE key is NOT an amendment — committing
+    // it would bump terms_version + rebind objective_digest
+    // (invalidating every pinned review/policy grant) while changing
+    // nothing. Keys present-but-undefined (service callers can send
+    // them; JSON cannot) are vacuous the same way.
+    if (!patchKeys.length || patchKeys.every((k) => input.patch[k] === undefined)) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must name at least one key");
+    }
+    for (const k of patchKeys) {
       if (!AMENDABLE_KEYS.has(k)) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TERMS", `not owner-amendable: ${k}`);
       }
@@ -1088,6 +1168,49 @@ export class ObjectiveAuthorityService {
       this.assertOwner(row, input.actor);
       this.assertNotTerminal(row);
       const patch = input.patch;
+      /* Idempotent amend (R2 M2′): recordProgress/attachEvidence dedup
+         on evidence_key; amendments had NO anchor — an ambiguous
+         retry after a committed-but-lost response would double-commit
+         (terms_version +2, every pinned review/policy invalidated
+         twice). A caller-supplied idempotency_key replays against the
+         LAST committed amendment: same key + same patch digest is an
+         idempotent no-op, same key + different patch is a typed
+         conflict — never a silent double-commit. Callers that send no
+         key (or an empty key — normalized away, never aliased to the
+         unkeyed null sentinel) keep the original always-commit
+         semantics.
+         Dedup window is ONE amendment deep: an older key retried after
+         a different amendment committed is treated as a NEW operation
+         and re-applies its patch — honest "latest-key replay", not a
+         full ledger (bounded ledgers already exist for evidence/spend
+         where collisions matter more). Replay is evaluated AFTER
+         scope/owner/terminal gates: a foreign or expired caller can
+         never probe whether a key committed — authz leaks nothing. */
+      const idemKey = input.idempotency_key || undefined;
+      if (idemKey !== undefined) {
+        const last = (row.last_amendment ?? null) as Record<string, unknown> | null;
+        if (last && last.idempotency_key === idemKey) {
+          let patchDigest: string;
+          try {
+            patchDigest = digest(patch);
+          } catch {
+            // Non-canonical patch values (e.g., NaN reachable only from
+            // a service caller — JSON cannot carry them) fail as the
+            // typed field error the validators would have produced.
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_FIELD",
+              "patch contains non-canonical values",
+            );
+          }
+          if (last.patch_digest === patchDigest) {
+            return row; // exact replay — never double-commits
+          }
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_AMEND_CONFLICT",
+            `${objectiveId}: idempotency_key ${idemKey} reused with different patch`,
+          );
+        }
+      }
       if (patch.title !== undefined) row.title = assertStr("title", patch.title).trim();
       if (patch.description !== undefined) row.description = assertStr("description", patch.description, { empty: true });
       if (patch.statement !== undefined) row.statement = assertOptStr("statement", patch.statement);
@@ -1128,7 +1251,7 @@ export class ObjectiveAuthorityService {
       if (patch.hard_constraints !== undefined) row.hard_constraints = normalizeStringList("hard_constraints", patch.hard_constraints);
       if (patch.success_conditions !== undefined) row.success_conditions = normalizeStringList("success_conditions", patch.success_conditions);
       if (patch.stop_conditions !== undefined) row.stop_conditions = normalizeStringList("stop_conditions", patch.stop_conditions);
-      if (patch.owner_authority_id !== undefined) row.owner_authority_id = assertStr("owner_authority_id", patch.owner_authority_id);
+      if (patch.owner_authority_id !== undefined) row.owner_authority_id = assertOwnerAuthorityRef("owner_authority_id", patch.owner_authority_id);
       row.terms_version = Number(row.terms_version) + 1;
       row.amendment_seq = Number(row.amendment_seq) + 1;
       row.last_amendment = {
@@ -1137,6 +1260,8 @@ export class ObjectiveAuthorityService {
         reason: input.reason ?? null,
         at: utcnow(),
         keys: Object.keys(patch),
+        idempotency_key: idemKey ?? null,
+        patch_digest: digest(patch),
       };
       row.objective_digest = objectiveDigest({
         objective_id: String(row.objective_id),
@@ -1246,4 +1371,120 @@ export class ObjectiveAuthorityService {
     };
     return out;
   }
+}
+
+/* --------------------------------------------------------------------
+ * Canonical budget re-proof — moved here from objective-adaptive-review
+ * for AUDIT R2-F2: cost admission must consult the canonical objective
+ * budget authority, and cost.ts cannot import the adaptive-review
+ * module (its ceo-runtime dependency chain creates an import cycle).
+ * objective-authority is a leaf module — the same strict proof now
+ * lives beside spendSemantics and is re-exported through
+ * objective-adaptive-review for the existing P15.5 callers.
+ * ------------------------------------------------------------------ */
+
+function budgetProofFail(detail: string): never {
+  // Same fail-closed code the P15.5 adaptive-review caller relies on.
+  throw new IntegrityError("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW", detail);
+}
+
+/** Re-prove that `budget.consumed_microusd` on a strict-read Objective is
+ *  backed by the immutable canonical spend-event chain, not merely a
+ *  field on the row.
+ *
+ *  - every spend event carries {spend_key, amount_microusd,
+ *    consumed_microusd} where consumed equals the cumulative sum;
+ *  - the applied_spend_keys ledger mirrors the event chain exactly
+ *    (no missing authority, no extra keys);
+ *  - each ledger digest equals spendSemantics(objective_id, {spend_key,
+ *    amount_microusd}) — the only recognized spend authority;
+ *  - the cumulative sum equals the current consumed_microusd.
+ *
+ *  Any malformed shape, untrusted evidence, or chain mismatch throws —
+ *  consumed_microusd cannot affect P15.5/CEO reasoning unproven. */
+export function assertCanonicalObjectiveBudget(
+  store: PairEvidenceStore,
+  objective: Row,
+): void {
+  const oid = String(objective.objective_id);
+  const budget = objective.budget as Record<string, unknown> | undefined;
+  if (!budget ||
+      !Number.isInteger(budget.ceiling_microusd) ||
+      !Number.isInteger(budget.consumed_microusd) ||
+      Number(budget.ceiling_microusd) < 0 ||
+      Number(budget.consumed_microusd) < 0 ||
+      Number(budget.consumed_microusd) > Number(budget.ceiling_microusd)) {
+    budgetProofFail(`objective ${oid}: budget shape/ceiling invalid`);
+  }
+  const rawLedger = objective.applied_spend_keys;
+  const ledger: Array<{ key: string; digest: string }> = [];
+  if (rawLedger !== undefined && rawLedger !== null) {
+    if (!Array.isArray(rawLedger)) {
+      budgetProofFail(`objective ${oid}: applied_spend_keys malformed`);
+    }
+    for (const e of rawLedger as Array<Record<string, unknown>>) {
+      if (typeof e !== "object" || e === null ||
+          typeof e.key !== "string" || e.key === "" ||
+          typeof e.digest !== "string" || e.digest === "") {
+        budgetProofFail(`objective ${oid}: applied_spend_keys entry malformed`);
+      }
+      ledger.push({ key: e.key, digest: e.digest });
+    }
+  }
+  const events = listAccountedSpendEvents(store, oid);
+  // Every spend_key is unique and cumulative consumed is monotone
+  // consistent through the immutable event chain.
+  const byKey = new Map<string, { amount: number; consumed: number }>();
+  let running = 0;
+  for (const e of events) {
+    const md = e.metadata as Record<string, unknown> | null;
+    if (!md || typeof md.spend_key !== "string" || md.spend_key === "" ||
+        !Number.isInteger(md.amount_microusd) ||
+        Number(md.amount_microusd) < 0 ||
+        !Number.isInteger(md.consumed_microusd)) {
+      budgetProofFail(`objective ${oid}: malformed spend event authority`);
+    }
+    const key = String(md.spend_key);
+    if (byKey.has(key)) {
+      budgetProofFail(`objective ${oid}: duplicate spend_key authority ${key}`);
+    }
+    running += Number(md.amount_microusd);
+    if (Number(md.consumed_microusd) !== running) {
+      budgetProofFail(
+        `objective ${oid}: spend event cumulative mismatch at ${key}`);
+    }
+    byKey.set(key, { amount: Number(md.amount_microusd), consumed: running });
+  }
+  if (running !== Number(budget.consumed_microusd)) {
+    budgetProofFail(
+      `objective ${oid}: consumed=${String(budget.consumed_microusd)} ` +
+      `but canonical spend chain totals ${running}`);
+  }
+  // The ledger must mirror the event chain exactly — no missing spend
+  // authority, no extra keys.
+  if (ledger.length !== events.length) {
+    budgetProofFail(`objective ${oid}: spend ledger/event count mismatch`);
+  }
+  for (const entry of ledger) {
+    const e = byKey.get(entry.key);
+    if (!e) {
+      budgetProofFail(`objective ${oid}: ledger key ${entry.key} has no spend event`);
+    }
+    const expected = spendSemantics(oid, {
+      spend_key: entry.key,
+      amount_microusd: e!.amount,
+      // A note is not part of persisted event evidence — a spend that
+      // used one cannot be re-proven here and fails closed.
+      note: undefined,
+    });
+    if (entry.digest !== expected) {
+      budgetProofFail(`objective ${oid}: spend digest mismatch for ${entry.key}`);
+    }
+  }
+}
+
+function listAccountedSpendEvents(store: PairEvidenceStore, oid: string) {
+  // listEvents already orders by the immutable seq column.
+  return store.listEvents(OBJECTIVE_ENTITY, oid)
+    .filter((e) => String(e.event_type) === "OBJECTIVE_BUDGET_ACCOUNTED");
 }

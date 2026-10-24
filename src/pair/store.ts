@@ -165,6 +165,14 @@ export class PairEvidenceStore {
     this.readBudget[kind] -= count;
   }
 
+  /** Remaining charged-read budget of the current proof scope, or null
+   *  when unscoped. Lets a bounded loop stop speculative work before the
+   *  budget trips — exhausting it mid-transaction would roll back
+   *  progress that must stay durable. */
+  readBudgetRemaining(): { entities: number; events: number } | null {
+    return this.readBudget ? { ...this.readBudget } : null;
+  }
+
   private pageLimit(limit: number): number {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
       throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "limit");
@@ -173,13 +181,31 @@ export class PairEvidenceStore {
   }
 
   private verifiedEvent(row: Record<string, unknown>): Record<string, unknown> {
-    const metadata = row.metadata_json ? JSON.parse(String(row.metadata_json)) : null;
+    let metadata: unknown = null;
+    if (row.metadata_json) {
+      try {
+        metadata = JSON.parse(String(row.metadata_json));
+      } catch {
+        // Unparseable metadata is event corruption — carry the event
+        // id so callers can isolate it, never a bare SyntaxError.
+        throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
+      }
+    }
     const body = {
       event_id: row.event_id, entity_type: row.entity_type, entity_id: row.entity_id,
       event_type: row.event_type, old_state: row.old_state, new_state: row.new_state,
       actor: row.actor, correlation_id: row.correlation_id, metadata, created_at: row.created_at,
     };
-    if (digest(body) !== row.event_hash) {
+    let mismatch: boolean;
+    try {
+      // digest() itself throws on undigestable content (non-finite
+      // numbers, pathological nesting) — that is unverifiable, i.e. a
+      // mismatch, never a raw crash.
+      mismatch = digest(body) !== row.event_hash;
+    } catch {
+      mismatch = true;
+    }
+    if (mismatch) {
       throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
     }
     return { ...row, metadata };
@@ -229,9 +255,23 @@ export class PairEvidenceStore {
       .all(...args) as Record<string, unknown>[];
     this.charge("entities", rows.length);
     return rows.map(row => {
-      const payload = JSON.parse(String(row.payload)) as T & { version: number };
-      if (digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
-          payload.entity_type !== input.entity_type || payload.version !== row.version) {
+      let payload: T & { version: number };
+      try {
+        payload = JSON.parse(String(row.payload)) as T & { version: number };
+      } catch {
+        // An unparseable payload is corruption like any other — carry
+        // the key so paged consumers can isolate-and-skip it.
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
+      }
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
+          payload.entity_type !== input.entity_type || payload.version !== row.version;
+      } catch {
+        mismatch = true; // undigestable is unverifiable — classify, don't crash
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
       }
       return payload;
@@ -355,8 +395,26 @@ export class PairEvidenceStore {
     if (!row) {
       throw new NotFoundError(`${entityType}:${entityId}`);
     }
-    const payload = JSON.parse(row.payload) as T;
-    if (digest(payload) !== row.payload_hash) {
+    let payload: T;
+    try {
+      payload = JSON.parse(row.payload) as T;
+    } catch {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+        `${entityType}:${entityId}`,
+      );
+    }
+    // 'null'/'5'/[] parse fine and digest fine — a non-object payload
+    // is corruption, not a valid entity body (avoids null.property
+    // crashes typed as raw TypeErrors downstream).
+    let mismatch: boolean;
+    try {
+      mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+        digest(payload) !== row.payload_hash;
+    } catch {
+      mismatch = true;
+    }
+    if (mismatch) {
       throw new IntegrityError(
         "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
         `${entityType}:${entityId}`,
@@ -387,8 +445,20 @@ export class PairEvidenceStore {
       .all(...(this.readBudget ? [entityType, this.readBudget.entities + 1] : [entityType])) as Array<{ payload: string; payload_hash: string }>;
     this.charge("entities", rows.length);
     return rows.map((row) => {
-      const payload = JSON.parse(row.payload) as T;
-      if (digest(payload) !== row.payload_hash) {
+      let payload: T;
+      try {
+        payload = JSON.parse(row.payload) as T;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
+      }
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityType);
       }
       return payload as T & { version: number };
@@ -470,6 +540,21 @@ export class PairEvidenceStore {
     return rows.map(row => this.verifiedEvent(row));
   }
 
+  /** seq-cursor page: the SSE delta path must bound its read, never
+   *  materialize the whole journal per poll. */
+  listEventsSince(sinceSeq: number, limit = 1024): Array<Record<string, unknown>> {
+    const lim = this.pageLimit(limit);
+    if (!Number.isSafeInteger(sinceSeq) || sinceSeq < 0) {
+      throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "event cursor");
+    }
+    const materialize = this.readBudget ? Math.min(lim, this.readBudget.events + 1) : lim;
+    const rows = this.db
+      .prepare("SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?")
+      .all(sinceSeq, materialize) as Array<Record<string, unknown>>;
+    this.charge("events", rows.length);
+    return rows.map(row => this.verifiedEvent(row));
+  }
+
   appendEvidence(
     missionId: string,
     kind: string,
@@ -496,8 +581,20 @@ export class PairEvidenceStore {
       Record<string, unknown>
     >;
     return rows.map((row) => {
-      const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
-      if (digest(payload) !== row.payload_hash) {
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
+      }
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_EVIDENCE_HASH_MISMATCH", String(row.evidence_id));
       }
       return { ...row, payload };
@@ -565,8 +662,20 @@ export class PairEvidenceStore {
       )
       .all(missionId) as Array<{ payload: string; payload_hash: string }>;
     return rows.map((row) => {
-      const payload = JSON.parse(row.payload) as Record<string, unknown>;
-      if (digest(payload) !== row.payload_hash) {
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
+      }
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError("FAIL_CLOSED_PLAN_REVISION_HASH_MISMATCH", missionId);
       }
       return payload;
@@ -588,8 +697,23 @@ export class PairEvidenceStore {
       .prepare(`SELECT entity_type, entity_id, payload, payload_hash FROM ${table}`)
       .all() as Array<Record<string, unknown>>;
     for (const row of rows) {
-      const payload = JSON.parse(String(row.payload));
-      if (digest(payload) !== row.payload_hash) {
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(String(row.payload));
+      } catch {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+          `${row.entity_type}:${row.entity_id}`,
+        );
+      }
+      let mismatch: boolean;
+      try {
+        mismatch = payload === null || typeof payload !== "object" || Array.isArray(payload) ||
+          digest(payload) !== row.payload_hash;
+      } catch {
+        mismatch = true;
+      }
+      if (mismatch) {
         throw new IntegrityError(
           "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
           `${row.entity_type}:${row.entity_id}`,

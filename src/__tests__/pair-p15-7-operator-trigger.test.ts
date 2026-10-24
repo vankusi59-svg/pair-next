@@ -99,7 +99,21 @@ function freshFullStack(name: string): FullStack {
     reconciliation: recon, observability, planner,
   });
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  // Phase C — every delegated open plans through the shared async
+  // Planner Pool seam; tests stub it with a canonical llm_plan.
+  const biz = new BusinessLayer({
+    store, control, schedules,
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata ?? {}),
+          llm_plan: [{ task_id: "T1", title: "t", instructions: "t", required_capabilities: [] }],
+          plan_source: "LLM",
+        },
+      },
+    }),
+  });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });

@@ -75,7 +75,12 @@ function makeCtx(n: string, opts: {
   const project = service.createProject({ name: n, root_location: workspace });
   const conv = new ConversationSessionService(store);
   const drafts = new MissionDraftService({
-    conversation: conv, control, store, ...(opts.now ? { now: opts.now } : {}),
+    conversation: conv, control, store,
+    // Phase C — the draft plans through the SAME async Planner Pool
+    // seam; this stub passes the input through so the sync test
+    // `planner` (deps.planner) still emits the plan at preview.
+    planExpander: async (input) => ({ input }),
+    ...(opts.now ? { now: opts.now } : {}),
   });
   return {
     dir, dbPath, workspace, store, service, control, conv, drafts,
@@ -385,7 +390,7 @@ describe("P15.8-C — mission confirmation", () => {
     // New service instances over the same db.
     const store2 = new PairEvidenceStore(ctx.dbPath);
     const conv2 = new ConversationSessionService(store2);
-    const drafts2 = new MissionDraftService({ conversation: conv2, control: ctx.control, store: store2 });
+    const drafts2 = new MissionDraftService({ conversation: conv2, control: ctx.control, store: store2, planExpander: async (input) => ({ input }) });
     const row = drafts2.getDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
     expect(row.state).toBe("CONFIRMED");
     expect(row.mission_id).toBe(r.mission_id);
@@ -646,7 +651,7 @@ describe("P15.8-C — mission confirmation", () => {
     spy.mockRestore();
     // B — a second service over the same store — resumes and settles.
     const convB = new ConversationSessionService(ctx.store);
-    const draftsB = new MissionDraftService({ conversation: convB, control: ctx.control, store: ctx.store });
+    const draftsB = new MissionDraftService({ conversation: convB, control: ctx.control, store: ctx.store, planExpander: async (input) => ({ input }) });
     const rb = await draftsB.confirmDraft({
       session_id: sid, operator_id: OP,
       draft_id: d.draft_id, expected_digest: d.draft_digest,

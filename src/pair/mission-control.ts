@@ -28,6 +28,7 @@ import type { ReconciliationService } from "./reconciliation.js";
 import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
+import { ExecutorRegistry } from "./executor-registry.js";
 import { projectRoutableModels } from "./model-routable.js";
 import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
@@ -37,6 +38,7 @@ import {
   detectTelegramDeliveryIntent,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
+import { operatorGoalOf } from "./goal-contract.js";
 import {
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
@@ -459,10 +461,13 @@ export class MissionControl {
 
   /** §4.1 — canonical entity events after `sinceSeq` (hash-verified on read).
    *  Drives the SSE stream; returns latest_seq so cursors don't regress. */
-  eventsSince(sinceSeq = 0): { events: Array<Record<string, unknown>>; latest_seq: number } {
-    const all = this.store.listEvents();
-    const latest = all.length ? Number(all[all.length - 1].seq ?? 0) : sinceSeq;
-    return { events: all.filter((e) => Number(e.seq ?? 0) > sinceSeq), latest_seq: latest };
+  eventsSince(sinceSeq = 0, limit = 1024): { events: Array<Record<string, unknown>>; latest_seq: number } {
+    const events = this.store.listEventsSince(sinceSeq, limit);
+    // high-water delivered: a full page means more rows remain, so the
+    // cursor lands on the last row actually sent and the client keeps
+    // paging instead of silently skipping the journal middle.
+    const latest = events.length ? Number(events[events.length - 1]!.seq ?? 0) : sinceSeq;
+    return { events, latest_seq: latest };
   }
 
   timeline(missionId: string) {
@@ -475,6 +480,90 @@ export class MissionControl {
       executors: this.store.list("executor"),
       routes: this.store.list("route"),
       bindings: this.store.list("executor_binding"),
+    };
+  }
+
+  /** Executor ON/OFF — the operator mutation seam. Delegates to the
+   *  canonical ExecutorRegistry intent method (audited, OCC-safe);
+   *  this layer never flips a row directly. */
+  setExecutorEnabled(
+    executorId: string,
+    enabled: boolean,
+    operatorId: string,
+  ): Record<string, unknown> {
+    return new ExecutorRegistry(this.deps.service).setExecutorEnabled(
+      executorId,
+      enabled,
+      `operator:${operatorId}`,
+    );
+  }
+
+  /**
+   * Executor Management projection — one row per supported executor id
+   * plus any extra registered executor. The registry row (operator
+   * intent + qualification + availability) is authoritative; the router
+   * and GovernedTaskGate independently enforce `status`. `bound` marks
+   * whether an adapter instance exists IN THIS PROCESS — an enabled
+   * executor that isn't adapter-bound can never dispatch until the
+   * bootstrap reconfigures and restarts, so the UI surfaces it as
+   * requires_restart rather than implying the toggle alone suffices.
+   * Hermes is intentionally absent (not integrated).
+   */
+  executors(boundExecutorIds: string[] = []): {
+    executors: Array<Record<string, unknown>>;
+  } {
+    const bound = new Set(boundExecutorIds);
+    const registry = new ExecutorRegistry(this.deps.service);
+    const rows = new Map(
+      this.store.list("executor").map((r) => [String(r.executor_id), r]),
+    );
+    const SUPPORTED: Array<[string, string]> = [
+      ["PAIR_NATIVE", "local deterministic worker"],
+      ["CODEX", "runs the local Codex CLI harness (requires CODEX_HOME)"],
+      ["DEVIN", "remote Devin executor (requires PAIR_DEVIN_API_KEY)"],
+      ["DEEPSEEK_HARNESS", "runs the local DeepSeek Harness (requires PAIR_DSH_HOME)"],
+    ];
+    const hintOf = (id: string) =>
+      SUPPORTED.find(([i]) => i === id)?.[1] ?? "unknown executor";
+    const missingOf = (
+      id: string,
+      row: Record<string, unknown> | undefined,
+      desc: Record<string, unknown> | undefined,
+    ): string[] => {
+      if (!row || !desc) return [`not registered — ${hintOf(id)}`];
+      const missing: string[] = [];
+      if (String(desc.qualification_state) !== "QUALIFIED") {
+        const q = (row.metadata as Record<string, unknown> | undefined)?.qualification as
+          | Record<string, unknown>
+          | undefined;
+        const reasons = Array.isArray(q?.reasons) ? q!.reasons : [];
+        if (reasons.length) missing.push(...reasons.map(String));
+        else missing.push("not qualified");
+      }
+      if (String(desc.auth_state) === "AUTH_REQUIRED") missing.push("authentication required");
+      if (!bound.has(id)) missing.push("no adapter bound this process");
+      return missing;
+    };
+    const ids = new Set<string>([...SUPPORTED.map(([id]) => id), ...rows.keys()]);
+    return {
+      executors: [...ids].map((id) => {
+        const row = rows.get(id);
+        // Volatile fields (qualification/auth/availability) are derived
+        // by the descriptor — never trusted from the raw row.
+        const desc = row ? registry.describe(id) : undefined;
+        return {
+          executor_id: id,
+          registered: row != null,
+          enabled: row != null && String(row.status) !== "DISABLED",
+          status: row != null ? String(row.status ?? "ENABLED") : "UNREGISTERED",
+          availability_state: desc ? String(desc.availability_state ?? "UNAVAILABLE") : "UNAVAILABLE",
+          qualification_state: desc ? String(desc.qualification_state ?? "UNQUALIFIED") : "UNQUALIFIED",
+          health_state: desc ? String(desc.health_state ?? "UNKNOWN") : "UNKNOWN",
+          bound: bound.has(id),
+          requires_restart: row != null && !bound.has(id),
+          missing_prerequisites: missingOf(id, row, desc),
+        };
+      }),
     };
   }
 
@@ -585,6 +674,8 @@ export class MissionControl {
   previewMission(input: {
     project_id: string;
     goal: string;
+    /** R1 — provenance-bound operator request (defaults to `goal`). */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -605,6 +696,7 @@ export class MissionControl {
       mission_id: "__preview__",
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoalOf(input),
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
@@ -684,6 +776,11 @@ export class MissionControl {
     input: {
       project_id: string;
       goal: string;
+      /** R1 — provenance-bound operator request: the only text that may
+       *  mint contract/delivery/language/network authority. Persisted
+       *  into `mission_input` and digest-bound so confirm replays the
+       *  same authority. Defaults to `goal` (direct submissions). */
+      operator_goal?: string | null;
       metadata?: Record<string, unknown>;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -714,10 +811,16 @@ export class MissionControl {
     }
     const workspaces = this.normalizeMissionWorkspaces(input);
     const risk = canonicalRiskCeiling(input.risk_ceiling);
+    // R1 — resolve the operator authority ONCE: the same text drives
+    // planning (pseudoMission), the delivery/language re-proof below,
+    // the digest binding, and the persisted mission_input confirm
+    // replays. Never the envelope.
+    const operatorGoal = operatorGoalOf(input);
     const pseudoMission: Record<string, unknown> = {
       mission_id: "__preview__",
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoal,
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
@@ -736,12 +839,13 @@ export class MissionControl {
     // (intent↔presence + instruction hygiene) is re-proven with the
     // operator request before the preview is pinned.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(input.goal),
-      outputLanguage: detectOutputLanguage(input.goal),
+      telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+      outputLanguage: detectOutputLanguage(operatorGoal),
     });
     const eid = effectiveInputDigest({
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoal,
       granted_permissions: input.granted_permissions,
       authorized_workspaces: workspaces,
       risk_ceiling: risk,
@@ -761,6 +865,7 @@ export class MissionControl {
       missionInput: {
         project_id: input.project_id,
         goal: input.goal,
+        operator_goal: operatorGoal,
         metadata: input.metadata ?? {},
         granted_permissions: input.granted_permissions ?? [],
         authorized_workspaces: workspaces,
@@ -786,8 +891,18 @@ export class MissionControl {
       planner_run_id: row.planner_run_id ?? null,
       expires_at: row.expires_at,
       state: row.state,
-      plan_source: plannerEvidence?.winner ? "LLM" : "TEMPLATE",
-      plan_model: plannerEvidence?.winner?.model ?? null,
+      // Phase C — the TEMPLATE source is gone: a preview that reached
+      // persistence was produced by authorized planning (pool winner
+      // evidence, or an authorized llm_plan carried in metadata — the
+      // sync planner fails closed on anything else above).
+      plan_source:
+        plannerEvidence?.winner || (input.metadata?.llm_plan as unknown[] | undefined)?.length
+          ? "LLM"
+          : ((input.metadata?.plan_source as string | undefined) ?? "LLM"),
+      plan_model:
+        plannerEvidence?.winner?.model ??
+        (input.metadata?.plan_model as string | undefined) ??
+        null,
       warnings: plannerEvidence?.warnings ?? [],
     };
   }
@@ -835,8 +950,8 @@ export class MissionControl {
       assertPlanDataflow(
         v.preview.canonical_tasks as Array<Record<string, unknown>>,
         {
-          telegramIntent: detectTelegramDeliveryIntent(mi.goal),
-          outputLanguage: detectOutputLanguage(mi.goal),
+          telegramIntent: detectTelegramDeliveryIntent(operatorGoalOf(mi)),
+          outputLanguage: detectOutputLanguage(operatorGoalOf(mi)),
         },
       );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
@@ -868,6 +983,10 @@ export class MissionControl {
       const mission = this.createMissionFromPreview({
         project_id: String(mi.project_id),
         goal: String(mi.goal),
+        // R1 — replay the digest-bound operator authority verbatim
+        // (pre-fix previews have no field → mission.goal is authority,
+        // identical to how it was planned).
+        operator_goal: mi.operator_goal != null ? String(mi.operator_goal) : null,
         metadata,
         granted_permissions: (mi.granted_permissions as string[] | undefined) ?? [],
         authorized_workspaces: authorizedWorkspaces,
@@ -893,6 +1012,7 @@ export class MissionControl {
   private createMissionFromPreview(input: {
     project_id: string;
     goal: string;
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -982,6 +1102,7 @@ export class MissionControl {
     return this.deps.service.createMission({
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: input.operator_goal ?? null,
       metadata,
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: input.authorized_workspaces,
@@ -1007,6 +1128,8 @@ export class MissionControl {
   startMission(input: {
     project_id: string;
     goal: string;
+    /** R1 — provenance-bound operator request (defaults to `goal`). */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -1042,6 +1165,10 @@ export class MissionControl {
     binding_open_id: string;
     project_id: string;
     goal: string;
+    /** R1 — the operator request of record for authority derivation.
+     *  The seam DERIVES it from the canonical work item the binding
+     *  references — a supplied value may mirror but never define it. */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -1138,13 +1265,32 @@ export class MissionControl {
       }
       metadata[key] = canonical;
     }
-    return this.startMissionInternal({ ...input, metadata }, binding);
+    // R1 — the operator goal is canonical too: the bound work item's
+    // `goal` field, loaded from the store under this binding — never
+    // the enriched envelope and never a caller-supplied copy. Only this
+    // text may mint Goal Contract / network / delivery / language
+    // authority; the envelope remains context + committed goal.
+    const operatorGoal = String(workItem.goal ?? "");
+    if (
+      input.operator_goal != null &&
+      String(input.operator_goal) !== operatorGoal
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_CONTEXT_MISMATCH",
+        "operator_goal conflicts with canonical work_item.goal",
+      );
+    }
+    return this.startMissionInternal(
+      { ...input, operator_goal: operatorGoal, metadata },
+      binding,
+    );
   }
 
   private startMissionInternal(
     input: {
       project_id: string;
       goal: string;
+      operator_goal?: string | null;
       metadata?: Record<string, unknown>;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -1271,6 +1417,7 @@ export class MissionControl {
       ? this.deps.service.createBoundMission(binding, {
           project_id: input.project_id,
           goal: input.goal,
+          operator_goal: input.operator_goal ?? null,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,
@@ -1279,6 +1426,7 @@ export class MissionControl {
       : this.deps.service.createMission({
           project_id: input.project_id,
           goal: input.goal,
+          operator_goal: input.operator_goal ?? null,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,
@@ -1489,10 +1637,11 @@ export class MissionControl {
   }
 
   /**
-   * Fire every due schedule through the canonical startMission path. When an
-   * expander is supplied (the serve script's LLM planner seam) each due goal
-   * is expanded into a real plan first — scheduled missions get the same plan
-   * quality as the UI's Plan & run instead of the minimal template fallback.
+   * Fire every due schedule through the canonical preview+confirm path.
+   * Phase C — scheduled Missions are planned by the SAME async LLM
+   * Planner Pool expander as every other ingress: no expander →
+   * FAIL_CLOSED_NO_PLANNER per due schedule (bounded, recorded as the
+   * schedule's own fire error), never a deterministic template.
    */
   async tickSchedules(
     now?: string,
@@ -1502,7 +1651,10 @@ export class MissionControl {
     const defaultProject = String(this.store.list("project")[0]?.project_id ?? "");
     return this.deps.schedules.fireDue(
       async (input) => {
-        const expanded = expander ? await expander(input as Record<string, unknown>) : { input };
+        if (!expander) {
+          throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.schedules");
+        }
+        const expanded = await expander(input as Record<string, unknown>);
         const exInput = (expanded as { input?: unknown }).input ?? expanded;
         const plannerEvidence = (expanded as { planner?: never }).planner;
         const preview = this.createPlanPreview({

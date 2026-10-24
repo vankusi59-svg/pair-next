@@ -133,7 +133,10 @@ interface ConvDeps {
 function convDeps(s: Stack, invoker: ConversationInvoker | null): ConvDeps {
   const sessions = new ConversationSessionService(s.store);
   const drafts = new MissionDraftService({
-    conversation: sessions, control: s.control, store: s.store });
+    conversation: sessions, control: s.control, store: s.store,
+    // Phase C — same async Planner Pool seam; passthrough keeps the
+    // sync test planner as the preview's plan source.
+    planExpander: async (input) => ({ input }) });
   const reasoning = invoker
     ? new ConversationReasoningService({
         conversation: sessions, store: s.store, invoker,

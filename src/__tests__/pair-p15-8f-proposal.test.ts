@@ -146,7 +146,10 @@ interface ConvDeps {
 function convDeps(s: Stack, invoker: ConversationInvoker | null): ConvDeps {
   const sessions = new ConversationSessionService(s.store);
   const drafts = new MissionDraftService({
-    conversation: sessions, control: s.control, store: s.store });
+    conversation: sessions, control: s.control, store: s.store,
+    // Phase C — same async Planner Pool seam; passthrough keeps the
+    // sync test planner as the preview's plan source.
+    planExpander: async (input) => ({ input }) });
   const reasoning = invoker
     ? new ConversationReasoningService({
         conversation: sessions, store: s.store, invoker,
@@ -610,6 +613,7 @@ describe("P15.8-F R1 — expiry + regression pins", () => {
     let nowMs = Date.parse("2026-10-09T00:00:00Z");
     const drafts = new MissionDraftService({
       conversation: sessions, control: s.control, store: s.store,
+      planExpander: async (input) => ({ input }),
       now: () => new Date(nowMs).toISOString(), draft_ttl_s: 60 });
     const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
     const d = drafts.createDraft({
@@ -704,7 +708,8 @@ describe("P15.8-F R2 — canonical proposal race closure", () => {
     // A draft materialized from the returned proposal carries the
     // committed goal — callers cannot reach the divergent local value.
     const drafts = new MissionDraftService({
-      conversation: sessions, control: s.control, store: s.store });
+      conversation: sessions, control: s.control, store: s.store,
+      planExpander: async (input) => ({ input }) });
     const d = drafts.createDraft({
       session_id: sid, operator_id: WEBOP, project_id: s.projectId,
       goal: winner.proposal!.goal,

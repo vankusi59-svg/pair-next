@@ -17,6 +17,17 @@ import {
 } from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
+/** R1-F1 — Windows path syntax is canonical-invalid on EVERY host.
+ *  After `\`→`/` folding, `path.isAbsolute` sees drive forms only on
+ *  win32: on POSIX `C:/x` is just a relative-looking spelling and
+ *  `C:rel` is never absolute anywhere. Detect drive-qualified
+ *  (`C:/x`), drive-relative (`C:rel`) and folded UNC (`//srv/sh`)
+ *  spellings on the normalized name, before any filesystem resolve —
+ *  a Windows absolute path must never mint a `C:/x` canonical name. */
+function isWindowsPathForm(rel: string): boolean {
+  return /^[A-Za-z]:/.test(rel) || rel.startsWith("//");
+}
+
 export class ArtifactProvenanceValidator {
   validate_execution(
     service: PairControlPlane,
@@ -57,8 +68,15 @@ export class ArtifactProvenanceValidator {
       }
       const art = entry as Record<string, unknown>;
       const relField: unknown = art.path;
-      const rel = typeof relField === "string" ? relField : "";
-      if (typeof relField !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
+      // Platform-separator folding — executors report workspace-relative
+      // paths with the HOST separator (Windows emits `outbox\file.txt`);
+      // canonical logical names are POSIX-only. Folding `\`→`/` at this
+      // ingress boundary keeps one file one canonical name on every host.
+      // The strict checks below still run on the normalized spelling —
+      // absolute and `..` forms stay rejected (and `..\x` is now caught
+      // by the segment check too).
+      const rel = typeof relField === "string" ? relField.replace(/\\/g, "/") : "";
+      if (typeof relField !== "string" || !rel || isWindowsPathForm(rel) || path.isAbsolute(rel) || rel.split("/").includes("..")) {
         failures.push(`artifact path invalid: ${rel || "<invalid>"}`);
         continue;
       }

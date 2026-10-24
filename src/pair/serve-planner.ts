@@ -8,9 +8,13 @@
  * instantiates, never a reimplementation.
  *
  * F3 R1.1 — replan discipline:
- *   - `reason === "initial"` keeps the established behavior: confirmed
- *     `pinned_plan_tasks` verbatim → `metadata.llm_plan` through the
- *     canonicalize seam → deterministic template plan.
+ *   - `reason === "initial"` accepts ONLY authorized plan authority:
+ *     confirmed `pinned_plan_tasks` verbatim → `metadata.llm_plan`
+ *     through the canonicalize seam. Phase C — the deterministic
+ *     template plan is REMOVED: a mission reaching the planner without
+ *     a persisted plan fails closed FAIL_CLOSED_PLAN_REQUIRED. Genuine
+ *     planning happens ONLY in the async LLM Planner Pool at the
+ *     expander edge; its winner travels as `metadata.llm_plan`.
  *   - `reason === "replan"` NEVER silently replays a stored plan
  *     (pinned / llm_plan / unchanged template) as though it were a
  *     fresh alternative. A replan must come from a configured governed
@@ -21,10 +25,15 @@
  *     falls through to the RecoveryController's next bounded action.
  *
  *   The production LLM planner (`llmPlan`) is asynchronous and cannot
- *   run inside the synchronous `RuntimePlanner` contract, so production
- *   wiring passes no `replanProvider`: live production replanning is
- *   explicitly UNSUPPORTED under the current sync contract and REPLAN
- *   fails closed rather than replaying the old plan.
+ *   run inside the synchronous `RuntimePlanner` contract. The governed
+ *   bridge (src/pair/replan-generation.ts) stages async Planner Pool
+ *   candidates in a durable `replan_generation` row and is wired here as
+ *   `replanProvider` behind `PAIR_ASYNC_REPLAN_PROVIDER=1`; a provider
+ *   that already canonicalized inside the pool returns `canonical:
+ *   true` and is forwarded verbatim (runReplan's committed gates still
+ *   apply). With no provider configured, live production replanning
+ *   remains explicitly UNSUPPORTED and REPLAN fails closed rather than
+ *   replaying the old plan.
  */
 import {
   isBookkeepingShapedTask,
@@ -56,13 +65,19 @@ import {
   PAIR_DELIVERY_INJECTION_KEY,
   type DeliveryInjectionRecord,
   type ExternalInputArtifactSource,
+  type TelegramDeliveryIntent,
+  isContentBearing,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
-import { extractGoalContract } from "./goal-contract.js";
+import {
+  operatorGoalOf,
+  extractGoalContract,
+} from "./goal-contract.js";
 import { assertPlanCoverage } from "./plan-coverage.js";
 import { IntegrityError } from "./errors.js";
-import { DSH_EXECUTOR_ID } from "./dsh-adapter.js";
-import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
+import { ExecutorRegistry } from "./executor-registry.js";
+import type { ExecutorAdapter } from "./adapter.js";
+import type { PairControlPlane } from "./service.js";
 import type { RuntimePlanner, RuntimePlannerInput } from "./mission-runtime.js";
 
 /** Capability allowlist for LLM-derived plans (initial + replan). */
@@ -129,21 +144,90 @@ export function canonicalBookkeepingTask(goal: string): Record<string, unknown> 
   };
 }
 
+/**
+ * Planner capability supply — capability sets of the CURRENTLY ENABLED,
+ * qualified executors, derived from canonical state at call time.
+ *
+ * Audit F1 (PR #119): the dashboard ON/OFF toggle flips durable
+ * `executor.status`; a DISABLED executor's capabilities must never make
+ * a task canonicalizable because the capability router and
+ * GovernedTaskGate would reject its dispatch anyway — the planner would
+ * otherwise mint plan shapes no executor may run. Reading the registry
+ * row inside the closure means an operator toggle takes effect for
+ * planning WITHOUT a restart for already-bound adapters. Unqualified
+ * rows contribute nothing; the live `capabilities()` declaration still
+ * gates the actual list (dynamically-claimed capabilities stay
+ * executor-owned).
+ */
+export function plannerExecutorCapSets(
+  service: PairControlPlane,
+  adapters: Map<string, ExecutorAdapter>,
+): () => string[][] {
+  const registry = new ExecutorRegistry(service);
+  return () =>
+    [...adapters.entries()]
+      .map(([id, a]) => {
+        try {
+          const row = service.store.tryGet("executor", id);
+          if (!row || String(row.status) === "DISABLED") return [];
+          const desc = registry.normalizeDescriptor(row);
+          if (String(desc.qualification_state) !== "QUALIFIED") return [];
+          const c = a.capabilities();
+          if (c.qualified === false) return [];
+          const caps = c.capability_ids ?? c.capabilities ?? [];
+          return Array.isArray(caps) ? caps.map(String) : [];
+        } catch {
+          return [];
+        }
+      })
+      .filter((s) => s.length);
+}
+
+/**
+ * Subscription-only LLM transport policy (PR #120): a Planner Pool
+ * candidate may ONLY invoke the Codex CLI subscription transport. Any
+ * candidate reaching the invocation seam without `transport:
+ * "codex_cli"` is an authority violation — refused BEFORE an HTTP
+ * request can be constructed. The configure-time gate
+ * (assertCodexOnlyPlannerRoute over PAIR_PLANNER_*_ROUTE) makes such a
+ * candidate unreachable; this is the defense-in-depth check at the
+ * point where a model invocation would actually run.
+ */
+export function assertCodexCliPlannerTransport(candidate: {
+  ref: string;
+  transport?: string;
+}): void {
+  if (candidate.transport !== "codex_cli") {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED",
+      `planner candidate ${String(candidate.ref)} transport ${String(candidate.transport ?? "openai_http")} is not codex_cli — no HTTP planner invocation is permitted`,
+    );
+  }
+}
+
 export interface ServePlannerDeps {
-  /** Whether a governed executor id is registered + qualified (template
-   *  plan T2/T3 emission). Production: `(id) => governed.has(id)`. */
-  hasExecutor: (executorId: string) => boolean;
   /** Capability sets of the currently-qualified executors — sanitizePlan
    *  drops tasks no single executor can serve. */
   executorCapSets: () => string[][];
   /** Optional SYNCHRONOUS governed replan provider. Receives the full
    *  RuntimePlannerInput including `replan_context`; its raw candidate
    *  still flows through the same canonicalize seam — no direct commit
-   *  from provider output. Absent → REPLAN reports unavailability. */
+   *  from provider output — UNLESS it returns `canonical: true`, meaning
+   *  the candidate already passed the canonical preparation seam inside
+   *  the async Planner Pool (the governed replan-generation bridge):
+   *  a second pass would double PAIR-owned structure, so it is forwarded
+   *  verbatim and runReplan's committed gates still apply. Absent →
+   *  REPLAN reports unavailability. */
   replanProvider?:
     | ((
         input: RuntimePlannerInput,
-      ) => { tasks?: Array<Record<string, unknown>> } | null | undefined)
+      ) =>
+        | {
+            tasks?: Array<Record<string, unknown>>;
+            canonical?: boolean;
+          }
+        | null
+        | undefined)
     | null;
 }
 
@@ -177,9 +261,18 @@ export function makeServeCanonicalizer(deps: {
      *  trusted PAIR code for this mission (empty/absent = no
      *  cross-mission consumption is authorized). */
     external_input_artifacts?: ExternalInputArtifactSource[];
+    /** R1 — the provenance-bound operator goal: the ONLY text that may
+     *  mint contract requirements, network authority, delivery intent,
+     *  and output language. `goal` remains the committed mission text
+     *  (envelope for delegated missions — bookkeeping writes it, the
+     *  model sees it); absent → `goal` itself is operator-authored. */
+    authorityGoal?: string;
   },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
+    // R1 — authority resolution is provenance, never parsing: this is
+    // the text every authority derivation below consumes.
+    const authorityGoal = ctx?.authorityGoal ?? String(goal ?? "");
     // HOTFIX 1 — delivery omission provenance is measured on the RAW
     // candidate BEFORE sanitize/drop/remap so a TRUE omission (planner
     // never attempted a delivery task) can be told apart from a
@@ -189,7 +282,7 @@ export function makeServeCanonicalizer(deps: {
     // captured inside the planner transport (llmPlan/codexPlannerPlan)
     // BEFORE its own sanitizePlan; the incoming task list has already
     // survived that first drop and can no longer prove it.
-    const deliveryIntent = detectTelegramDeliveryIntent(String(goal ?? ""));
+    const deliveryIntent = detectTelegramDeliveryIntent(authorityGoal);
     // R2 — evidence is the tri-state inspection: an explicit
     // `raw_delivery_emission_state`/`_count` pair wins (production
     // failover always supplies it); absent evidence means the caller
@@ -242,7 +335,7 @@ export function makeServeCanonicalizer(deps: {
     });
     // PRV2-A §E — adaptive work-task budget bounds the work graph; the
     // injected bookkeeping task is not counted against it.
-    const workBudget = resolveWorkTaskBudget(goal, deps.maxWorkTasks);
+    const workBudget = resolveWorkTaskBudget(authorityGoal, deps.maxWorkTasks);
     const { tasks } = sanitizePlan(
       workRaw as never[],
       SERVE_LLM_WORK_CAPS,
@@ -342,10 +435,10 @@ export function makeServeCanonicalizer(deps: {
     //    verdict (resolveTaskNetworkAuthority) is preserved verbatim —
     //    LEGACY detectors, NOT_REQUIRED+claim → UNAUTHORIZED_CAPABILITY.
     const netFresh = ctx?.provenance !== "persisted";
-    const netGoalHosts = extractGoalHosts(goal);
-    const netGoalDemand = goalRequiresCurrentExternalData(goal);
+    const netGoalHosts = extractGoalHosts(authorityGoal);
+    const netGoalDemand = goalRequiresCurrentExternalData(authorityGoal);
     const netGoalHasSubject =
-      externalSubjectKeys(goal).size > 0 || subjectAnchors(goal).size > 0;
+      externalSubjectKeys(authorityGoal).size > 0 || subjectAnchors(authorityGoal).size > 0;
     const taskNetRes = (t: Record<string, unknown>) => {
       const md = (t.metadata ?? {}) as Record<string, unknown>;
       const instr = String(t.task_instruction ?? "");
@@ -358,7 +451,7 @@ export function makeServeCanonicalizer(deps: {
             goalRequiresExternalData: netGoalDemand,
             instructionMatchesGoalSubject:
               netGoalHasSubject &&
-              instructionSatisfiesGoalSubject(instr, goal),
+              instructionSatisfiesGoalSubject(instr, authorityGoal),
             instruction: instr,
           })
         : resolveTaskNetworkAuthority({
@@ -395,7 +488,7 @@ export function makeServeCanonicalizer(deps: {
     const anyDerivedRequired = tasks.some(
       (t) => taskNetRes(t).verdict === "REQUIRED",
     );
-    if (!anyDerivedRequired && goalRequiresCurrentExternalData(goal)) {
+    if (!anyDerivedRequired && goalRequiresCurrentExternalData(authorityGoal)) {
       const legitimate = tasks.some((t) => {
         const caps = (t.required_capabilities as string[] | undefined) ?? [];
         const instr = String(t.task_instruction ?? "");
@@ -405,7 +498,7 @@ export function makeServeCanonicalizer(deps: {
           // R4 — subject binding: the task must gather the subject the
           // goal's current-data obligation is about, not merely be a
           // legitimate gatherer of something unrelated.
-          instructionSatisfiesGoalSubject(instr, goal)
+          instructionSatisfiesGoalSubject(instr, authorityGoal)
         );
       });
       if (!legitimate) {
@@ -504,57 +597,15 @@ export function makeServeCanonicalizer(deps: {
     // (TELEGRAM_DELIVERY inside the canonical work vocabulary AND
     // routable by a currently-qualified executor capability set).
     if (ctx?.provenance !== "persisted") {
-      // A planner may never forge "PAIR injected" evidence — strip the
-      // PAIR-owned stamp from every candidate task; it is re-stamped
-      // only on the task this run actually injects.
-      for (const t of allTasks) {
-        const md = t.metadata as Record<string, unknown> | undefined;
-        if (md && md[PAIR_DELIVERY_INJECTION_KEY] !== undefined) {
-          delete md[PAIR_DELIVERY_INJECTION_KEY];
-        }
-      }
-      if (
-        deliveryIntent.requested &&
-        canonicalDeliveryCount === 0 &&
-        rawDeliveryCount === 0
-      ) {
-        const servable =
-          SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
-          deps
-            .executorCapSets()
-            .some((set) =>
-              (set as string[]).includes("TELEGRAM_DELIVERY"),
-            );
-        if (!servable) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE",
-            JSON.stringify({ requested: true, servable: false }),
-          );
-        }
-        const deliveryKey = `T${allTasks.length + 1}`;
-        const injected: Record<string, unknown> = {
-          task_key: deliveryKey,
-          title: "governed telegram delivery",
-          // Placeholder only — reconcile rewrites the canonical
-          // delivery instruction and stamps the manifest/contract/
-          // output-language/edges exactly as for a planner-emitted task.
-          task_instruction:
-            "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
-          required_capabilities: ["TELEGRAM_DELIVERY"],
-          depends_on: [],
-          metadata: {},
-        };
-        const record: DeliveryInjectionRecord = {
-          reason: "DELIVERY_TASK_INJECTED",
-          task_key: deliveryKey,
-          mode: deliveryIntent.mode,
-          authority: "OPERATOR_TELEGRAM_INTENT",
-        };
-        (injected.metadata as Record<string, unknown>)[
-          PAIR_DELIVERY_INJECTION_KEY
-        ] = record;
-        allTasks.push(injected);
-      }
+      injectDeliveryTaskForTrueOmission(
+        allTasks,
+        deliveryIntent,
+        {
+          canonical: canonicalDeliveryCount,
+          raw: rawDeliveryCount,
+        },
+        deps.executorCapSets,
+      );
     }
     // Incident R1/R2 — deterministic artifact data-flow reconciliation
     // at THE canonical seam, before validatePlanProposal + plan_digest:
@@ -564,7 +615,7 @@ export function makeServeCanonicalizer(deps: {
     // the operator REQUEST alone.
     reconcilePlanDataflow(allTasks as never[], {
       telegramIntent: deliveryIntent,
-      outputLanguage: detectOutputLanguage(String(goal ?? "")),
+      outputLanguage: detectOutputLanguage(authorityGoal),
       external_input_artifacts: ctx?.external_input_artifacts,
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
@@ -578,9 +629,105 @@ export function makeServeCanonicalizer(deps: {
     // (replanning changes HOW, never WHAT). A fabricated model
     // `pair_coverage` mapping is evidence, never authority: PAIR
     // verifies every requirement independently.
-    assertPlanCoverage(extractGoalContract(String(goal ?? "")), allTasks);
+    // R1 — coverage binds the operator authority text, never the
+    // enriched envelope: appended `[AGENT CONTEXT]` history cannot
+    // mint obligations/deliverables/constraints/prohibitions.
+    assertPlanCoverage(extractGoalContract(authorityGoal), allTasks);
     return allTasks;
   };
+}
+
+/** HOTFIX-D — THE one governed delivery-omission injection authority.
+ *  Called from the canonicalize seam (LLM/persisted candidates, fresh
+ *  provenance only) AND from the deterministic template fallback tail —
+ *  never duplicated, never reimplemented per call site. Three proofs
+ *  before injection, in order:
+ *    1. planner-forgery defense — strip `PAIR_DELIVERY_INJECTION_KEY`
+ *       from every task; PAIR re-stamps only the task THIS run injects;
+ *    2. operator intent + TRUE omission — `requested` AND zero canonical
+ *       AND zero raw attempted delivery tasks (a dropped malformed
+ *       emission already failed closed upstream — never repair into
+ *       ambiguity);
+ *    3. servability — TELEGRAM_DELIVERY inside the canonical work
+ *       vocabulary AND routable by a currently-qualified executor
+ *       capability set — else `FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE`;
+ *    4. a real producer exists — no content-bearing task upstream means
+ *       nothing genuine to deliver — `FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER`
+ *       (never fabricate an empty deliverable just to satisfy presence).
+ *  The injected task is a canonical DAG leaf keyed by the next FREE
+ *  `T<n>` (never a bare `T${allTasks.length+1}` — an emitted key gap,
+ *  e.g. T1,T3 when DSH is absent but Codex is present, would collide).
+ *  Deterministic: smallest unused key ≥ length+1, so sequential lists
+ *  keep `T${len+1}` exactly as before.
+ *  reconcilePlanDataflow (called by each caller) rewrites its
+ *  instruction, derives producer edges, and stamps the manifest /
+ *  plan-contract / output-language exactly as for a planner-emitted
+ *  delivery task. */
+function injectDeliveryTaskForTrueOmission(
+  allTasks: Array<Record<string, unknown>>,
+  deliveryIntent: TelegramDeliveryIntent,
+  counts: { canonical: number; raw: number },
+  executorCapSets: () => string[][],
+): void {
+  for (const t of allTasks) {
+    const md = t.metadata as Record<string, unknown> | undefined;
+    if (md && md[PAIR_DELIVERY_INJECTION_KEY] !== undefined) {
+      delete md[PAIR_DELIVERY_INJECTION_KEY];
+    }
+  }
+  if (
+    !deliveryIntent.requested ||
+    counts.canonical !== 0 ||
+    counts.raw !== 0
+  ) {
+    return;
+  }
+  const servable =
+    SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
+    executorCapSets()
+      .some((set) => (set as string[]).includes("TELEGRAM_DELIVERY"));
+  if (!servable) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE",
+      JSON.stringify({ requested: true, servable: false }),
+    );
+  }
+  if (!allTasks.some((t) => isContentBearing(t))) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER",
+      JSON.stringify({ requested: true, content_bearing_tasks: 0 }),
+    );
+  }
+  // F1 — canonical task-key allocation: the next FREE `T<n>`, not a
+  // bare length+1 (a gap like T1,T3 would collide with the existing
+  // T3). Deterministic replay preserved — same input keys always yield
+  // the same delivery key.
+  let nextKey = allTasks.length + 1;
+  const usedKeys = new Set(allTasks.map((t) => String(t.task_key)));
+  while (usedKeys.has(`T${nextKey}`)) nextKey += 1;
+  const deliveryKey = `T${nextKey}`;
+  const injected: Record<string, unknown> = {
+    task_key: deliveryKey,
+    title: "governed telegram delivery",
+    // Placeholder only — reconcile rewrites the canonical
+    // delivery instruction and stamps the manifest/contract/
+    // output-language/edges exactly as for a planner-emitted task.
+    task_instruction:
+      "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
+    required_capabilities: ["TELEGRAM_DELIVERY"],
+    depends_on: [],
+    metadata: {},
+  };
+  const record: DeliveryInjectionRecord = {
+    reason: "DELIVERY_TASK_INJECTED",
+    task_key: deliveryKey,
+    mode: deliveryIntent.mode,
+    authority: "OPERATOR_TELEGRAM_INTENT",
+  };
+  (injected.metadata as Record<string, unknown>)[
+    PAIR_DELIVERY_INJECTION_KEY
+  ] = record;
+  allTasks.push(injected);
 }
 
 /** Build the production runtime planner (the `planner` dep of
@@ -595,6 +742,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
   });
   const planner: RuntimePlanner = (input) => {
     const goal = String(input.mission.goal);
+    // R1 — the provenance-bound operator goal pinned at mint is the
+    // only authority text (legacy/unpinned missions resolve to goal).
+    const authorityGoal = operatorGoalOf(input.mission);
     if (input.reason === "replan") {
       // F3 R1.1 — a replan must be generated by a configured governed
       // provider consuming the structured failure context. Stored plans
@@ -608,8 +758,17 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         const candidate = provider(input);
         const raw = candidate?.tasks;
         if (Array.isArray(raw) && raw.length) {
+          // Staged async-pool candidate (governed replan-generation
+          // bridge): canonicalization ran ONCE inside
+          // runPlannerFailover's winner-check — a second pass would
+          // double PAIR-owned structure. Forwarded verbatim; every
+          // committed runReplan gate still applies downstream.
+          if (candidate?.canonical === true) {
+            return { tasks: raw };
+          }
           try {
             const tasks = canonicalizeLlmTasks(raw, goal, {
+              authorityGoal,
               external_input_artifacts: input.input_artifact_sources,
             });
             if (tasks.length) return { tasks };
@@ -653,41 +812,25 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         goal,
         {
           provenance: "persisted",
+          authorityGoal,
           external_input_artifacts: input.input_artifact_sources,
         },
       );
       if (tasks.length) return { tasks };
     }
-    const tasks: Array<Record<string, unknown>> = [
-      canonicalBookkeepingTask(goal),
-    ];
-    if (deps.hasExecutor(DSH_EXECUTOR_ID)) {
-      tasks.push({
-        task_key: "T2",
-        title: "llm analysis (dsh)",
-        task_instruction: `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE.`,
-        required_capabilities: ["REASONING"],
-        depends_on: ["T1"],
-        metadata: {},
-      });
-    }
-    if (
-      deps.hasExecutor(CODEX_EXECUTOR_ID) &&
-      /codex|python|script|code/i.test(goal)
-    ) {
-      tasks.push({
-        task_key: "T3",
-        title: "codex step",
-        task_instruction:
-          "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
-        required_capabilities: ["PYTHON_EXECUTION"],
-        depends_on: ["T2"].filter((k) =>
-          tasks.some((t) => t.task_key === k),
-        ),
-        metadata: {},
-      });
-    }
-    return { tasks };
+    // Phase C — deterministic mission-planning template REMOVED. A new
+    // Mission must carry authorized plan authority — a confirmed
+    // preview's `pinned_plan_tasks` or a Planner Pool winner persisted
+    // as `metadata.llm_plan` (produced by the shared async expander
+    // edge BEFORE mission creation, for direct/draft/scheduled and
+    // delegated opens alike). Reaching this tail means a mission was
+    // admitted without a persisted plan — typed fail-closed, never a
+    // synthesized task list, never a T1-only "successful" plan, never
+    // a silent substitution.
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_REQUIRED",
+      "mission has no persisted plan authority — planning must run through the LLM Planner Pool before mission start",
+    );
   };
   return { planner, canonicalizeLlmTasks };
 }

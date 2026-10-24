@@ -90,12 +90,14 @@ import {
   persistedPlanSemanticDigest,
   canonicalPlanSemanticDigest,
   MAX_REPLAN_CANDIDATES_PER_DECISION,
+  REPLAN_GENERATION_PENDING,
   ReplanAttemptLedger,
   revisionBoundToAttempt,
   type DependencyReason,
   type RecoveryFailureContext,
   type ReplanAttemptRecord,
 } from "./plan-feasibility.js";
+import { missionOperatorGoalOf } from "./goal-contract.js";
 
 export const MISSION_RUNTIME_STATES = [
   "CREATED",
@@ -661,8 +663,10 @@ export class MissionRuntime {
     const md = (task.metadata as Record<string, unknown>) ?? {};
     // Language authority is re-derived from the effective operator goal —
     // a stamped metadata value can be tampered with, the goal cannot.
+    // R1 — the provenance-bound operator_goal, never the enriched
+    // envelope: appended agent context cannot change output language.
     const expectedLanguage =
-      detectOutputLanguage(mission.goal).code ?? null;
+      detectOutputLanguage(this.missionOperatorGoal(mission)).code ?? null;
     const languageViolation = (
       artifact: string,
       text: string,
@@ -1296,6 +1300,13 @@ export class MissionRuntime {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
+    // R1/R2-F2 — resolve provenance-bound operator authority FIRST: every
+    // downstream derivation (external inputs, planner prompt, dataflow
+    // revalidation) binds this text. A bound mission whose canonical
+    // chain (bound_open_id → work_open_binding → work_item.goal) is
+    // broken fails closed HERE — the enriched envelope is never promoted
+    // merely because recovery failed.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — canonical cross-mission input authority for this
     // mission: ACCEPTED artifacts from sibling missions in the same
     // authorized Objective lineage, computed by trusted PAIR code. The
@@ -1304,7 +1315,7 @@ export class MissionRuntime {
     const externalInputs =
       this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
     const proposal = this.deps.planner({
-      mission,
+      mission: { ...mission, operator_goal: operatorGoal },
       advice,
       reason: "initial",
       input_artifact_sources: externalInputs,
@@ -1320,24 +1331,42 @@ export class MissionRuntime {
       tasks as unknown as Array<Record<string, unknown>>,
       externalInputs,
     );
-    // Incident R1 — pinned plans must be data-flow sound at the commit
-    // boundary: every consumed artifact requires its producer edge. A
-    // planner path that bypassed the canonicalize seam still fails closed.
-    // R8 — the intent↔presence invariant and instruction hygiene are
-    // re-proven here with the operator request (mission.goal) as the
-    // only delivery authority. Stamped external bindings re-prove the
-    // CURRENT eligible set NOW.
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-      outputLanguage: detectOutputLanguage(mission.goal),
-      external_input_artifacts: externalInputs,
-    });
-    this.deps.service.commitPlan({
-      mission_id: missionId,
-      tasks: tasks as unknown as Array<Record<string, unknown>>,
-      source: "AUTOMATON_PLANNER",
-      reason: "initial_plan",
-      proposal,
+    // R2-F1 — the planner call window can span new sibling artifact
+    // arrivals (or revocations): `externalInputs` was resolved BEFORE
+    // the planner ran and may already be stale. Re-resolve the canonical
+    // eligible set NOW and re-proof every stamped binding INSIDE the
+    // commit transaction — a moved latest-winner or a revoked source
+    // makes the recomputed ledger differ and fails closed
+    // (FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING) rather than committing
+    // a stale pin. Check + write in ONE immediate transaction: the
+    // eligibility read and the revision write share the serialized
+    // SQLite writer, so no artifact can land between them.
+    this.store.immediate(() => {
+      const commitInputs =
+        this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
+      bindPlanExternalInputs(
+        tasks as unknown as Array<Record<string, unknown>>,
+        commitInputs,
+      );
+      // Incident R1 — pinned plans must be data-flow sound at the commit
+      // boundary: every consumed artifact requires its producer edge. A
+      // planner path that bypassed the canonicalize seam still fails closed.
+      // R8 — the intent↔presence invariant and instruction hygiene are
+      // re-proven here with the provenance-bound operator request as the
+      // only delivery authority. Stamped external bindings re-prove the
+      // CURRENT eligible set NOW.
+      assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
+        telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+        outputLanguage: detectOutputLanguage(operatorGoal),
+        external_input_artifacts: commitInputs,
+      });
+      this.deps.service.commitPlan({
+        mission_id: missionId,
+        tasks: tasks as unknown as Array<Record<string, unknown>>,
+        source: "AUTOMATON_PLANNER",
+        reason: "initial_plan",
+        proposal,
+      });
     });
     this.transitionRuntime(missionId, "READY", "plan_committed");
   }
@@ -3519,6 +3548,8 @@ export class MissionRuntime {
       return;
     }
 
+    // R2-F2 — provenance resolves once, before any replan derivation.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — replan candidates bind the same canonical cross-mission
     // input authority as the initial plan (computed once per tick).
     const externalInputs =
@@ -3530,7 +3561,7 @@ export class MissionRuntime {
       let proposal: unknown;
       try {
         proposal = this.deps.planner({
-          mission,
+          mission: { ...mission, operator_goal: operatorGoal },
           advice: advice ?? null,
           superseded_tasks: oldTasks,
           reason: "replan",
@@ -3550,6 +3581,12 @@ export class MissionRuntime {
         });
       } catch (err) {
         const code = String((err as { code?: string })?.code ?? "");
+        // Governed async replan provider — a durable replan_generation
+        // row was just minted or is still in flight. PENDING is NOT a
+        // failure: no candidate slot is consumed, no ledger row is
+        // written, and the runtime stays REPLANNING until durable
+        // staging resolves the generation.
+        if (code === REPLAN_GENERATION_PENDING) return;
         // R1.1 — the REPLAN action itself is infeasible when no governed
         // replan provider can produce a candidate: not a candidate
         // rejection, no bounded slot consumed — route straight to the
@@ -3579,8 +3616,8 @@ export class MissionRuntime {
         assertPlanDataflow(
           validated as unknown as Array<Record<string, unknown>>,
           {
-            telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-            outputLanguage: detectOutputLanguage(mission.goal),
+            telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+            outputLanguage: detectOutputLanguage(operatorGoal),
             external_input_artifacts: externalInputs,
           },
         );
@@ -3734,10 +3771,31 @@ export class MissionRuntime {
       let bound =
         revisions().find((r) => revisionBoundToAttempt(r, fresh)) ?? null;
       if (!bound) {
+        // R2-F2 — the durable PREPARED candidate was bound+validated at
+        // staging time; eligibility may have moved since (crash-resume
+        // windows are unbounded: new same-name siblings land, sources
+        // get revoked). Re-resolve the canonical eligible set inside
+        // THIS commit transaction and re-proof every pinned external
+        // input — a moved latest-winner, revoked source or drifted
+        // identity fails closed (FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING)
+        // BEFORE any revision write: no new revision, no supersede, no
+        // receipt — and never a silent re-pin. Runs only when a real
+        // commit is about to land; the already-committed replay branch
+        // (bound !== null) never re-proves, so legitimate post-commit
+        // drift can't retroactively fail a valid commit.
+        const preparedTasks = (fresh.prepared_tasks ??
+          []) as Array<Record<string, unknown>>;
+        const commitInputs =
+          this.deps.service.artifactResolver.listEligibleExternalInputSources(
+            this.deps.service.getMission(missionId),
+          );
+        bindPlanExternalInputs(preparedTasks, commitInputs);
+        assertPlanDataflow(preparedTasks, {
+          external_input_artifacts: commitInputs,
+        });
         const res = this.deps.service.commitPlan({
           mission_id: missionId,
-          tasks: (fresh.prepared_tasks ??
-            []) as Array<Record<string, unknown>>,
+          tasks: preparedTasks,
           source: "AUTOMATON_PLANNER",
           reason: "replan",
           proposal:
@@ -3886,6 +3944,32 @@ export class MissionRuntime {
       this.exerciseApprovedRecovery(missionId, approvalId, now);
       return;
     }
+  }
+
+  /** R1/R2 — the mission's operator-goal authority text, resolved by
+   *  PROVENANCE (never by parsing the committed goal):
+   *    1. bound missions (bound_open_id set) — the canonical chain
+   *       work_open_binding → work_item.goal is validated on EVERY
+   *       resolution; a pinned `operator_goal` is the immutable snapshot
+   *       of that goal taken at mint (identical by construction — any
+   *       divergence fails closed), never a bypass around provenance.
+   *       Missing/mismatched binding, missing or goal-less work item, or
+   *       pin divergence all FAIL CLOSED: unrecoverable canonical
+   *       authority can never silently widen to the enriched envelope;
+   *    2. legacy bound rows minted before the field — same chain, the
+   *       canonical work item goal IS the recovered snapshot;
+   *    3. direct missions (no binding) — the persisted `operator_goal`
+   *       pin (preview/confirm path) or, for pre-R1 rows, `goal` itself.
+   *  This text — and only this text — may mint contract requirements,
+   *  network authorization, Telegram delivery intent, or output
+   *  language. The enriched envelope stays informational. */
+  private missionOperatorGoal(mission: Record<string, unknown>): string {
+    // R2-F2 — bound-mission operator authority resolves ONLY through
+    // the canonical chain bound_open_id → work_open_binding →
+    // work_item.goal, validated on every resolution. The single
+    // canonical seam lives in goal-contract.ts so the governed async
+    // replan-generation driver proves the EXACT same authority.
+    return missionOperatorGoalOf(this.store, mission);
   }
 
   /** Advisory retrieval — a broken advisor can never break orchestration. */

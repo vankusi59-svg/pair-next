@@ -269,11 +269,14 @@ function mkProducer(
 function mkConsumer(
   ctx: ReturnType<typeof mkCtx>,
   producers: ReturnType<typeof mkProducer>[],
-  opts: { consume?: string; remote?: boolean; depends_on?: string[] } = {},
+  opts: { consume?: string | string[]; produces?: string[]; remote?: boolean; depends_on?: string[] } = {},
 ) {
   const tid = `ATSK_C_${seq++}`;
   const key = `TC${seq}`;
-  const consume = opts.consume ?? producers[0]?.name ?? "report.txt";
+  const consumes = Array.isArray(opts.consume)
+    ? opts.consume
+    : [opts.consume ?? producers[0]?.name ?? "report.txt"];
+  const produces = opts.produces ?? [];
   ctx.store.put(
     "task",
     tid,
@@ -283,16 +286,16 @@ function mkConsumer(
       mission_id: ctx.missionId,
       plan_id: "PLAN_F2",
       title: key,
-      task_instruction: `read ${consume} then reply DONE.`,
+      task_instruction: `read ${consumes.join(",")} then reply DONE.`,
       required_capabilities: opts.remote ? [REMOTE_CAP] : ["FILE_OPERATIONS"],
       depends_on: opts.depends_on ?? producers.map((p) => p.task_key),
       status: "READY",
-      metadata: { pair_dataflow: { produces: [], consumes: [consume] } },
+      metadata: { pair_dataflow: { produces, consumes } },
       version: 0,
     },
     0,
   );
-  return { tid, task: ctx.store.get("task", tid), task_key: key, consume };
+  return { tid, task: ctx.store.get("task", tid), task_key: key, consume: consumes[0] };
 }
 
 /** Consumer governed task (+ optional live executor_execution) pinned
@@ -466,6 +469,48 @@ describe("A — dependency resolution", () => {
     const ctx = mkCtx("a4");
     const prod = mkProducer(ctx, { produces: "report.txt" });
     const cons = mkConsumer(ctx, [prod], { depends_on: [] });
+    expect(errCode(() =>
+      resolver(ctx).resolveForConsumer({ mission: freshMission(ctx), task: cons.task }),
+    )).toBe("DEP:FAIL_CLOSED_DEPENDENCY_RESOLUTION");
+  });
+
+  it("A8. consume ∩ own-produce with no predecessor → self-shadowed, no handoff", () => {
+    const ctx = mkCtx("a8");
+    const cons = mkConsumer(ctx, [], {
+      consume: "exports/journal-export.json",
+      produces: ["exports/journal-export.json"],
+      depends_on: [],
+    });
+    const entries = resolver(ctx).resolveForConsumer({
+      mission: freshMission(ctx),
+      task: cons.task,
+    });
+    expect(entries).toHaveLength(0);
+  });
+
+  it("A9. consume ∩ own-produce + real depends_on producer → producer still binds", () => {
+    const ctx = mkCtx("a9");
+    const prod = mkProducer(ctx, { produces: "report.txt" });
+    const cons = mkConsumer(ctx, [prod], {
+      consume: "report.txt",
+      produces: ["report.txt"],
+      depends_on: [prod.task_key],
+    });
+    const entries = resolver(ctx).resolveForConsumer({
+      mission: freshMission(ctx),
+      task: cons.task,
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.producer_task_id).toBe(prod.tid);
+  });
+
+  it("A10. self-produced consume skipped but a genuinely unbound consume still fails", () => {
+    const ctx = mkCtx("a10");
+    const cons = mkConsumer(ctx, [], {
+      consume: ["self.txt", "truly-missing.txt"],
+      produces: ["self.txt"],
+      depends_on: [],
+    });
     expect(errCode(() =>
       resolver(ctx).resolveForConsumer({ mission: freshMission(ctx), task: cons.task }),
     )).toBe("DEP:FAIL_CLOSED_DEPENDENCY_RESOLUTION");

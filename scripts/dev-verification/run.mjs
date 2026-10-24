@@ -1,5 +1,6 @@
-#!/usr/bin/env node
 // PAIR Development Verification Harness V1 — deterministic runner.
+// (No shebang: vite-node externalization does not strip `#!`, and a
+// shebang in an imported .mjs surfaces as SyntaxError on newer vite.)
 // `npm run verify:change -- --base <sha> [--full] [--claim <path>]`
 // Exit 0 = READY_FOR_INDEPENDENT_AUDIT; non-zero = NOT_READY.
 // Development tooling only — never consulted by production PAIR.
@@ -9,11 +10,12 @@ import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   HarnessError, TOLERATED_FAILURES, planVerification, validateClaim,
 } from "./lib.mjs";
 
-export const ROOT = new URL("../..", import.meta.url).pathname;
+export const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CLAIM = ".pair-verification/patch-claim.json";
 const OUT_DIR = ".pair-verification";
 
@@ -91,7 +93,11 @@ function evaluateRun({ proc, resultPath, file }) {
   }
   // Per-entry budget: a baseline signature may be consumed at most `max`
   // times per invocation; beyond that it is ordinary failure (R2.G).
-  const budget = TOLERATED_FAILURES.map((t) => ({ t, left: t.max ?? 1 }));
+  // AUDIT R1 F1 — platform-scoped entries are inert on other platforms:
+  // a win32 baseline can never mask a Linux failure (and vice versa).
+  const budget = TOLERATED_FAILURES
+    .filter((t) => t.platform == null || t.platform === process.platform)
+    .map((t) => ({ t, left: t.max ?? 1 }));
   const matchTol = (trName, name) =>
     budget.find((b) => b.left > 0 &&
       (b.t.file === file || b.t.file === trName ||
@@ -203,8 +209,20 @@ function runSelector(sel, exec, root = ROOT, tag = "x") {
   };
 }
 
-export const defaultExec = (bin, argv) =>
-  spawnSync(bin, argv, { cwd: ROOT, encoding: "utf8", shell: false });
+export const defaultExec = (bin, argv) => {
+  // win32: npx/pnpm resolve to .cmd shims that cannot spawn without a
+  // shell. Wrap in cmd.exe with metachar-aware quoting so selector
+  // patterns (e.g. -t "a|b") stay literal — identical semantics on
+  // unix, which keeps the direct execFile path.
+  if (process.platform === "win32") {
+    const q = (s) =>
+      /[\s"&|<>^()%!]/.test(s) ? `"${s.replaceAll('"', '\\"')}"` : s;
+    return spawnSync("cmd.exe",
+      ["/d", "/s", "/c", [bin, ...argv.map(q)].join(" ")],
+      { cwd: ROOT, encoding: "utf8" });
+  }
+  return spawnSync(bin, argv, { cwd: ROOT, encoding: "utf8", shell: false });
+};
 
 function runTool(name, argv, exec) {
   const r = exec(argv[0], argv.slice(1));
@@ -358,6 +376,9 @@ export function verify(opts = {}) {
     throw new HarnessError("VERIFY_CLAIM_PATH",
       `claim path must resolve inside the repository: ${claimArg}`);
   }
+  // git diff --name-only emits forward slashes — normalize the repo-
+  // relative claim path so the freshness check compares like separators.
+  const claimRelGit = claimRel.replaceAll("\\", "/");
   let claimRaw = null;
   if (existsSync(claimAbs)) {
     try {
@@ -380,9 +401,9 @@ export function verify(opts = {}) {
   // must be added/modified inside the resolved BASE..HEAD diff. A claim
   // committed by an earlier PR is stale and can never certify this one —
   // freshness authority is the diff, never mtime/claim_id/title (R2.A/E).
-  if (!files.includes(claimRel)) {
+  if (!files.includes(claimRelGit)) {
     throw new HarnessError("VERIFY_PATCH_CLAIM_STALE",
-      `${claimRel} is not added/modified in ${base}..${head} — ` +
+      `${claimRelGit} is not added/modified in ${base}..${head} — ` +
       "a stale claim cannot certify the current change");
   }
   const plan = planVerification({
@@ -411,7 +432,8 @@ export function verify(opts = {}) {
   return { verdict, reportMd, base, head, plan, groups };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] != null &&
+    import.meta.url === pathToFileURL(process.argv[1]).href) {
   const cli = process.argv.slice(2);
   const a = (f) => cli.indexOf(f) >= 0 ? cli[cli.indexOf(f) + 1] : undefined;
   try {

@@ -24,6 +24,8 @@ import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
 
+export const EXPERIENCE_SCHEMA_V2 = "pair.os.vnext.experience.v2";
+
 export const EXPERIENCE_TYPES = new Set([
   "PLAN_TEMPLATE",
   "SUBPLAN_PATTERN",
@@ -147,6 +149,38 @@ export class ExperienceService {
     }
   }
 
+  /** P17 — a tenancy scope is a CANONICAL claim, validated against the
+   *  store at write time: an objective scope must resolve to a real
+   *  objective and carries the objective's own business (a caller may
+   *  not pair it with a different business); a business-only scope must
+   *  resolve to a real business. Both null = UNSCOPED — retrievable by
+   *  unscoped queries only, never by a scoped/Brain read. */
+  private assertScope(exp: Record<string, unknown>): void {
+    const oid = exp.scope_objective_id != null ? String(exp.scope_objective_id) : null;
+    const bid = exp.scope_business_id != null ? String(exp.scope_business_id) : null;
+    if (oid !== null) {
+      const obj = this.store.tryGet("objective", oid) as Record<string, unknown> | null;
+      if (!obj) {
+        throw new IntegrityError("FAIL_CLOSED_EXPERIENCE_SCOPE", `objective ${oid} does not resolve`);
+      }
+      const canonicalBid = String(obj.business_id ?? "");
+      if (bid !== null && bid !== canonicalBid) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_EXPERIENCE_SCOPE",
+          `business ${bid} != objective business ${canonicalBid}`,
+        );
+      }
+      exp.scope_business_id = canonicalBid;
+      return;
+    }
+    if (bid !== null) {
+      const biz = this.store.tryGet("business", bid) as Record<string, unknown> | null;
+      if (!biz) {
+        throw new IntegrityError("FAIL_CLOSED_EXPERIENCE_SCOPE", `business ${bid} does not resolve`);
+      }
+    }
+  }
+
   createCandidate(fields: {
     type: string;
     source_evidence_refs: string[];
@@ -166,13 +200,15 @@ export class ExperienceService {
     observed_executors?: string[];
     observed_providers?: string[];
     observed_models?: string[];
+    scope_business_id?: string | null;
+    scope_objective_id?: string | null;
   }): Record<string, unknown> {
     const origin = fields.evidence_origin ?? "OPERATOR_ASSERTION";
     if (!EVIDENCE_ORIGINS.has(origin)) {
       throw new PolicyError("FAIL_CLOSED_EXPERIENCE_ORIGIN", origin);
     }
     const exp: Record<string, unknown> = {
-      schema: "pair.os.vnext.experience.v1",
+      schema: EXPERIENCE_SCHEMA_V2,
       experience_id: newId("EXP"),
       type: fields.type,
       status: "CANDIDATE",
@@ -204,8 +240,11 @@ export class ExperienceService {
       observed_models: [...new Set(fields.observed_models ?? [])].sort(),
       contradictions: [],
       created_at: utcnow(),
+      scope_business_id: fields.scope_business_id ?? null,
+      scope_objective_id: fields.scope_objective_id ?? null,
     };
     this.assertFields(exp);
+    this.assertScope(exp);
     // A candidate must be grounded in at least one resolvable Layer-B ref.
     this.assertEvidenceRefs(exp.source_evidence_refs as string[]);
     exp.experience_digest = experienceDigest(exp);
@@ -229,15 +268,28 @@ export class ExperienceService {
     return this.load(String(exp.experience_id));
   }
 
-  /** Locate the open (non-terminal) series member for aggregation. */
-  findBySeriesKey(seriesKey: string): Record<string, unknown> | null {
+  /** Locate the open (non-terminal) series member for aggregation.
+   *  P17: when a scope is supplied the match is tenancy-strict — a
+   *  same-signature member in another scope is a DIFFERENT series
+   *  (cross-scope evidence never aggregates into one row). */
+  findBySeriesKey(
+    seriesKey: string,
+    scope?: { scope_business_id: string | null; scope_objective_id: string | null },
+  ): Record<string, unknown> | null {
+    const sameScope = (e: Record<string, unknown>): boolean => {
+      if (!scope) return true;
+      const rowObj = e.scope_objective_id != null ? String(e.scope_objective_id) : null;
+      const rowBiz = e.scope_business_id != null ? String(e.scope_business_id) : null;
+      return rowObj === scope.scope_objective_id && rowBiz === scope.scope_business_id;
+    };
     return (
       this.store
         .list("experience")
         .find(
           (e) =>
             e.series_key === seriesKey &&
-            !["REVOKED", "SUPERSEDED"].includes(String(e.status)),
+            !["REVOKED", "SUPERSEDED"].includes(String(e.status)) &&
+            sameScope(e),
         ) ?? null
     );
   }
@@ -435,6 +487,44 @@ export class ExperienceService {
    *  7. permission_effect == NONE
    *  8. relevance ranking (deterministic token overlap)
    */
+  /** P17 — tenancy admission, symmetric:
+   *  - objective query: the objective's own rows + business-shared rows
+   *    of its canonical business (a query omitting business_id derives
+   *    it from the objective — an objective that does not resolve
+   *    admits NOTHING, never the world).
+   *  - business query: business-shared rows only — an objective-private
+   *    row (scope_objective_id set) stays private to its objective.
+   *  - unscoped query: UNSCOPED rows only. "No scope asserted" means
+   *    exactly that — a scope-bound row is never visible outside its
+   *    scope, on ANY read path (raw-forged malformed pairs included). */
+  private scopeAdmits(
+    exp: Record<string, unknown>,
+    query: { objective_id?: string; business_id?: string },
+  ): boolean {
+    const rowObj = exp.scope_objective_id != null ? String(exp.scope_objective_id) : null;
+    const rowBiz = exp.scope_business_id != null ? String(exp.scope_business_id) : null;
+    if (query.objective_id) {
+      let bid = query.business_id ?? null;
+      if (bid === null) {
+        const obj = this.store.tryGet("objective", query.objective_id) as
+          Record<string, unknown> | null;
+        bid = obj ? String(obj.business_id ?? "") || null : null;
+        if (bid === null) return false; // objective unproven — fail closed
+      }
+      if (rowObj === query.objective_id) {
+        // An objective-scoped row whose business disagrees is a
+        // malformed binding — never admitted (write-side assertScope
+        // forbids it; a raw-forged row could still carry it).
+        return rowBiz === null || rowBiz === bid;
+      }
+      return rowObj === null && rowBiz === bid;
+    }
+    if (query.business_id) {
+      return rowObj === null && rowBiz === query.business_id;
+    }
+    return rowObj === null && rowBiz === null;
+  }
+
   retrieve(query: {
     text?: string;
     mission_id?: string;
@@ -448,6 +538,8 @@ export class ExperienceService {
     statuses?: string[];
     trusted_origins?: string[];
     now?: string;
+    objective_id?: string;
+    business_id?: string;
   }): Array<Record<string, unknown>> {
     const statuses = new Set(query.statuses ?? ["ACTIVE", "QUALIFIED"]);
     const now = query.now ?? utcnow();
@@ -490,6 +582,7 @@ export class ExperienceService {
       )
         return false; // 2
       if (!compatible(e)) return false; // 3+4+5
+      if (!this.scopeAdmits(e, query)) return false; // 3b — P17 tenancy
       if (e.stale === true) return false; // 6
       const stale =
         e.stale_after ?? (e.trust_metadata as Record<string, unknown>)?.stale_after;
@@ -514,5 +607,51 @@ export class ExperienceService {
         (Number(b.confidence) || 0) - (Number(a.confidence) || 0) ||
         String(a.experience_id).localeCompare(String(b.experience_id)),
     );
+  }
+
+  /**
+   * P17 — the Brain-facing scoped read: retrieve() for the objective's
+   * tenancy PLUS the honest exclusion counts (unscoped legacy rows and
+   * foreign-scope rows are real, but the scoped read must never see
+   * them — reporting the counts keeps the projection truthful).
+   * Counts cover every row the scope does not admit — a pile of
+   * unscoped legacy candidates stays visible as excluded, not hidden.
+   */
+  scopedFor(scope: { objective_id: string; business_id: string }): {
+    rows: Array<Record<string, unknown>>;
+    excluded_unscoped: number;
+    excluded_out_of_scope: number;
+    excluded_ineligible: number;
+  } {
+    const all = this.store.list("experience");
+    let excluded_unscoped = 0;
+    let excluded_out_of_scope = 0;
+    const inScopeIds = new Set<string>();
+    for (const e of all) {
+      const rowObj = e.scope_objective_id != null ? String(e.scope_objective_id) : null;
+      const rowBiz = e.scope_business_id != null ? String(e.scope_business_id) : null;
+      if (rowObj === null && rowBiz === null) {
+        excluded_unscoped += 1;
+      } else if (!this.scopeAdmits(e, scope)) {
+        excluded_out_of_scope += 1;
+      } else {
+        inScopeIds.add(String(e.experience_id));
+      }
+    }
+    const rows = this.retrieve({
+      objective_id: scope.objective_id,
+      business_id: scope.business_id,
+    });
+    // In-scope rows that did not surface — below the status/trust/
+    // staleness floor (CANDIDATE, QUARANTINED, revoked, stale).
+    // admitted + ineligible = the complete in-scope population; the
+    // projection never hides them.
+    const excluded_ineligible = Math.max(0, inScopeIds.size - rows.length);
+    return {
+      rows,
+      excluded_unscoped,
+      excluded_out_of_scope,
+      excluded_ineligible,
+    };
   }
 }

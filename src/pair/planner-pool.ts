@@ -37,8 +37,22 @@ export interface PlannerInvocation {
   /** Effective per-request timeout for this call (REASK = min(normal
    *  per-request timeout, remaining candidate budget)). */
   timeoutMs?: number;
+  /** AUDIT R1 F3 — the ONE absolute run deadline (epoch ms). Per-request
+   *  `timeoutMs` bounds a single call measured at invocation time, but a
+   *  transport's INTERNAL retry loop starts fresh requests later; a
+   *  request must never begin after this point, and every internal
+   *  request timeout is min()'d against it. */
+  deadlineMs?: number;
   /** Hard provider-request bound for this call (REASK = 1). */
   maxProviderRequests?: number;
+  /** AUDIT R1 F4 — mutable provider-invocation counter shared across the
+   *  eligibility re-proof and every model invocation of ONE attempt. A
+   *  transport increments it at the exact point it initiates a real
+   *  provider request (HTTP call / CLI spawn / qualification probe), so
+   *  the settled attempt row records how many requests PROVABLY ran —
+   *  including partial counts when an invocation threw mid-flight. An
+   *  attempt that never reached a provider-touching seam settles 0. */
+  providerCounter?: { requests: number };
   /** Bounded deterministic rejection feedback — present iff kind=REASK. */
   rejectionContext?: PlannerRejectionContext;
 }
@@ -309,6 +323,12 @@ export interface PlannerAttemptRecord {
   failure_class?: PlannerFailureClass;
   /** Sanitized warning codes only — never raw LLM output. */
   warnings: string[];
+  /** AUDIT R1 F4 — provider requests this attempt PROVABLY initiated
+   *  (eligibility probes + INITIAL + REASK), reported by the code that
+   *  made them. This — never the attempt-row count — is the settlement
+   *  evidence for planner cost: an eligibility-rejected attempt that
+   *  never invoked a provider persists 0. */
+  provider_requests?: number;
   /** digest of the winning task list when this attempt won. */
   plan_digest?: string;
   /** Canonical grouping identity — every attempt belongs to a planner_run. */
@@ -356,6 +376,30 @@ export interface PlannerFailoverResult {
  * pool resolving to no eligible candidate must never silently degrade to
  * the deterministic/template path (§1 R1).
  */
+/** AUDIT R2 F1 — worst-case provider-request bound for ONE candidate
+ *  attempt: the number the monetary reservation envelope must cover.
+ *
+ *  - codex_cli: eligibility is re-proved TWICE per attempt (pre-INITIAL
+ *    and pre-REASK); each re-proof may trigger ONE bounded canonical
+ *    qualification refresh that spawns up to 2 real provider probes
+ *    (validateAccess probe + probeModel). Plus INITIAL + REASK calls:
+ *    2×2 probes + 1 + 1 = 6.
+ *  - all other transports (HTTP): eligibility is catalog-local — zero
+ *    provider calls. The INITIAL call's internal retry may emit up to
+ *    2 requests, plus the bounded REASK: 2 + 1 = 3.
+ *
+ * The bound is a structural constant derived from the same call-graph
+ * the pool executes — keep it in lockstep with runPlannerFailover /
+ * refreshCodexPlannerQualification; never hand-mirror it at call sites.
+ */
+export function plannerCandidateRequestBound(candidate: {
+  transport?: string;
+}): number {
+  return candidate.transport === "codex_cli"
+    ? 2 /* eligibility re-proofs */ * 2 /* probes per refresh */ + 1 /* INITIAL */ + 1 /* REASK */
+    : 2 /* INITIAL internal requests */ + 1 /* REASK */;
+}
+
 export async function runPlannerFailover(opts: {
   candidates: PlannerCandidate[];
   planFn: (
@@ -369,6 +413,15 @@ export async function runPlannerFailover(opts: {
    *  refresh before settling an availability rejection). */
   assertEligible: (
     c: PlannerCandidate,
+    /** AUDIT R1 F4 — eligibility paths that spawn real provider probes
+     *  (codex canonical refresh) count them here so a STARTED attempt's
+     *  provider_requests reflects requests that actually ran even when
+     *  the eligibility step rejects or throws afterwards. */
+    providerCounter?: { requests: number },
+    /** AUDIT R2 F2 — run-level deadline context: eligibility paths that
+     *  spawn real provider probes MUST bound each probe's timeout by the
+     *  remaining window and never START one after deadlineMs. */
+    runCtx?: { deadlineMs: number | null },
   ) =>
     | void
     | { reject: true; failure_class: PlannerFailureClass; reason: string }
@@ -402,6 +455,16 @@ export async function runPlannerFailover(opts: {
    *  re-ask runs with no budget limit (test seams); production wires the
    *  transport-derived ceiling so worst-case latency never grows. */
   latencyBudget?: (c: PlannerCandidate) => PlannerLatencyBudget;
+  /** Phase C — ONE run-level deadline spanning every candidate, every
+   *  eligibility/qualification step, the INITIAL model call, transport
+   *  retries and the bounded REASK. Absolute epoch ms. Each gate
+   *  recomputes the remaining budget; every provider request timeout is
+   *  min()'d against it; a result landing past the deadline is
+   *  discarded — never a winner, never an unauthorized Mission. Expiry
+   *  throws FAIL_CLOSED_PLANNER_DEADLINE (not failover-eligible): the
+   *  caller settles the run FAILED — never EXHAUSTED, since untried
+   *  candidates were denied by the deadline rather than by failure. */
+  deadlineMs?: number;
   onExhausted?: (attempts: PlannerAttemptRecord[]) => void;
   now?: () => string;
 }): Promise<PlannerFailoverResult> {
@@ -413,8 +476,39 @@ export async function runPlannerFailover(opts: {
     );
   }
   const attempts: PlannerAttemptRecord[] = [];
+  // Phase C — the single run-level deadline helpers: deadlineRemaining()
+  // folds the run budget into every downstream check; settleDeadline()
+  // persists honest TIMEOUT/RUN_DEADLINE evidence on an already-open
+  // attempt before the typed throw propagates.
+  const deadlineAt = opts.deadlineMs ?? null;
+  const deadlineRemaining = () =>
+    deadlineAt == null ? Number.MAX_SAFE_INTEGER : deadlineAt - Date.now();
+  const deadlineError = () =>
+    new IntegrityError(
+      "FAIL_CLOSED_PLANNER_DEADLINE",
+      JSON.stringify({ attempts: attempts.length, candidates_tried: n }),
+    );
+  const settleDeadline = (
+    base: Omit<PlannerAttemptRecord, "outcome">,
+    t0: number,
+    settle: (rec: PlannerAttemptRecord) => void,
+  ): never => {
+    settle({
+      ...base,
+      completed_at: now(),
+      latency_ms: Date.now() - t0,
+      outcome: "FAILED",
+      failure_class: PLANNER_FAILURE_CLASS.TIMEOUT,
+      warnings: ["RUN_DEADLINE_EXCEEDED"],
+    });
+    throw deadlineError();
+  };
   let n = 0;
   for (const c of opts.candidates) {
+    // Phase C — run deadline BEFORE a new attempt opens: an untried
+    // candidate leaves no STARTED row; the run dies DEADLINE, never
+    // EXHAUSTED.
+    if (deadlineRemaining() <= 0) throw deadlineError();
     n++;
     const started = now();
     const t0 = Date.now();
@@ -433,9 +527,17 @@ export async function runPlannerFailover(opts: {
     // §4 — durable STARTED evidence before ANY gate runs: even an
     // eligibility-rejected or authority-aborted invocation is auditable.
     const token = opts.onAttemptStart?.(base);
+    // AUDIT R1 F4 — the ONE provider-request counter for this attempt:
+    // threaded into the eligibility re-proof (codex refresh probes) and
+    // every model invocation (INITIAL + REASK). Every settle stamps the
+    // accumulated count — including a partial count after a mid-flight
+    // throw — so the durable row distinguishes "attempt persisted" from
+    // "provider provably invoked".
+    const providerCalls = { requests: 0 };
     const settle = (rec: PlannerAttemptRecord) => {
-      attempts.push(rec);
-      opts.onAttemptEnd?.(token, rec);
+      const stamped = { ...rec, provider_requests: providerCalls.requests };
+      attempts.push(stamped);
+      opts.onAttemptEnd?.(token, stamped);
     };
     // Runtime eligibility re-proof per invocation (§9/R2). Authority
     // failures throw and propagate — NOT failover-eligible; availability
@@ -445,7 +547,7 @@ export async function runPlannerFailover(opts: {
     // must not look like a crashed in-flight invocation.
     let elig;
     try {
-      elig = await opts.assertEligible(c);
+      elig = await opts.assertEligible(c, providerCalls, { deadlineMs: deadlineAt });
     } catch (e) {
       settle({
         ...base,
@@ -469,13 +571,32 @@ export async function runPlannerFailover(opts: {
       });
       continue;
     }
+    // Phase C — deadline re-proved AFTER the (possibly async)
+    // eligibility/qualification step; the INITIAL request timeout is
+    // bounded by whatever the run deadline left over.
+    if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
     // P-REASK — set only after the re-ask marker is durably persisted
     // (onAttemptReask). When the SECOND invocation itself dies, the outer
     // catch keeps `REASK:<code>` in the settled warnings so the durable
     // row still proves the re-ask began.
     let reaskInitiated: string | null = null;
     try {
-      const res = await opts.planFn(c, { kind: "INITIAL" });
+      const res = await opts.planFn(c, {
+        kind: "INITIAL",
+        providerCounter: providerCalls,
+        ...(deadlineAt != null
+          ? {
+              timeoutMs: Math.min(
+                opts.latencyBudget?.(c)?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
+                Math.max(1, deadlineRemaining()),
+              ),
+              deadlineMs: deadlineAt,
+            }
+          : {}),
+      });
+      // Phase C — a result landing past the run deadline is discarded:
+      // it can never become a winner or mint an unauthorized Mission.
+      if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
       const completed = now();
       if (!Array.isArray(res.tasks) || !res.tasks.length) {
         settle({
@@ -525,10 +646,14 @@ export async function runPlannerFailover(opts: {
           const reaskCode = extractReaskEligibleCode(e);
           if (reaskCode) {
             const budget = opts.latencyBudget?.(c);
-            const preReproofRemaining =
+            // Phase C — the re-ask may spend ONLY what the candidate
+            // ceiling AND the run deadline both leave over.
+            const preReproofRemaining = Math.min(
               budget == null
                 ? Number.MAX_SAFE_INTEGER
-                : budget.ceilingMs - (Date.now() - t0);
+                : budget.ceilingMs - (Date.now() - t0),
+              deadlineRemaining(),
+            );
             if (preReproofRemaining > 0) {
               // §9/R4 + R1.A — a second model invocation re-proves
               // canonical eligibility first. An authority throw falls
@@ -537,7 +662,7 @@ export async function runPlannerFailover(opts: {
               // attempt_no) — no inner settle may precede it. An
               // availability rejection prevents the re-ask; normal
               // failover proceeds.
-              const elig2 = await opts.assertEligible(c);
+              const elig2 = await opts.assertEligible(c, providerCalls, { deadlineMs: deadlineAt });
               if (elig2 && elig2.reject) {
                 settle({
                   ...base,
@@ -553,10 +678,18 @@ export async function runPlannerFailover(opts: {
               // re-proof consumed real time; a non-positive remainder
               // means no marker, no event, no second invocation — the
               // candidate settles on the ORIGINAL canonical rejection.
-              const remaining =
+              // Phase C — the remainder is min()'d against the run
+              // deadline; an expired deadline is a run failure, not a
+              // candidate rejection.
+              const remaining = Math.min(
                 budget == null
                   ? Number.MAX_SAFE_INTEGER
-                  : budget.ceilingMs - (Date.now() - t0);
+                  : budget.ceilingMs - (Date.now() - t0),
+                deadlineRemaining(),
+              );
+              if (remaining <= 0 && deadlineRemaining() <= 0) {
+                settleDeadline(base, t0, settle);
+              }
               if (remaining > 0) {
               // Durable BEFORE the second invocation: the STARTED row
               // records PAIR's re-ask so a crash mid-call can never make
@@ -568,10 +701,12 @@ export async function runPlannerFailover(opts: {
               reaskInitiated = reaskCode;
               const res2 = await opts.planFn(c, {
                 kind: "REASK",
+                providerCounter: providerCalls,
                 timeoutMs: Math.min(
                   budget?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
                   remaining,
                 ),
+                ...(deadlineAt != null ? { deadlineMs: deadlineAt } : {}),
                 maxProviderRequests: 1,
                 rejectionContext: {
                   validation_code: reaskCode,
@@ -579,6 +714,9 @@ export async function runPlannerFailover(opts: {
                   detail: extractReaskDetail(e, reaskCode),
                 },
               });
+              // Phase C — a re-ask result landing past the run deadline
+              // is discarded exactly like a late INITIAL result.
+              if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
               if (Array.isArray(res2.tasks) && res2.tasks.length) {
                 try {
                   const canonical2 = opts.canonicalize
@@ -665,6 +803,9 @@ export async function runPlannerFailover(opts: {
               }
             }
           }
+          // Phase C — expiry between the canonical rejection and the
+          // settle is a run-deadline failure, not a plan defect.
+          if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
           settle({
             ...base,
             completed_at: now(),
@@ -699,6 +840,11 @@ export async function runPlannerFailover(opts: {
       // A re-ask already durably initiated keeps its marker on the row.
       const reaskMarker = reaskInitiated ? [`REASK:${reaskInitiated}`] : [];
       if (e instanceof IntegrityError) {
+        // Phase C — a run-deadline throw already settled this attempt
+        // honestly (RUN_DEADLINE_EXCEEDED); never settle it twice.
+        if (e.code === "FAIL_CLOSED_PLANNER_DEADLINE") {
+          throw e;
+        }
         settle({
           ...base,
           completed_at: now(),

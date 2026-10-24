@@ -61,6 +61,12 @@ export class ProviderValidator {
           actor: opts.actor,
         });
       } catch (err) {
+        // AUDIT R2 F2 — authority-typed failures (FAIL_CLOSED_*) are not
+        // probe outcomes: a probe denied by an authority window must
+        // never be recorded as UNREACHABLE evidence. Propagate.
+        if (String((err as { code?: string })?.code ?? "").startsWith("FAIL_CLOSED_")) {
+          throw err;
+        }
         outcome = "UNREACHABLE";
         catalog.recordProbeObservation(providerId, "UNREACHABLE", {
           detail: sanitizeDiagnostic(err instanceof Error ? err.message : err) ?? undefined,

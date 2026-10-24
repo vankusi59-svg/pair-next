@@ -52,17 +52,237 @@ export function codexCliEnvGet(env: CodexCliEnv | undefined, name: string): stri
   return typeof env === "function" ? env(name) : env[name];
 }
 
+/** The codex home a spawned child resolves — explicit CODEX_HOME, else
+ *  the platform default (~/.codex via HOME/USERPROFILE). Mirrors what
+ *  the child itself sees: the persisted session lives in this dir. */
+export function codexHomeDir(env: CodexCliEnv | undefined): string | null {
+  const configured = codexCliEnvGet(env, "CODEX_HOME");
+  if (configured) return configured;
+  const home =
+    codexCliEnvGet(env, "HOME") ?? codexCliEnvGet(env, "USERPROFILE");
+  return home ? path.join(home, ".codex") : null;
+}
+
+/** The effective Codex CLI authentication mode a governed child would
+ *  run under (R2-F1). `codex exec` resolves auth as: env API key (never
+ *  forwarded to governed children — codexCliChildEnv strips it; the
+ *  executor adapter strips it for autonomous dispatch) → the persisted
+ *  session file. So auth.json's STRUCTURE is the effective mode:
+ *  an explicit `auth_mode` field takes precedence over credential-shape
+ *  inference (R3); absent it, the mere PRESENCE of a non-null
+ *  OPENAI_API_KEY or any alternative persisted credential family is
+ *  metered/contradictory billing (codex-rs is_some() semantics) even
+ *  when ambient env keys are absent; a ChatGPT OAuth `tokens` session
+ *  is the only subscription identity. SECRET-SAFE: key names and field
+ *  shapes only — credential values are never read out, logged or
+ *  persisted. Anything missing/unparsable/contradictory fails closed. */
+export type CodexAuthMode = "CHATGPT" | "API_KEY" | "UNAUTHENTICATED" | "AMBIGUOUS";
+
+export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
+  const home = codexHomeDir(env);
+  if (!home) return "UNAUTHENTICATED";
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(home, "auth.json"), "utf8");
+  } catch {
+    return "UNAUTHENTICATED";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "AMBIGUOUS";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "AMBIGUOUS";
+  }
+  const rec = parsed as Record<string, unknown>;
+  // ChatGPT OAuth session material — the real codex-rs shape carries
+  // access_token + refresh_token strings plus an id_token claim set.
+  const tokens = rec.tokens;
+  const t = (tokens !== null && typeof tokens === "object" &&
+    !Array.isArray(tokens)) ? tokens as Record<string, unknown> : null;
+  const tokensValid = t !== null &&
+    typeof t.access_token === "string" && t.access_token !== "" &&
+    typeof t.refresh_token === "string" && t.refresh_token !== "" &&
+    t.id_token != null;
+
+  // AUDIT R3 F1 — codex-rs' persisted resolver gives an explicit
+  // auth_mode precedence over credential-shape inference. Accept only
+  // "chatgpt" backed by valid OAuth session material; every other
+  // explicit mode — including "apikey" — is a non-subscription
+  // declaration no matter how valid coexisting tokens look, and a
+  // malformed/unknown declaration is unverifiable → fail closed.
+  const declared = rec.auth_mode;
+  if (typeof declared === "string" && declared.trim() !== "") {
+    const m = declared.trim().toLowerCase();
+    if (m === "chatgpt") {
+      if (tokensValid) return "CHATGPT";
+      return tokens == null ? "UNAUTHENTICATED" : "AMBIGUOUS";
+    }
+    if (m === "apikey") return "API_KEY";
+    return "AMBIGUOUS";
+  }
+  if (declared !== undefined && declared !== null) return "AMBIGUOUS";
+
+  // auth_mode absent — credential-shape inference matching codex-rs
+  // AuthDotJson::resolved_mode() Option::is_some() semantics: field
+  // PRESENCE with a non-null value is a persisted credential — empty
+  // strings, arrays and objects still resolve that credential's mode;
+  // they never let coexisting OAuth tokens classify as CHATGPT.
+  const storedKey = rec.OPENAI_API_KEY;
+  if (storedKey !== undefined && storedKey !== null) return "API_KEY";
+  // Contradictory alternative credential families — a persisted PAT or
+  // bedrock key set is a DIFFERENT non-subscription authority the CLI
+  // can resolve; alongside OAuth tokens the effective mode is
+  // unprovable → fail closed, never CHATGPT.
+  for (const field of [
+    "personal_access_token", "bedrock_api_key", "bedrock_access_keys",
+  ]) {
+    const v = rec[field];
+    if (v !== undefined && v !== null) return "AMBIGUOUS";
+  }
+  if (tokensValid) return "CHATGPT";
+  return "AMBIGUOUS";
+}
+
+/** True only when the effective autonomous auth mode is a ChatGPT
+ *  subscription session — the live, file-backed proof behind
+ *  subscription-only invocation. Re-resolved on every call: a
+ *  `codex logout` / `login --with-api-key` between admission and
+ *  invocation is never trusted from a cached verdict. */
+export function codexChatgptSessionProven(
+  env: CodexCliEnv | undefined,
+): boolean {
+  return codexAuthMode(env) === "CHATGPT";
+}
+
 export function resolveCodexExecutable(env: CodexCliEnv | undefined): string | null {
   const configured =
     codexCliEnvGet(env, "PAIR_CODEX_PLANNER_EXECUTABLE") ??
     codexCliEnvGet(env, "PAIR_CODEX_EXECUTABLE");
   if (configured) return configured;
+  return resolveCodexExecutableSystem(env);
+}
+
+/** Platform-native codex discovery with NO env-override reads — the
+ *  executor lane's resolution primitive (its own configured seam is
+ *  checked by the caller before falling through here). */
+export function resolveCodexExecutableSystem(env: CodexCliEnv | undefined): string | null {
+  if (process.platform === "win32") {
+    return resolveCodexExecutableWin32(env);
+  }
   try {
     const resolved = execFileSync("which", ["codex"], { encoding: "utf8" }).trim();
     return resolved || null;
   } catch {
     return null;
   }
+}
+
+/** Windows-native codex executable resolution — no `which`, no shell.
+ *
+ *  Order mirrors Windows command resolution, with the security-critical
+ *  preference that a REAL PE image always beats a batch shim:
+ *    1. PATHEXT-ordered PATH scan — first `codex<ext>` that exists as a
+ *       file wins within a directory; `.exe`/`.com` candidates are
+ *       remembered before `.cmd`/`.bat` shims.
+ *    2. The native install root — `%LOCALAPPDATA%\OpenAI\Codex\bin\<ver>\
+ *       codex.exe` — is scanned so an npm-installed `codex.cmd` shim on
+ *       PATH still resolves to its underlying PE image (spawning a
+ *       `.cmd` directly is rejected by modern Node without a shell).
+ *    3. If only a batch shim exists, it is returned and the caller
+ *       launches it through `windowsSpawnTarget`'s COMSPEC wrapper with
+ *       a strict argv whitelist — never `shell: true` free-form. */
+function resolveCodexExecutableWin32(env: CodexCliEnv | undefined): string | null {
+  const isFile = (p: string): boolean => {
+    try {
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const exts = (
+    codexCliEnvGet(env, "PATHEXT") ??
+    process.env.PATHEXT ??
+    ".COM;.EXE;.BAT;.CMD"
+  )
+    .split(";")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  let batchCandidate: string | null = null;
+  for (const dirEntry of (codexCliEnvGet(env, "PATH") ?? process.env.PATH ?? "").split(path.delimiter)) {
+    const dirName = dirEntry.trim();
+    if (!dirName) continue;
+    for (const ext of exts) {
+      const cand = path.join(dirName, `codex${ext}`);
+      if (!isFile(cand)) continue;
+      if (ext === ".exe" || ext === ".com") return cand;
+      batchCandidate ??= cand;
+    }
+  }
+  const localApp = codexCliEnvGet(env, "LOCALAPPDATA") ?? process.env.LOCALAPPDATA;
+  if (localApp) {
+    const binRoot = path.join(localApp, "OpenAI", "Codex", "bin");
+    try {
+      const versions = fs.readdirSync(binRoot).sort().reverse();
+      for (const v of versions) {
+        const cand = path.join(binRoot, v, "codex.exe");
+        if (isFile(cand)) return cand;
+      }
+    } catch {
+      /* install root absent — fall through to the batch shim */
+    }
+  }
+  return batchCandidate;
+}
+
+const WIN32_BATCH_EXT = new Set([".cmd", ".bat"]);
+/** argv fragments a COMSPEC-wrapped launch may carry. The grammar admits
+ *  only token characters (paths, `key='value'` config pairs, model ids,
+ *  TOML tables): every cmd metacharacter — `& | < > ^ % ! " ( ) [ ] ;`
+ *  `$ # ? *` backtick — is rejected, so nothing outside it can ever
+ *  reach the `cmd /c` line. `{}` are retained (TOML inline tables in
+ *  governed argv) — they are not cmd metacharacters and stay inert
+ *  inside the per-token quoting below. */
+const WIN32_CMD_ARG_SAFE = /^[A-Za-z0-9_./\\:=,'@+\-~{} ]*$/;
+
+/** Launch target for `spawn`/`execFileSync`: a real `.exe`/`.com` image is
+ *  spawned directly (CreateProcess — no shell involvement at all). A
+ *  `.cmd`/`.bat` shim can only run through `cmd.exe /d /s /c`, and every
+ *  token is additionally wrapped in double quotes so cmd cannot re-parse
+ *  metacharacter adjacency — `"` itself is rejected by the grammar so the
+ *  quoting cannot be escaped. Returns null when the launch cannot be made
+ *  safe — the caller fails closed rather than invoking an unsafe shell. */
+export function windowsSpawnTarget(
+  command: string,
+  args: string[],
+): { command: string; args: string[]; verbatim: boolean } | null {
+  if (process.platform !== "win32") return { command, args, verbatim: false };
+  const base = path.basename(command).toLowerCase();
+  const isBatch = WIN32_BATCH_EXT.has(path.extname(base));
+  if (!isBatch) {
+    // Ambiguous batch-lookalike names ("codex.cmd&calc", "codex.cmd
+    // evil", "codex.bat%PATH%") would bypass the extension check and
+    // reach CreateProcess as-is — reject rather than classify.
+    if (/\.(?:cmd|bat)/.test(base) || !WIN32_CMD_ARG_SAFE.test(base)) {
+      return null;
+    }
+    return { command, args, verbatim: false };
+  }
+  const comspec = process.env.COMSPEC ?? "C:\\Windows\\System32\\cmd.exe";
+  if (
+    !WIN32_CMD_ARG_SAFE.test(command) ||
+    args.some((a) => !WIN32_CMD_ARG_SAFE.test(a))
+  ) {
+    return null;
+  }
+  // cmd /s strips the first+last quote of the /c string — wrap the whole
+  // line in an outer quote pair so every token's own quotes survive. The
+  // caller must spawn with windowsVerbatimArguments so Node does not add
+  // its own quoting layer on top of this constructed line.
+  const line = `"${[command, ...args].map((t) => `"${t}"`).join(" ")}"`;
+  return { command: comspec, args: ["/d", "/s", "/c", line], verbatim: true };
 }
 
 /** Child env: minimal inherited surface only; CODEX_HOME pins the
@@ -73,6 +293,14 @@ export function codexCliChildEnv(env: CodexCliEnv | undefined): Record<string, s
   const out: Record<string, string> = {};
   for (const k of [
     "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
+    // Windows process essentials — a stripped env leaves the child
+    // without SystemRoot (DNS/TLS/CreateProcess internals), a writable
+    // Temp, or its own install/config roots under LOCALAPPDATA and
+    // USERPROFILE. Each is still whitelist-forwarded, never ambient.
+    "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+    "USERDOMAIN", "APPDATA", "LOCALAPPDATA", "ProgramData", "PUBLIC",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
     // test-only fake-executable controls — inert for the real binary
     "FAKE_CODEX_BEHAVIOR", "FAKE_CODEX_PIDFILE", "FAKE_CODEX_INVOKELOG", "FAKE_CODEX_ENVFILE",
   ]) {
@@ -97,12 +325,20 @@ export async function spawnCodexCli(
   timeoutMs: number,
   env: CodexCliEnv | undefined,
 ): Promise<CodexCliSpawnResult> {
+  const target = windowsSpawnTarget(command, args);
+  if (!target) {
+    return {
+      status: "SPAWN_FAILED", code: null, stderrTail: "",
+      error: "CODEX_SPAWN_TARGET_UNSAFE",
+    };
+  }
   let child: ChildProcess;
   try {
-    child = spawn(command, args, {
+    child = spawn(target.command, target.args, {
       cwd: runDir,
       env: codexCliChildEnv(env),
       stdio: ["pipe", "pipe", "pipe"],
+      windowsVerbatimArguments: target.verbatim,
     });
   } catch (e) {
     return { status: "SPAWN_FAILED", code: null, stderrTail: "", error: String(e).slice(0, 200) };

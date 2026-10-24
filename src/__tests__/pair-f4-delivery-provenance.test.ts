@@ -2939,7 +2939,12 @@ describe("Phase F4 R5 — transactional reconcile + budget-aware ledger", () => 
       });
     try {
       expect(() =>
-        reconcileStaleDeliveryAttempts(ctx.store, "2026-10-05T02:00:00.000Z"),
+        reconcileStaleDeliveryAttempts(
+          ctx.store,
+          new Date(
+            Date.parse(String(before.attempt_started_at)) + 120_000,
+          ).toISOString(),
+        ),
       ).toThrow(/crash-after-append/);
     } finally {
       spy.mockRestore();

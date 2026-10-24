@@ -40,6 +40,7 @@ import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
 import type { CeoPlanningCycleService } from "./ceo-planning-cycle.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import type { BrainContextDeps } from "./brain-context.js";
 import { ObjectiveKpiVerificationService } from "./objective-kpi-verification.js";
 import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
 import {
@@ -82,6 +83,7 @@ export const OPERATING_OUTCOMES = [
   "TOPOLOGY_CHANGE_REQUIRED",
   "INSUFFICIENT_VERIFIED_PROGRESS",
   "OBJECTIVE_BUDGET_EXHAUSTED",
+  "OBJECTIVE_ZERO_BUDGET",
   "NO_ELIGIBLE_AGENT",
   "DEPENDENCY_BLOCKED",
   "OBJECTIVE_NOT_ACTIVE",
@@ -168,6 +170,13 @@ export class ObjectiveOperatingService {
      *  the pass aborts and the fault propagates. Manual/operator
      *  callers never set it — semantics are byte-identical to before. */
     authority_gate?: () => void;
+    /** AUDIT R1 F5 — optional absolute epoch bound for any delegated
+     *  planning inside this pass (the auto-driver pins it to its lease's
+     *  canonical lifetime bound minus finalization allowance). Forwarded
+     *  into prepareDelegatedPlan so a planner run can never outlive the
+     *  authority that invoked it. Manual callers never set it —
+     *  semantics are byte-identical to before. */
+    planning_deadline_epoch_ms?: number;
     /** TEST-ONLY — never set in production. */
     hooks?: OperatingPassHooks;
   }): Promise<OperatingPassResult> {
@@ -184,7 +193,9 @@ export class ObjectiveOperatingService {
     }
     const ctx: PassCtx = { steps_used: 0 };
     try {
-      return await this.pass(ctx, objectiveId, actor, input.hooks, input.authority_gate);
+      return await this.pass(
+        ctx, objectiveId, actor, input.hooks, input.authority_gate,
+        input.planning_deadline_epoch_ms);
     } catch (e) {
       if (e instanceof PassBoundExceeded) {
         // Deterministic external-wait boundary: the committed seams
@@ -199,6 +210,7 @@ export class ObjectiveOperatingService {
     ctx: PassCtx, objectiveId: string, actor: string,
     hooks?: OperatingPassHooks,
     authorityGate?: () => void,
+    planningDeadlineEpochMs?: number,
   ): Promise<OperatingPassResult> {
     const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
       outcome: o, objective_id: objectiveId, ...extra,
@@ -228,8 +240,19 @@ export class ObjectiveOperatingService {
     const allTargetsMet = kpis.length > 0 &&
       kpis.every((k) => objectiveKpiAssessment(k) === "MET");
     const budget = objective.budget as Record<string, unknown>;
-    const budgetExhausted =
-      Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd);
+    // P0-F3 — canonical budgetView semantics (objective-display R3.A):
+    // ceiling=0 is ZERO_BUDGET — a hard bound ("cannot dispatch new
+    // work"), NEVER uncapped and NEVER "exhausted". Positive ceilings
+    // still exhaust at consumed >= ceiling. Both block NEW spend-bearing
+    // work (CEO cycle, work open, new allocation); bookkeeping/observe
+    // paths above are unaffected.
+    const budgetCeiling = Number(budget.ceiling_microusd);
+    const budgetBlocked: OperatingOutcome | null =
+      budgetCeiling <= 0
+        ? "OBJECTIVE_ZERO_BUDGET"
+        : Number(budget.consumed_microusd) >= budgetCeiling
+          ? "OBJECTIVE_BUDGET_EXHAUSTED"
+          : null;
 
     let binding = this.deps.workstreams.getBinding(objectiveId); // strict
 
@@ -262,7 +285,7 @@ export class ObjectiveOperatingService {
     // §7 — initial objective bootstrap through the EXISTING P15.3
     // cycle only (never another CEO path, never Planner/Brain/executor).
     if (!binding) {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       this.tick(ctx);
       authorityGate?.();
       const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor,
@@ -341,13 +364,13 @@ export class ObjectiveOperatingService {
     // governs which one opens first (R2.E) — strategy is ordering
     // authority here, not a new model call.
     if (launchable.length > 0) {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       launchable.sort((a, b) => rankOf(a.workstream_key) - rankOf(b.workstream_key));
       return this.openDelegatedChild(
         ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
         launchable[0]!.work_item_id, actor, result, {
           workstream_key: launchable[0]!.workstream_key,
-        }, hooks, authorityGate);
+        }, hooks, authorityGate, planningDeadlineEpochMs);
     }
 
     // §12 — binding + nothing launchable + no active execution → the
@@ -369,7 +392,7 @@ export class ObjectiveOperatingService {
       order = (binding.workstreams as Array<Record<string, unknown>>)
         .map((w) => String(w.workstream_key));
     } else {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       this.tick(ctx);
       authorityGate?.();
       const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor,
@@ -489,7 +512,7 @@ export class ObjectiveOperatingService {
           ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
           ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
         },
-        hooks, authorityGate);
+        hooks, authorityGate, planningDeadlineEpochMs);
     }
     if (blocked.length > 0) {
       return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
@@ -542,7 +565,8 @@ export class ObjectiveOperatingService {
     objectiveId: string, childId: string, workstreamWorkItemId: string,
   ): { objective_version: number } |
      { abort: "OBJECTIVE_NOT_ACTIVE" | "TARGET_MET_CANDIDATE" |
-              "OBJECTIVE_BUDGET_EXHAUSTED" | "AWAITING_EXECUTION";
+              "OBJECTIVE_BUDGET_EXHAUSTED" | "OBJECTIVE_ZERO_BUDGET" |
+              "AWAITING_EXECUTION";
        mission_id?: string } {
     this.deps.objectives.evaluateDeadline(objectiveId);
     const objective = this.deps.objectives.get(objectiveId); // strict
@@ -557,6 +581,13 @@ export class ObjectiveOperatingService {
     }
     assertCanonicalObjectiveBudget(this.store, objective);
     const budget = objective.budget as Record<string, unknown>;
+    // P0-F3 — same three-state canonical classification as the pass
+    // gates: zero ceiling is a hard bound (ZERO_BUDGET), positive caps
+    // exhaust at consumed >= ceiling. A zero-budget objective can never
+    // be re-proven into dispatch authority.
+    if (Number(budget.ceiling_microusd) <= 0) {
+      return { abort: "OBJECTIVE_ZERO_BUDGET" };
+    }
     if (Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd)) {
       return { abort: "OBJECTIVE_BUDGET_EXHAUSTED" };
     }
@@ -573,51 +604,55 @@ export class ObjectiveOperatingService {
       operatingFail(`dispatch WAL does not pin child ${childId}`);
     }
     const child = this.store.get("work_item", childId) as Row;
+    const mission = this.deps.business.boundMissionForWorkItem(child);
+    // Phase C — a bound in-flight mission converges BEFORE the READY
+    // gate: the delegated-open race now interleaves at the planning
+    // await, so a losing pass re-proves AFTER the winner committed —
+    // the child is legitimately IN_PROGRESS and convergence must ride
+    // the canonical in-flight proof (§20/R2.A), never a raw READY gate.
+    if (mission && !TERMINAL_MISSION_STATUSES.has(String(mission.status))) {
+      assertCanonicalMissionInFlight(this.store, mission, child);
+      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+    }
     if (assertCanonicalWorkStatus(this.store, child) !== "READY") {
       operatingFail(`delegated child ${childId} not canonically READY`);
     }
-    const mission = this.deps.business.boundMissionForWorkItem(child);
+    // A surviving `mission` here is canonically terminal — the
+    // in-flight/PAUSED/live branches converged or propagated above.
     if (mission) {
       const ms = String(mission.status);
-      if (TERMINAL_MISSION_STATUSES.has(ms)) {
-        // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
-        // REOPENABLE contract, run AT the openWorkItem crossing and
-        // never trusting the earlier review observation:
-        //  a) the current READY must derive from an authentic
-        //     WORK_ITEM_UNBLOCKED event following THIS latest bound
-        //     predecessor — the same single authority the review used;
-        //  b) EVERY bound attempt in immutable WOB history must be
-        //     canonically terminal (mirroring openWorkItem's own
-        //     admission loop — a live earlier attempt is corrupt
-        //     authority, never converged);
-        //  c) the latest bound mission identity + lifecycle is
-        //     re-proven through its own immutable spine.
-        if (proveCanonicalUnblockProvenance(this.store, child) === null) {
-          operatingFail(
-            `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
-        }
-        for (const att of canonicalBoundAttemptsForWorkItem(
-            this.store, childId)) {
-          const am = this.store.tryGet(
-            "mission", String(att.mission_id)) as Row | null;
-          if (!am) {
-            operatingFail(
-              `bound attempt ${String(att.open_id)} mission missing`);
-          }
-          const ams = canonicalDerivedMissionStatus(this.store, am);
-          if (!TERMINAL_MISSION_STATUSES.has(ams)) {
-            operatingFail(
-              `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
-          }
-          assertCanonicalMissionLifecycle(this.store, am, ams);
-        }
-        assertCanonicalMissionLifecycle(this.store, mission, ms);
-        return { objective_version: Number(objective.version) };
+      // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
+      // REOPENABLE contract, run AT the openWorkItem crossing and
+      // never trusting the earlier review observation:
+      //  a) the current READY must derive from an authentic
+      //     WORK_ITEM_UNBLOCKED event following THIS latest bound
+      //     predecessor — the same single authority the review used;
+      //  b) EVERY bound attempt in immutable WOB history must be
+      //     canonically terminal (mirroring openWorkItem's own
+      //     admission loop — a live earlier attempt is corrupt
+      //     authority, never converged);
+      //  c) the latest bound mission identity + lifecycle is
+      //     re-proven through its own immutable spine.
+      if (proveCanonicalUnblockProvenance(this.store, child) === null) {
+        operatingFail(
+          `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
       }
-      // R2.A — converge only through a proven in-flight mission.
-      // PAUSED / live / unproven claims propagate — never a reopen.
-      assertCanonicalMissionInFlight(this.store, mission, child);
-      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+      for (const att of canonicalBoundAttemptsForWorkItem(
+          this.store, childId)) {
+        const am = this.store.tryGet(
+          "mission", String(att.mission_id)) as Row | null;
+        if (!am) {
+          operatingFail(
+            `bound attempt ${String(att.open_id)} mission missing`);
+        }
+        const ams = canonicalDerivedMissionStatus(this.store, am);
+        if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+          operatingFail(
+            `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
+        }
+        assertCanonicalMissionLifecycle(this.store, am, ams);
+      }
+      assertCanonicalMissionLifecycle(this.store, mission, ms);
     }
     return { objective_version: Number(objective.version) };
   }
@@ -627,8 +662,17 @@ export class ObjectiveOperatingService {
    *  objective-version admission pin (R2.C) bound atomically into the
    *  dedup write; the open race converges ONLY through a fully-proven
    *  canonical in-flight bound Mission (§20/R2.A) — PAUSED, terminal or
-   *  unproven claims propagate, never become AWAITING_EXECUTION. */
-  private openDelegatedChild(
+   *  unproven claims propagate, never become AWAITING_EXECUTION.
+   *
+   *  Phase C — the crossing is ASYNC now: genuine delegated planning
+   *  through the ONE shared Planner Pool seam runs AFTER the dispatch
+   *  authority proof and BEFORE openWorkItem. The plan is authorized
+   *  for the EXACT enriched bound-mission goal; the post-await re-proof
+   *  + objective-version CAS pin the authority the await could not hold,
+   *  and openWorkItem's dedup write re-checks the plan's goal digest.
+   *  Planner absent/exhausted propagates fail-closed — never a
+   *  deterministic template, never a fake successful DISPATCHED. */
+  private async openDelegatedChild(
     ctx: PassCtx,
     objectiveId: string,
     childId: string,
@@ -638,15 +682,20 @@ export class ObjectiveOperatingService {
     extra?: Partial<OperatingPassResult>,
     hooks?: OperatingPassHooks,
     authorityGate?: () => void,
-  ): OperatingPassResult {
+    /** AUDIT R1 F5 — absolute epoch bound forwarded into
+     *  prepareDelegatedPlan; absent = the configured planner run
+     *  deadline alone governs (manual pass semantics). */
+    planningDeadlineEpochMs?: number,
+  ): Promise<OperatingPassResult> {
     this.tick(ctx);
     hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
     // P15.10-C — delegated authority re-proven AT the mission-open
     // boundary: the last checkpoint before a bound Mission can exist.
     authorityGate?.();
-    const proof = this.proveDispatchAuthority(
-      objectiveId, childId, workstreamWorkItemId);
-    if ("abort" in proof) {
+    const applyAbort = (
+      proof: ReturnType<ObjectiveOperatingService["proveDispatchAuthority"]>,
+    ): OperatingPassResult | null => {
+      if (!("abort" in proof)) return null;
       if (proof.abort === "AWAITING_EXECUTION") {
         return result("AWAITING_EXECUTION", {
           delegated_child_work_item_id: childId,
@@ -658,18 +707,23 @@ export class ObjectiveOperatingService {
         owner_action_required: proof.abort === "TARGET_MET_CANDIDATE" ? true : undefined,
         ...extra,
       });
+    };
+    const proof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in proof) {
+      const aborted = applyAbort(proof);
+      if (aborted) return aborted;
     }
-    let saved: Row;
-    try {
-      saved = this.deps.business.openWorkItem(childId, actor, {
-        objective_id: objectiveId,
-        expected_objective_version: proof.objective_version,
-      }) as Row;
-    } catch (err) {
-      // An open loser converges only when the canonical bound Mission
-      // is fully proven in flight (§20/R2.A): spine replay + WOB
-      // identity + compatible runtime — PAUSED/terminal/unproven all
-      // propagate fail-closed.
+    // Phase C — genuine delegated planning. The await is OUTSIDE any
+    // transaction; nothing committed yet. Planner unavailability or
+    // exhaustion propagates fail-closed — the pass reports the planner
+    // failure, never a DISPATCHED claim without an authorized plan.
+    // AUDIT R1 F2 — prepareDelegatedPlan now preflights the identical
+    // open-eligibility gates BEFORE paying for planning, so a losing
+    // race may surface an eligibility throw from EITHER the preflight
+    // or the open dedup. Both converge through the same canonical
+    // in-flight mission proof.
+    const convergeIfMissionInFlight = (): OperatingPassResult | null => {
       const child = this.store.tryGet("work_item", childId) as Row | null;
       const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
       if (mission && child) {
@@ -680,6 +734,45 @@ export class ObjectiveOperatingService {
           ...extra,
         });
       }
+      return null;
+    };
+    let prepared: Awaited<
+      ReturnType<BusinessLayer["prepareDelegatedPlan"]>>;
+    try {
+      prepared = await this.deps.business.prepareDelegatedPlan(
+        childId, actor, { planningDeadlineEpochMs });
+    } catch (err) {
+      const conv = convergeIfMissionInFlight();
+      if (conv) return conv;
+      throw err;
+    }
+    // Phase C — authority re-proven AFTER the asynchronous planning
+    // await: the driver lease may have lapsed mid-plan and the
+    // objective/strategy state may have drifted. The re-proven
+    // objective version below is what the dedup write CAS-pins.
+    authorityGate?.();
+    const reproof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in reproof) {
+      const reaborted = applyAbort(reproof);
+      if (reaborted) return reaborted;
+    }
+    const expectedVersion = "objective_version" in reproof
+      ? reproof.objective_version
+      : ("objective_version" in proof ? proof.objective_version : undefined);
+    let saved: Row;
+    try {
+      saved = this.deps.business.openWorkItem(childId, actor, {
+        objective_id: objectiveId,
+        expected_objective_version: expectedVersion,
+      }, { prepared_plan: prepared }) as Row;
+    } catch (err) {
+      // An open loser converges only when the canonical bound Mission
+      // is fully proven in flight (§20/R2.A): spine replay + WOB
+      // identity + compatible runtime — PAUSED/terminal/unproven all
+      // propagate fail-closed.
+      const conv = convergeIfMissionInFlight();
+      if (conv) return conv;
       throw err;
     }
     const mission = this.deps.business.boundMissionForWorkItem(saved);
@@ -731,6 +824,10 @@ export function createDefaultObjectiveOperatingService(deps: {
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
+  /** P17 — optional scoped advisory surfaces forwarded into the
+   *  default BrainContext inside the CEO cycle. */
+  experience?: BrainContextDeps["experience"];
+  scopedMemory?: BrainContextDeps["scopedMemory"];
 }): { service: ObjectiveOperatingService; model_entry_id: string;
   ceoCycle: CeoPlanningCycleService;
   kpiVerification: ObjectiveKpiVerificationService } {
@@ -739,6 +836,8 @@ export function createDefaultObjectiveOperatingService(deps: {
     business: deps.business,
     workforce: deps.workforce,
     invoker: deps.invoker,
+    experience: deps.experience,
+    scopedMemory: deps.scopedMemory,
   });
   const review = new ObjectiveAdaptiveReviewService({
     store: deps.store,

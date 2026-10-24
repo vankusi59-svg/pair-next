@@ -28,7 +28,9 @@ import type { PairControlPlane } from "./service.js";
 
 export const ROUTING_POLICY_VERSION = "pair.os.vnext.capability-routing.v1";
 
-const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+// Canonical execution-terminal set — mirrors MissionRuntime.TERMINAL_EXECUTION.
+// TIMEOUT is terminal: a timed-out execution no longer holds a remote slot.
+const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 const AUTH_REJECTED = new Set(["AUTH_REQUIRED", "UNAUTHENTICATED", "EXPIRED", "NONE", "DENIED"]);
 const QUOTA_REJECTED = new Set(["EXHAUSTED", "DEPLETED", "BLOCKED"]);
 const RATE_LIMIT_REJECTED = new Set(["LIMITED", "THROTTLED", "BLOCKED", "EXHAUSTED"]);
@@ -58,7 +60,11 @@ export class CapabilityRouter {
       .filter(
         (e) =>
           e.executor_id === executorId &&
-          !EXECUTION_TERMINAL.has(String(e.execution_state)),
+          !EXECUTION_TERMINAL.has(String(e.execution_state)) &&
+          // Phase D §5 / P0-F1 — a durable terminal_outcome (reconciled
+          // settle or operator no-replay acknowledgment) releases the
+          // slot regardless of the last reported execution_state.
+          !e.terminal_outcome,
       ).length;
   }
 

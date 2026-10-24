@@ -69,6 +69,10 @@ export function beginPlannerRun(
       operator_id: args.operator_id ?? null,
       routes: args.routes,
       attempts: 0,
+      // AUDIT R1 F4 — provider requests PROVABLY initiated across all
+      // attempts (transport-reported, never inferred from attempt rows).
+      // Settlement reads THIS field — never `attempts`.
+      provider_requests: 0,
       winner_attempt_no: null,
       preview_id: null,
       error_code: null,
@@ -230,35 +234,57 @@ export function settlePlannerAttempt(
     actor?: string;
   },
 ): void {
-  const row = store.tryGet(ATTEMPT_ENTITY, args.planner_attempt_id);
-  if (!row) return;
-  const r = args.record;
-  const body = {
-    ...row,
-    outcome: r.outcome,
-    completed_at: r.completed_at,
-    latency_ms: r.latency_ms,
-    failure_class: r.failure_class ?? null,
-    warnings: r.warnings ?? [],
-    winner: args.winner ?? false,
-    plan_digest: args.plan_digest ?? r.plan_digest ?? null,
-  };
-  store.put(ATTEMPT_ENTITY, args.planner_attempt_id, body, Number(row.version ?? 0));
-  store.event({
-    entity_type: ATTEMPT_ENTITY,
-    entity_id: args.planner_attempt_id,
-    event_type: r.outcome === "SUCCESS" ? "PLANNER_ATTEMPT_SUCCEEDED" : "PLANNER_ATTEMPT_FAILED",
-    old_state: "STARTED",
-    new_state: r.outcome,
-    actor: args.actor ?? "PAIR_PLANNER",
-    metadata: {
-      planner_run_id: row.planner_run_id,
-      route: r.route,
-      model_entry_id: r.model_entry_id,
-      attempt_no: r.attempt_no,
+  store.immediate(() => {
+    const row = store.tryGet(ATTEMPT_ENTITY, args.planner_attempt_id);
+    if (!row) return;
+    const r = args.record;
+    const body = {
+      ...row,
+      outcome: r.outcome,
+      completed_at: r.completed_at,
       latency_ms: r.latency_ms,
       failure_class: r.failure_class ?? null,
-    },
+      warnings: r.warnings ?? [],
+      winner: args.winner ?? false,
+      plan_digest: args.plan_digest ?? r.plan_digest ?? null,
+      // AUDIT R1 F4 — transport-reported provider-request count for THIS
+      // attempt; settled terminal rows always carry it (0 = provably no
+      // provider invocation, e.g. eligibility-rejected before planFn).
+      provider_requests: Number(r.provider_requests ?? 0),
+    };
+    store.put(ATTEMPT_ENTITY, args.planner_attempt_id, body, Number(row.version ?? 0));
+    // AUDIT R1 F4 — aggregate the attempt's proven provider spend onto
+    // the run row atomically with the attempt settle: cost settlement
+    // keys on run.provider_requests, never the STARTED-row count.
+    const run = store.tryGet(RUN_ENTITY, String(row.planner_run_id));
+    if (run) {
+      store.put(
+        RUN_ENTITY,
+        String(row.planner_run_id),
+        {
+          ...run,
+          provider_requests:
+            Number(run.provider_requests ?? 0) + Number(r.provider_requests ?? 0),
+        },
+        Number(run.version ?? 0),
+      );
+    }
+    store.event({
+      entity_type: ATTEMPT_ENTITY,
+      entity_id: args.planner_attempt_id,
+      event_type: r.outcome === "SUCCESS" ? "PLANNER_ATTEMPT_SUCCEEDED" : "PLANNER_ATTEMPT_FAILED",
+      old_state: "STARTED",
+      new_state: r.outcome,
+      actor: args.actor ?? "PAIR_PLANNER",
+      metadata: {
+        planner_run_id: row.planner_run_id,
+        route: r.route,
+        model_entry_id: r.model_entry_id,
+        attempt_no: r.attempt_no,
+        latency_ms: r.latency_ms,
+        failure_class: r.failure_class ?? null,
+      },
+    });
   });
 }
 
@@ -308,6 +334,10 @@ export const DEFAULT_PREVIEW_TTL_S = 1800;
 export function effectiveInputDigest(input: {
   project_id: string;
   goal: string;
+  /** R1 — the provenance-bound operator request resolved at preview
+   *  time. Digest-bound so a drifted operator authority between preview
+   *  and confirm is unrepresentable (confirm replays mission_input). */
+  operator_goal?: string | null;
   granted_permissions?: unknown[];
   authorized_workspaces?: unknown[];
   risk_ceiling?: unknown;
@@ -320,6 +350,7 @@ export function effectiveInputDigest(input: {
     effective_planning_input: 1,
     project_id: String(input.project_id),
     goal: String(input.goal),
+    operator_goal: input.operator_goal ?? null,
     granted_permissions: input.granted_permissions ?? [],
     authorized_workspaces: input.authorized_workspaces ?? [],
     risk_ceiling: input.risk_ceiling ?? null,

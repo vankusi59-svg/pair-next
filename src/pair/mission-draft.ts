@@ -44,10 +44,11 @@ import {
   newId,
   utcnow,
 } from "./canonical.js";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ConversationSessionService } from "./conversation-session.js";
 import type { MissionControl } from "./mission-control.js";
+import type { DelegatedPlanExpander } from "./business.js";
 
 export const MISSION_DRAFT_ENTITY = "conversation_mission_draft";
 export const MISSION_DRAFT_SCHEMA = "pair.os.vnext.conversation-mission-draft.v1";
@@ -158,6 +159,12 @@ export class MissionDraftService {
        *  createPlanPreview + confirmPlanPreview on it, after draft
        *  confirmation authority is proven. */
       control: MissionControl;
+      /** Phase C — the ONE shared async LLM Planner Pool seam (the same
+       *  expander the API preview/submit edge, schedules and delegated
+       *  opens use). Absent → confirm fails closed FAIL_CLOSED_NO_PLANNER:
+       *  zero provider calls, zero fabricated planner_run evidence, the
+       *  draft stays SUBMITTING for an honest retry. */
+      planExpander?: DelegatedPlanExpander;
       store: PairEvidenceStore;
       draft_ttl_s?: number;
       now?: () => string;
@@ -686,9 +693,23 @@ export class MissionDraftService {
 
     /* ---- Planning — ONLY after the claim is durable ----------------- */
     if (row.preview_id == null) {
-      // createPlanPreview runs the planner/preview pipeline — the SAME
-      // governed path as Task Entry. Persisted preview = READY evidence.
-      const preview = this.deps.control.createPlanPreview({
+      // Phase C — the draft plans through the SAME asynchronous LLM
+      // Planner Pool expander as every other new-Mission ingress (the
+      // API preview/submit edge, schedules, delegated WorkItem opens).
+      // Missing dependency → typed FAIL_CLOSED_NO_PLANNER: zero provider
+      // calls, zero fabricated planner_run evidence, draft stays
+      // SUBMITTING so a retry can recover once planning exists. An
+      // EXISTING planner that exhausts its candidates propagates the
+      // durable run/attempt evidence upward — the two failure classes
+      // are never conflated.
+      const expander = this.deps.planExpander;
+      if (!expander) {
+        throw new PolicyError(
+          "FAIL_CLOSED_NO_PLANNER",
+          "conversation_mission_draft.confirm",
+        );
+      }
+      const expanded = await expander({
         project_id: row.project_id,
         goal: row.goal,
         metadata: { conversation_draft: { session_id: sessionId, draft_id: draftId } },
@@ -697,6 +718,26 @@ export class MissionDraftService {
         risk_ceiling: row.risk_ceiling ?? undefined,
         operator_id: operatorId,
       });
+      const exInput =
+        (expanded as { input?: Record<string, unknown> }).input ??
+        (expanded as unknown as Record<string, unknown>);
+      const plannerEvidence = (expanded as { planner?: Record<string, unknown> }).planner;
+      // The persisted preview replays the DRAFT's canonical terms —
+      // project/goal/constraints are the confirmed digest's authority;
+      // only the expander's metadata merge (llm_plan + provenance) rides
+      // along, with the draft marker pinned last.
+      const preview = this.deps.control.createPlanPreview({
+        project_id: row.project_id,
+        goal: row.goal,
+        metadata: {
+          ...((exInput.metadata as Record<string, unknown> | undefined) ?? {}),
+          conversation_draft: { session_id: sessionId, draft_id: draftId },
+        },
+        granted_permissions: row.granted_permissions,
+        authorized_workspaces: row.authorized_workspaces ?? undefined,
+        risk_ceiling: row.risk_ceiling ?? undefined,
+        operator_id: operatorId,
+      }, plannerEvidence as never);
       // Pin the preview binding — CAS: a racing pin wins, the loser
       // adopts the pinned preview instead of its own. Exactly one
       // preview is ever submitted per draft.

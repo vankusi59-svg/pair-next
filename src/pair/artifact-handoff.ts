@@ -50,6 +50,7 @@ import {
 } from "./artifact-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
+import * as w32 from "./win32-object-io.js";
 import type { ArtifactConsumeCapabilityClaims } from "./artifact-consume-capability.js";
 import { artifactDependencySetDigest } from "./artifact-consume-capability.js";
 import {
@@ -64,6 +65,7 @@ import type { BusinessLayer } from "./business.js";
 import type { WorkforceService } from "./work-graph.js";
 import { AgentContractService } from "./agent-contract.js";
 import { ObjectiveAuthorityService } from "./objective-authority.js";
+import { ObjectiveRelationService } from "./objective-relation.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { validateWorkOpenBindingById } from "./work-open-binding.js";
 
@@ -125,6 +127,9 @@ export const DEPENDENCY_ARTIFACT_ROOT = ".pair/dependency-artifacts";
  *  bound) and a documented aggregate cap. */
 export const MAX_DEPENDENCY_ARTIFACTS_PER_TASK = 32;
 export const MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/** P0-A — read-only access mask for handle-relative child opens on win32. */
+const WIN32_READ_ONLY_ACCESS = w32.W32.GENERIC_READ | w32.W32.SYNCHRONIZE;
 
 /** Dependency-resolution failures classify deterministically as
  *  DEPENDENCY_FAILURE (the recovery classifier maps the FAIL_CLOSED_
@@ -427,6 +432,18 @@ export class ArtifactDependencyResolver {
     const isDepPredecessor = (t: Record<string, unknown>): boolean =>
       depRefs.has(String(t.task_key)) || depRefs.has(String(t.task_id));
 
+    // Self-produced consumes need no upstream handoff: the committed plan
+    // model (plan-dataflow requiredEdges) requires no producer edge when a
+    // task declares the same artifact in consumes AND produces — the task
+    // creates it itself. Dispatch must honor that committed model rather
+    // than invent a producer the validator never demanded.
+    const ownProduces = new Set(
+      [...producesOf(task)]
+        .map((p) => {
+          try { return normalizeArtifactName(p); } catch { return null; }
+        })
+        .filter((p): p is string => p !== null),
+    );
     const entries: DependencyArtifactEntry[] = [];
     let totalBytes = 0;
     for (const rawName of [...consumes].sort()) {
@@ -470,6 +487,10 @@ export class ArtifactDependencyResolver {
           entries.push(extEntry);
           continue;
         }
+        // A consume the task itself produces is self-shadowed: no
+        // predecessor edge is required by the committed plan model, so
+        // nothing materializes — the task writes its own artifact.
+        if (ownProduces.has(name)) continue;
         // Declared consume with no producing predecessor: under the
         // committed plan model this state should never exist — treat as
         // unresolvable rather than guessing a source.
@@ -642,10 +663,18 @@ export class ArtifactDependencyResolver {
     return this._walDeps;
   }
 
+  /** P18-D — strict relation authority for the handoff scope. The
+   *  service is store-only (its own ObjectiveAuthorityService lazily
+   *  re-proves endpoints) — no cycle, read-only use. */
+  private _relations: ObjectiveRelationService | null = null;
+  private relations(): ObjectiveRelationService {
+    this._relations ??= new ObjectiveRelationService(this.store);
+    return this._relations;
+  }
+
   listEligibleExternalInputSources(
     mission: Record<string, unknown>,
   ): ExternalInputArtifactSource[] {
-    const CAP = 64;
     const lineageFail = (detail: string): never => {
       throw new IntegrityError(
         "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
@@ -667,6 +696,56 @@ export class ArtifactDependencyResolver {
     if (!own.ok || !own.binding) lineageFail(`consumer_binding:${own.reason}`);
     const binding = own.binding as Record<string, unknown>;
     const workItemId = String(binding.work_item_id ?? "");
+    return this.eligibleSourcesForWorkItemScope({
+      workItemId,
+      businessId: String(binding.business_id ?? ""),
+      consumerMissionId,
+      allowUndelegated: false,
+    });
+  }
+
+  /** EXTERNAL_INPUT_AWARENESS — the SAME canonical sibling scope resolved
+   *  before a consumer Mission exists: delegated-open planning happens
+   *  while the work item still has no work_open_binding, so the eligible
+   *  set derives from the work item's allocation directly. A work item
+   *  with no objective allocation simply has no authorized scope
+   *  (mirrors the unbound-mission early return); a malformed one fails
+   *  closed on the identical lineage checks. */
+  listEligibleExternalInputSourcesForWorkItem(
+    workItemId: string,
+  ): ExternalInputArtifactSource[] {
+    const wi = this.store.tryGet("work_item", String(workItemId)) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!wi) return [];
+    return this.eligibleSourcesForWorkItemScope({
+      workItemId: String(workItemId),
+      businessId: String(wi.business_id ?? ""),
+      consumerMissionId: "",
+      allowUndelegated: true,
+    });
+  }
+
+  /** Shared scope resolver: work item → allocation receipt → objective →
+   *  sibling work items → bound missions → ACCEPTED artifacts. */
+  private eligibleSourcesForWorkItemScope(opts: {
+    workItemId: string;
+    businessId: string;
+    consumerMissionId: string;
+    /** true = zero allocations is a legitimate "no scope" (plan-time,
+     *  pre-binding); false = canonical strictness (consumer already
+     *  bound — exactly one allocation is mandatory). */
+    allowUndelegated: boolean;
+  }): ExternalInputArtifactSource[] {
+    const CAP = 64;
+    const { workItemId, businessId, consumerMissionId } = opts;
+    const lineageFail = (detail: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        detail,
+      );
+    };
     // F1 — the work item's objective pin must be the canonical P15.4
     // receipt: exactly one allocation, full provenance proof, and the
     // same business as the binding.
@@ -677,6 +756,7 @@ export class ArtifactDependencyResolver {
         String((r as Record<string, unknown>).delegated_child_work_item_id ?? "") ===
         workItemId,
     );
+    if (!allocs.length && opts.allowUndelegated) return [];
     if (allocs.length !== 1) {
       lineageFail(`work_item_allocation_count:${allocs.length}`);
     }
@@ -695,31 +775,46 @@ export class ArtifactDependencyResolver {
       );
     }
     const alloc = allocs[0] as Record<string, unknown>;
-    if (
-      String(alloc.business_id ?? "") !==
-      String((binding as Record<string, unknown>).business_id ?? "")
-    ) {
+    if (String(alloc.business_id ?? "") !== businessId) {
       lineageFail("allocation_business_mismatch");
     }
     const objectiveId = String(alloc.objective_id ?? "");
-    const objective = this.store.tryGet("objective", objectiveId) as
-      | Record<string, unknown>
-      | null
-      | undefined;
-    if (!objective) lineageFail("objective_missing");
-    const obj = objective as Record<string, unknown>;
-    if (
-      String(obj.business_id ?? "") !==
-      String(binding.business_id ?? "")
-    ) {
-      lineageFail("objective_business_mismatch");
+    // P18-D — authorized objective scope: the consumer's own objective
+    // plus every ACTIVE DEPENDS_ON upstream (cross-objective deliverable
+    // handoff). STRICT relation enumeration via admissionView — a
+    // corrupt relation row wedges the lineage exactly like a corrupt
+    // allocation (never silently expands, never silently denies).
+    // CONFLICTS/SUPERSEDES never authorize handoff; direct edges only
+    // (transitivity is not consent — each hop needs its own minted
+    // bilateral-owner relation). A fabricated or owner-amended edge
+    // drops semantically, never expands scope.
+    const authorizedObjectives = new Set<string>([objectiveId]);
+    try {
+      for (const up of this.relations().admissionView(objectiveId).upstream) {
+        authorizedObjectives.add(up);
+      }
+    } catch (err) {
+      lineageFail(
+        `relation_scope:${String((err as { code?: string })?.code ?? err)}`,
+      );
+    }
+    for (const authObjectiveId of authorizedObjectives) {
+      const objective = this.store.tryGet("objective", authObjectiveId) as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      if (!objective) lineageFail("objective_missing");
+      const obj = objective as Record<string, unknown>;
+      if (String(obj.business_id ?? "") !== businessId) {
+        lineageFail("objective_business_mismatch");
+      }
     }
     // F1 — sibling scope: every allocation of the objective must itself
     // satisfy canonical provenance; every bound mission binding under
     // those work items must validate against its real mission row.
     const siblingWorkItems = new Set<string>();
     for (const r of this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []) {
-      if (String(r.objective_id ?? "") !== objectiveId) continue;
+      if (!authorizedObjectives.has(String(r.objective_id ?? ""))) continue;
       try {
         // R2-F1 — sibling scope proven through the SAME full canonical
         // allocation authority as the consumer's own work item.
@@ -797,6 +892,7 @@ export class ArtifactDependencyResolver {
         source_governed_task_id: String(row.governed_task_id),
         source_execution_id: String(row.execution_id),
         source_executor_id: String(row.producer_executor_id),
+        source_created_at: String(a.created_at ?? ""),
       });
     }
     return out;
@@ -1491,6 +1587,25 @@ export class ArtifactHandoffService {
       }
       const { relParts, realWorkspace, realAllowedRoots } =
         this.resolveConsumerDest(workspace, allowedPaths, e);
+      // P0-A — Windows-native materialization bound to kernel HANDLEs:
+      // every name lookup is anchored to the proven directory object
+      // (NtCreateFile RootDirectory == /proc/self/fd/<dirfd>/<name>),
+      // publication is an atomic no-replace handle-relative rename
+      // (FileRenameInformation ReplaceIfExists=false == link() EEXIST),
+      // and dir durability is a real FlushFileBuffers on that handle.
+      if (process.platform === "win32") {
+        this.materializeEntryWin32(
+          handoff,
+          governed,
+          e,
+          bytes,
+          relParts,
+          realWorkspace,
+          realAllowedRoots,
+        );
+        materialized.push(e.consumer_relative_path);
+        continue;
+      }
       // R2.3 — the directory OBJECT proven inside the governed workspace
       // is the directory object used to create/write/rename the
       // dependency file. Everything below the bound fd is expressed as
@@ -2144,6 +2259,223 @@ export class ArtifactHandoffService {
       throw err;
     }
     return { fd: curFd, realPath: curReal! };
+  }
+
+  /**
+   * P0-A win32 — the `openContainedParentFd` equivalent on kernel
+   * HANDLEs: the workspace directory is opened once, each existing
+   * component is opened INSIDE the previously proven handle
+   * (NtCreateFile RootDirectory), each missing component is created
+   * inside the proven handle — a swapped pathname component can never
+   * redirect even the mkdir. A component that is a reparse point
+   * (junction/symlink) is opened AS the link object and fails closed —
+   * O_NOFOLLOW parity. Final component must live beneath a real allowed
+   * root. Fails closed when the platform cannot prove opened objects.
+   */
+  private openContainedParentWin32(
+    realWorkspace: string,
+    dirComponents: string[],
+    realAllowedRoots: string[],
+    rel: string,
+  ): { obj: w32.W32Object; realPath: string } {
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+        `${rel}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
+    };
+    const openDir = (p: string): w32.W32Object => {
+      const r = w32.openObject(p, { directory: true });
+      if (!r.ok) fail("parent_open");
+      return r.ok ? r.obj : (undefined as never);
+    };
+    const prove = (obj: w32.W32Object, final: boolean): string => {
+      if (obj.isReparse || !obj.isDir) fail("parent_open");
+      if (!w32.win32PathWithin(obj.finalPath, realWorkspace)) {
+        fail("parent_outside_workspace");
+      }
+      if (
+        final &&
+        !realAllowedRoots.some((r) => w32.win32PathWithin(obj.finalPath, r))
+      ) {
+        fail("parent_outside_allowed_paths");
+      }
+      return obj.finalPath;
+    };
+    let cur = openDir(realWorkspace);
+    let curReal = prove(cur, false);
+    try {
+      for (let i = 0; i < dirComponents.length; i++) {
+        const comp = dirComponents[i]!;
+        // Open INSIDE the proven directory object — the name lookup is
+        // anchored to the handle, never to a mutable pathname.
+        let child = w32.openChildObject(cur, comp, { directory: true });
+        if (!child.ok && child.kind === "not_found") {
+          // mkdir INSIDE the proven directory object.
+          child = w32.openChildObject(cur, comp, {
+            directory: true,
+            create: "create",
+          });
+        }
+        if (!child.ok) fail("parent_open");
+        const childObj = child.ok ? child.obj : (undefined as never);
+        const childReal = prove(childObj, i === dirComponents.length - 1);
+        w32.closeObject(cur);
+        cur = childObj;
+        curReal = childReal;
+      }
+    } catch (err) {
+      w32.closeObject(cur);
+      throw err;
+    }
+    return { obj: cur, realPath: curReal };
+  }
+
+  /**
+   * P0-A win32 — materialize one pinned dependency artifact into the
+   * consumer workspace, bound entirely to kernel handles. Mirrors the
+   * Linux sequence exactly: bounded open-object verify → temp create
+   * inside the proven dir → write+fsync on the same handle → atomic
+   * no-replace publish (collision → converge-or-fail on the raced dest)
+   * → dir fsync → post-write re-probe of the MATERIALIZED object.
+   */
+  private materializeEntryWin32(
+    handoff: Record<string, unknown>,
+    governed: Record<string, unknown>,
+    e: DependencyArtifactEntry,
+    bytes: Buffer,
+    relParts: string[],
+    realWorkspace: string,
+    realAllowedRoots: string[],
+  ): void {
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+        `${e.consumer_relative_path}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
+    };
+    const parent = this.openContainedParentWin32(
+      realWorkspace,
+      relParts.slice(0, -1),
+      realAllowedRoots,
+      e.consumer_relative_path,
+    );
+    const dirObj = parent.obj;
+    try {
+      const base = relParts[relParts.length - 1]!;
+      const converged = (obj: w32.W32Object): boolean => {
+        const b = w32.readObject(obj, MAX_ARTIFACT_BYTES);
+        return (
+          b !== null &&
+          sha256Hex(b) === e.sha256 &&
+          b.length === e.byte_size
+        );
+      };
+      const existing = w32.openChildObject(dirObj, base, {
+        access: WIN32_READ_ONLY_ACCESS,
+      });
+      if (existing.ok) {
+        try {
+          if (existing.obj.isReparse || existing.obj.isDir) {
+            fail("conflict");
+          }
+          if (converged(existing.obj)) {
+            this.markState(handoff, "MATERIALIZED", governed);
+            return;
+          }
+          fail("existing_bytes_differ");
+        } finally {
+          w32.closeObject(existing.obj);
+        }
+      }
+      if (!existing.ok && existing.kind !== "not_found") {
+        fail(`dest_open:${existing.kind}`);
+      }
+      const tmpName = `.${base}.tmp-${process.pid}-${Math.random()
+        .toString(36)
+        .slice(2, 10)}`;
+      const tmp = w32.openChildObject(dirObj, tmpName, { create: "create" });
+      if (!tmp.ok) fail(`tmp_open:${tmp.kind}`);
+      const tobj = tmp.ok ? tmp.obj : (undefined as never);
+      // Single ownership / single close: the temp handle is released
+      // exactly once and release is ALWAYS attempted, including when
+      // arming delete-on-close fails. Returns false when required
+      // delete-on-close could not be armed — callers reaching the
+      // success path must then fail closed rather than mark the
+      // handoff MATERIALIZED with an unverified temp cleanup.
+      let tmpLive = true;
+      const closeTmp = (markDelete: boolean): boolean => {
+        if (!tmpLive) return true;
+        tmpLive = false;
+        const armed = markDelete ? w32.deleteOnClose(tobj) : true;
+        w32.closeObject(tobj);
+        return armed;
+      };
+      let published = false;
+      try {
+        // Prove the OPENED temp object before a byte lands: a regular
+        // non-reparse file whose canonical path stays inside the proven
+        // dir — same check the Linux branch makes via /proc/self/fd.
+        if (tobj.isReparse || tobj.isDir) fail("tmp_object");
+        if (!w32.win32PathWithin(tobj.finalPath, parent.realPath)) {
+          fail("tmp_outside");
+        }
+        if (!w32.writeObject(tobj, bytes)) fail("tmp_write");
+        if (!w32.flushObject(tobj)) fail("tmp_fsync");
+        const pub = w32.renameIntoDir(tobj, dirObj, base);
+        if (pub === "ok") {
+          published = true;
+          closeTmp(false); // the opened object IS the dest now
+        } else if (pub === "exists") {
+          // Publish lost the race — delete the temp. If the
+          // delete-on-close could not be armed the temp object may
+          // linger in the consumer workspace; that cleanup failure is
+          // itself a fail-closed condition — never converge to
+          // MATERIALIZED on top of it. The raced destination is never
+          // touched by this branch.
+          if (!closeTmp(true)) fail("tmp_cleanup");
+          const raced = w32.openChildObject(dirObj, base, {
+            access: WIN32_READ_ONLY_ACCESS,
+          });
+          if (!raced.ok) fail(`dest_open:${raced.kind}`);
+          const racedObj = raced.ok ? raced.obj : (undefined as never);
+          try {
+            if (converged(racedObj)) {
+              this.markState(handoff, "MATERIALIZED", governed);
+              return;
+            }
+            fail("existing_bytes_differ");
+          } finally {
+            w32.closeObject(racedObj);
+          }
+        } else {
+          fail(`publish:${pub.status.toString(16)}`);
+        }
+      } finally {
+        if (!published) closeTmp(true);
+      }
+      // Directory durability barrier on the SAME proven handle.
+      if (!w32.flushObject(dirObj)) {
+        fail("dir_fsync:win32");
+      }
+      // Post-write verification of the MATERIALIZED object bound to the
+      // proven directory — never the mutable root pathname.
+      const written = w32.openChildObject(dirObj, base, {
+        access: WIN32_READ_ONLY_ACCESS,
+      });
+      if (!written.ok) fail("post_write_mismatch");
+      const writtenObj = written.ok ? written.obj : (undefined as never);
+      try {
+        if (!converged(writtenObj)) fail("post_write_mismatch");
+      } finally {
+        w32.closeObject(writtenObj);
+      }
+      this.markState(handoff, "MATERIALIZED", governed);
+    } finally {
+      w32.closeObject(dirObj);
+    }
   }
 
   private markState(

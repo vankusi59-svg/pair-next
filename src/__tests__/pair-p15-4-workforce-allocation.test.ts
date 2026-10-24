@@ -788,7 +788,8 @@ function ensureAllocBundle() {
     .at(-1);
   if (!esbuild) throw new Error("esbuild binary not found");
   // Always rebuild — a stale bundle would test old source silently.
-  execFileSync(esbuild, [
+  execFileSync(process.execPath, [
+    esbuild,
     "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
     "--external:better-sqlite3", "--external:ulid", "--external:yaml",
     `--outfile=${R2_BUNDLE}`,

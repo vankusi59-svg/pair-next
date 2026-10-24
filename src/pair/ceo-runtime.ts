@@ -32,6 +32,16 @@ import {
   CeoPlanningCycleService,
   type CeoObservationDeps,
 } from "./ceo-planning-cycle.js";
+/* P16-C brief wiring closes a managed ESM cycle (ceo-runtime →
+   brain-context → objective-cockpit → objective-adaptive-review →
+   ceo-runtime + reasoning-brief → ceo-planning-cycle). All cross-
+   references are call-time bindings or hoisted export functions —
+   keep it that way: no eval-time use of the cyclic modules here. */
+import { BrainContextService, type BrainContextDeps } from "./brain-context.js";
+import {
+  briefObservationView,
+  ReasoningBriefService,
+} from "./reasoning-brief.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { BusinessLayer } from "./business.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
@@ -101,6 +111,19 @@ export interface CeoRuntimeComposition {
     executable?: string;
     scratchDir?: string;
   };
+  /** P16-C — advisory brief projection seam for the observation.
+   *  Injected verbatim into CeoObservationDeps.brain_brief (tests and
+   *  richer compositions may wire autoPolicy/autoDriver/artifacts).
+   *  When omitted, a default BrainContext + ReasoningBrief stack is
+   *  composed over the same strict reads bound to the resolved CEO
+   *  model entry; optional sections with no wired authority report
+   *  *_NOT_WIRED honestly. */
+  brain_brief?: CeoObservationDeps["brain_brief"];
+  /** P17 — optional scoped advisory surfaces forwarded into the
+   *  default BrainContextService (ignored when brain_brief is
+   *  injected — the injected seam owns its own wiring). */
+  experience?: BrainContextDeps["experience"];
+  scopedMemory?: BrainContextDeps["scopedMemory"];
   timeout_ms?: number;
   stale_grace_ms?: number;
   now?: () => string;
@@ -133,11 +156,33 @@ export function createDefaultCeoPlanningCycle(
     ((row) => deps.business.proveWorkItemDone(row as never));
   const invoker = deps.invoker ??
     new CodexCliCeoDecisionInvoker(deps.invoker_options ?? {});
+  // P16-C — default advisory brief stack: the owner's governed
+  // BrainContext projected through briefObservationView (digest-stable
+  // subset only). Zero writes, zero invocations — the same seam the
+  // P16-B surface uses, bound to THIS cycle's canonical model entry.
+  const brain_brief = deps.brain_brief ?? (() => {
+    const briefs = new ReasoningBriefService(deps.store, {
+      brain: new BrainContextService({
+        store: deps.store,
+        business: deps.business,
+        workforce: deps.workforce,
+        objectives,
+        workstreams,
+        // P17 — scoped tenancy readers; absent deps report *_NOT_WIRED.
+        experience: deps.experience,
+        scopedMemory: deps.scopedMemory,
+      }),
+      model_entry_id: modelEntryId,
+    });
+    return (objectiveId: string, ownerActor: string) =>
+      briefObservationView(briefs.briefFor(objectiveId, ownerActor));
+  })();
   const service = new CeoPlanningCycleService({
     store: deps.store,
     objectives,
     workstreams,
     proveWorkItemDone,
+    brain_brief,
     invoker,
     model_entry_id: modelEntryId,
     timeout_ms: deps.timeout_ms,

@@ -43,7 +43,16 @@ export function registerGovernedExecutors(
   service: PairControlPlane,
   adapters: Map<string, ExecutorAdapter>,
   actor = "PAIR_P5_MULTI_EXECUTOR",
-  options: { priorities?: Record<string, number> } = {},
+  options: {
+    priorities?: Record<string, number>;
+    /** Executor ids whose PRODUCT default is OFF (operator opt-in):
+     *  they register DISABLED on first boot only — a persisted
+     *  `status` always wins over the seeding default, so a persisted
+     *  operator toggle survives every restart both directions
+     *  (OFF never silently re-enables; ON under a default-OFF product
+     *  never silently disables). */
+    default_disabled?: string[];
+  } = {},
 ): RegisteredExecutors {
   const registry = new ExecutorRegistry(service);
   const registered: string[] = [];
@@ -59,6 +68,17 @@ export function registerGovernedExecutors(
     const capabilities =
       (capOut.capability_ids as string[]) ?? (capOut.capabilities as string[]) ?? [];
 
+    // Executor ON/OFF persistence: registration reconciles identity,
+    // capability and health — it never owns operator intent. A persisted
+    // status (whatever it says) survives re-registration; only the
+    // audited ExecutorRegistry.setExecutorEnabled seam flips it.
+    const persisted = service.store.tryGet("executor", executorId);
+    const persistedStatus =
+      persisted?.status != null ? String(persisted.status) : null;
+    const status =
+      persistedStatus ??
+      (options.default_disabled?.includes(executorId) ? "DISABLED" : "ENABLED");
+
     registry.register(
       {
         executor_id: executorId,
@@ -66,7 +86,7 @@ export function registerGovernedExecutors(
         capabilities: qualified ? capabilities : [],
         health_state: qualified ? "READY" : "DEGRADED",
         availability_state: probe.available === true ? "AVAILABLE" : "UNAVAILABLE",
-        status: "ENABLED",
+        status,
         metadata: {
           qualification_state: qualified ? "QUALIFIED" : "UNQUALIFIED",
           permission_modes: qualified

@@ -567,6 +567,10 @@ export class TelegramConversationService {
     const turn: ConversationTurnResult = await this.deps.reasoning.turn({
       session_id: session.session_id,
       operator_id: operatorId,
+      // Phase 1 — the telegram identity is proven by ingress provenance
+      // (operator_id === telegram:<chat_id>), but it is NEVER admin:
+      // status reads stay scoped to canonically-proven permissions.
+      principal: { kind: "telegram", operator_id: operatorId },
       body: text,
       idempotency_key: `tg:upd:${Number(input.update_id)}`,
     });

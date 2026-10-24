@@ -130,7 +130,23 @@ function freshFullStack(name: string): FullStack {
     reconciliation: recon, observability, planner,
   });
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  const biz = new BusinessLayer({ store, control, schedules,
+    // Phase C — the shared async Planner Pool seam: this stub returns a
+    // canned canonical llm_plan so delegated opens plan "through the
+    // pool" exactly once per open (same shape the production expander
+    // yields after failover+canonicalize).
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata as Record<string, unknown> | undefined),
+          llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+          plan_source: "LLM", plan_model: "test-planner",
+        },
+      },
+      planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+    }) });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -953,7 +969,22 @@ const control = new PAIR.MissionControl({
   reconciliation: recon, observability, planner,
 });
 const schedules = new PAIR.MissionScheduleService(service);
-const biz = new PAIR.BusinessLayer({ store, control, schedules });
+// Phase C — the delegated open needs an authorized plan: stub the shared
+// expander with a canonical llm_plan (the open seam only needs non-empty
+// plan authority; the race asserts dedup/convergence, not plan quality).
+const biz = new PAIR.BusinessLayer({
+  store, control, schedules,
+  planExpander: async (input) => ({
+    input: {
+      ...input,
+      metadata: {
+        ...(input.metadata ?? {}),
+        llm_plan: [{ task_id: "T1", title: "r", instructions: "r", required_capabilities: [] }],
+        plan_source: "LLM",
+      },
+    },
+  }),
+});
 const wf = new PAIR.WorkforceService({ store, business: biz });
 const workstreams = new PAIR.ObjectiveWorkstreamService({
   store, business: biz, workforce: wf, objectives: biz.objectives,
@@ -988,7 +1019,10 @@ function ensureRaceBundle() {
     .sort()
     .at(-1);
   if (!esbuild) throw new Error("esbuild binary not found");
-  execFileSync(esbuild, [
+  // bin/esbuild is a node launcher script (#!/usr/bin/env node) — spawn it
+  // through the interpreter so the bundle build is platform-portable.
+  execFileSync(process.execPath, [
+    esbuild,
     "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
     "--external:better-sqlite3", "--external:ulid", "--external:yaml",
     `--outfile=${RACE_BUNDLE}`,
@@ -1790,5 +1824,94 @@ describe("P15.6 F2 — objective admission bound to the child lineage", () => {
     const row = s.biz.openWorkItem(String(wi.work_item_id), OP);
     expect(String(row.status)).toBe("IN_PROGRESS");
     s.store.close();
+  });
+});
+
+/* ===================== P0-F3 — ZERO_BUDGET classification =====================
+ * Defect: objective with unset/default budget (ceiling_microusd=0,
+ * consumed=0) was classified OBJECTIVE_BUDGET_EXHAUSTED. Canonical
+ * semantics (P15.7 budgetView contract): ceiling=0 is ZERO_BUDGET — a
+ * hard bound, never "exhausted", never "uncapped". The loop must report
+ * OBJECTIVE_ZERO_BUDGET and still refuse new work. */
+describe("P0-F3 — objective zero-budget classification", () => {
+  /** Objective with NO budget_ceiling_microusd — the UI/API default. */
+  function mkZeroBudgetObjective(s: FullStack, bid: string) {
+    return s.biz.objectives.create({
+      business_id: bid,
+      title: "zero-budget objective",
+      statement: "prove default 0/0 classification",
+      kpis: [{ name: "k", unit: "u", baseline: 0, target: 1 }],
+      deadline: "2999-01-01T00:00:00.000Z",
+      dedup_key: `dk-${counter}`,
+      operator_id: OP,
+    });
+  }
+
+  it("F3-a. default 0/0 objective → OBJECTIVE_ZERO_BUDGET (never EXHAUSTED), blocked, zero CEO spend", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1"]));
+    const s = freshFullStack("zb");
+    const bid = mkBusiness(s);
+    const o = mkZeroBudgetObjective(s, bid);
+    const oid = String(o.objective_id);
+    expect(Number((o.budget as Record<string, unknown>).ceiling_microusd)).toBe(0);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const ops = opStack(s, inv);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("OBJECTIVE_ZERO_BUDGET");
+    expect(r.outcome).not.toBe("OBJECTIVE_BUDGET_EXHAUSTED");
+    expect(inv.inputs.length).toBe(0); // zero bound — no CEO call authorized
+    s.store.close();
+  });
+
+  it("F3-b. explicit positive ceiling with headroom is unaffected (dispatches)", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1", "w2"]));
+    const { s, oid, ops } = seeded("pb-pos", inv, ["w1", "w2"]);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    s.store.close();
+  });
+
+  it("F3-c. positive ceiling genuinely consumed → OBJECTIVE_BUDGET_EXHAUSTED preserved", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1"]));
+    const s = freshFullStack("pb-exh");
+    const bid = mkBusiness(s);
+    const o = s.biz.objectives.create({
+      business_id: bid, title: "exhausted", statement: "cap reached",
+      kpis: [{ name: "k", unit: "u", baseline: 0, target: 1 }],
+      deadline: "2999-01-01T00:00:00.000Z",
+      budget_ceiling_microusd: 100,
+      dedup_key: `dk-${counter}`, operator_id: OP,
+    });
+    const oid = String(o.objective_id);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "s1", amount_microusd: 100, actor: OWNER,
+    });
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const ops = opStack(s, inv);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("OBJECTIVE_BUDGET_EXHAUSTED");
+    s.store.close();
+  });
+
+  it("F3-d. explicit zero ceiling still hard-blocks any positive spend at the ledger", () => {
+    const s = freshFullStack("zb-ledger");
+    const bid = mkBusiness(s);
+    const o = mkZeroBudgetObjective(s, bid);
+    const oid = String(o.objective_id);
+    expect(() =>
+      s.biz.objectives.accountBudget(oid, {
+        business_id: bid, spend_key: "s1", amount_microusd: 1, actor: OWNER,
+      }),
+    ).toThrow(/FAIL_CLOSED_OBJECTIVE_BUDGET_EXCEEDED/);
+    s.store.close();
+  });
+
+  it("F3-e. ZERO_BUDGET outcome continues as owner-action block in the auto scheduler", async () => {
+    const { outcomeContinuation } = await import("../pair/objective-auto-scheduler.js");
+    const c = outcomeContinuation("OBJECTIVE_ZERO_BUDGET");
+    expect(c.state).toBe("BLOCKED_AUTHORITY");
+    expect(c.blocked_reason).toBe("BUDGET_OWNER_ACTION_REQUIRED");
   });
 });

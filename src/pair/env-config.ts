@@ -100,6 +100,15 @@ export const CONVERSATION_CLI_TIMEOUT = {
   bounds: { min: 5_000, max: 900_000, unit: "ms" },
 } as const;
 
+/** Phase 1 — serialized operational STATUS envelope bound (chars). The
+ *  query service drops whole sections to fit; output is always valid
+ *  JSON, never a truncated fragment. Unit: chars. Bounds 256–16000. */
+export const OPERATIONAL_STATUS_MAX = {
+  name: "PAIR_OPERATIONAL_STATUS_MAX_CHARS",
+  defaultValue: 2_000,
+  bounds: { min: 256, max: 16_000, unit: "chars" },
+} as const;
+
 /** LLM planner request budget. Unit: milliseconds. Bounds 2s–900s. */
 export const LLM_PLANNER_TIMEOUT = {
   name: "PAIR_LLM_PLANNER_TIMEOUT_MS",
@@ -114,6 +123,33 @@ export const CODEX_PLANNER_TIMEOUT = {
   name: "PAIR_CODEX_PLANNER_TIMEOUT_MS",
   defaultValue: 900_000,
   bounds: { min: 5_000, max: 900_000, unit: "ms" },
+} as const;
+
+/** Phase C — ONE run-level deadline for a planner pool run: it spans the
+ *  whole failover chain — every candidate's eligibility/qualification,
+ *  its INITIAL provider call (with transport-internal retries), and its
+ *  bounded REASK. Individual candidate/request budgets are min()'d
+ *  against the remaining run budget; a result landing past the deadline
+ *  is discarded and the run settles FAILED/deadline, never a winner.
+ *  The default (30m) comfortably covers the production chain
+ *  (codex 900s ceiling + HTTP candidates + a bounded re-ask each).
+ *  Unit: milliseconds. Bounds 5s–3600s. */
+export const PLANNER_RUN_DEADLINE = {
+  name: "PAIR_PLANNER_RUN_DEADLINE_MS",
+  defaultValue: 1_800_000,
+  bounds: { min: 5_000, max: 3_600_000, unit: "ms" },
+} as const;
+
+/** Governed async replan generation — absolute deadline for ONE durable
+ *  `replan_generation` row (mint → claimed → settled). Bounds the
+ *  pending wait AND the in-flight pool run; a row past its deadline
+ *  fails TIMEOUT and the REPLAN action goes infeasible. Default 30m to
+ *  cover the full planner chain (codex 900s ceiling + HTTP + bounded
+ *  re-ask). Unit: milliseconds. Bounds 5s–3600s. */
+export const REPLAN_GENERATION_DEADLINE = {
+  name: "PAIR_REPLAN_GENERATION_DEADLINE_MS",
+  defaultValue: 1_800_000,
+  bounds: { min: 5_000, max: 3_600_000, unit: "ms" },
 } as const;
 
 /** Governed task execution budget. Unit: seconds. Bounds 5s–7200s. */
@@ -173,12 +209,24 @@ export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): nu
   return readPositiveIntEnv(CODEX_PLANNER_TIMEOUT.name, CODEX_PLANNER_TIMEOUT.defaultValue, CODEX_PLANNER_TIMEOUT.bounds, env);
 }
 
+export function plannerRunDeadlineMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(PLANNER_RUN_DEADLINE.name, PLANNER_RUN_DEADLINE.defaultValue, PLANNER_RUN_DEADLINE.bounds, env);
+}
+
+export function replanGenerationDeadlineMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(REPLAN_GENERATION_DEADLINE.name, REPLAN_GENERATION_DEADLINE.defaultValue, REPLAN_GENERATION_DEADLINE.bounds, env);
+}
+
 export function ceoCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(CEO_CLI_TIMEOUT.name, CEO_CLI_TIMEOUT.defaultValue, CEO_CLI_TIMEOUT.bounds, env);
 }
 
 export function conversationCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(CONVERSATION_CLI_TIMEOUT.name, CONVERSATION_CLI_TIMEOUT.defaultValue, CONVERSATION_CLI_TIMEOUT.bounds, env);
+}
+
+export function operationalStatusMaxChars(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(OPERATIONAL_STATUS_MAX.name, OPERATIONAL_STATUS_MAX.defaultValue, OPERATIONAL_STATUS_MAX.bounds, env);
 }
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {

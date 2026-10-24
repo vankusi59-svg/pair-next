@@ -42,17 +42,24 @@ import {
   MissionScheduler,
   MissionSupervisor,
   ModelEvidenceCatalog,
+  ObjectiveAutoDriverService,
+  ObjectiveAutoPolicyService,
+  ObjectiveAutoScheduler,
+  ObjectiveAutoWakeupService,
   ObjectiveKpiVerificationService,
   ObjectiveWorkstreamService,
   PairControlPlane,
   PairEvidenceStore,
   ProviderCatalog,
+  readSchedulerRow,
   providerEntryId,
   qualifyModel,
   ReconciliationService,
   RecoveryController,
   WorkforceAllocationService,
   WorkforceService,
+  WAKE_SEGMENT,
+  WAKE_STATE,
   WORKFORCE_ALLOCATION_ENTITY,
   assertCanonicalObjectiveKpiProgress,
   assertKpiVerifierAuthority,
@@ -145,7 +152,21 @@ function freshFullStack(name: string): FullStack {
     reconciliation: recon, observability, planner,
   });
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  const biz = new BusinessLayer({ store, control, schedules,
+    // Phase C — the shared async Planner Pool seam (canned canonical
+    // llm_plan; see pair-p15-6 for the same stub contract).
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata as Record<string, unknown> | undefined),
+          llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+          plan_source: "LLM", plan_model: "test-planner",
+        },
+      },
+      planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+    }) });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -389,6 +410,98 @@ describe("P15.10-D §A — P15.10-C gap reproduction (end-to-end)", () => {
     expect(r.outcome).toBe("TARGET_MET_CANDIDATE");
     expect(r.owner_action_required).toBe(true);
     expect(String(s.biz.objectives.get(oid).status)).toBe("ACTIVE");
+    s.store.close();
+  });
+
+  it("A2 no KVA → quiet VERIFIED_KPI_EVIDENCE wait → owner grant rearms → next driver tick mints KVR → TARGET_MET_CANDIDATE — no manual ceo-cycle", async () => {
+    const { s, oid, binding } = seeded("a2", ["report"]);
+    let t = 1_000_000;
+    // The autonomous driver admission proof reads CODEX_HOME/auth.json.
+    const codexHome = path.join(s.dir, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+      OPENAI_API_KEY: null,
+      tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+    }));
+    process.env.CODEX_HOME = codexHome;
+    const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives, () => t);
+    const scheduler = new ObjectiveAutoScheduler(s.store, s.biz.objectives, policy, () => t);
+    const wakeup = new ObjectiveAutoWakeupService(s.store, scheduler, () => t);
+    qualifyCeo(s.store);
+    const ops = createDefaultObjectiveOperatingService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      invoker: new FakeInvoker(),
+    });
+    policy.control({ objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: FUTURE, max_ceo_calls: 10 }, idempotency_key: "cfg" });
+    policy.control({ objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: 1, idempotency_key: "en" });
+    if (!s.store.tryGet("executor", "CODEX")) {
+      s.store.put("executor", "CODEX", {
+        executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+        health_state: "READY", capabilities: [],
+        metadata: { qualification_state: "QUALIFIED" },
+      }, 0);
+    }
+    const driver = new ObjectiveAutoDriverService({
+      store: s.store, objectives: s.biz.objectives, policy, scheduler,
+      // The REAL operating pass — production wires exactly this.
+      runPass: (input) => ops.service.runObjectivePass(input),
+      executors: ["CODEX"],
+      billingFor: (e) => e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false },
+      costHaltActive: () => false,
+      workerId: "e2e-driver", bootId: "b1", now: () => t,
+    });
+    wakeup.tick();
+    // Canonical work completes — but NO grant exists yet, so the pass
+    // settles into the quiet verified-evidence wait.
+    completeDeliverable(s, binding, "report");
+    const first = await driver.tick();
+    expect(first.driven[0]).toMatchObject({
+      outcome: "INSUFFICIENT_VERIFIED_PROGRESS", settled: true });
+    const q0 = readSchedulerRow<Row>(s.store, WAKE_STATE, oid)!;
+    expect(q0).toMatchObject({ queue_state: "WAITING_EVIDENCE",
+      wait_kind: "VERIFIED_KPI_EVIDENCE", next_due: null });
+    expect(q0.pending_generation).toBe(q0.claimed_generation);
+    expect(q0.claimed_generation).toBe(q0.settled_generation);
+    // The endpoint's atomic composition: one immediate() for grant+wake.
+    let aid = "";
+    s.store.immediate(() => {
+      const g = s.kpiSvc.grant(oid, {
+        actor: OWNER, kpi_id: KPI,
+        rule: { rule_type: "DELIVERABLE_BUNDLE", required_count: 1 },
+        expires_at: FUTURE, idempotency_key: "e2e-grant",
+      });
+      aid = String(g.authorization_id);
+      scheduler.notifyKpiVerifierGrant(oid, aid);
+    });
+    const q1 = readSchedulerRow<Row>(s.store, WAKE_STATE, oid)!;
+    expect(q1.queue_state).toBe("WAITING_CONSUMER");
+    expect(q1.pending_generation).toBe(Number(q0.pending_generation) + 1);
+    expect(readSchedulerRow(s.store, WAKE_SEGMENT,
+      `kpi-verifier-grant:${aid}`)).not.toBeNull();
+    // The parked fairness cursor needs one FAIR_ROUND wrap before the
+    // rearmed rank is rescanned — the claim may take a second tick.
+    t += 30_001;
+    let second = await driver.tick();
+    if (!second.driven.length) second = await driver.tick();
+    expect(second.driven[0]).toMatchObject({
+      outcome: "TARGET_MET_CANDIDATE", settled: true });
+    // The KVR was minted by the pass through the canonical verifier —
+    // not by the grant; and the objective still awaits owner sign-off.
+    const receipts = s.store.list<Row>(KPI_RECEIPT_ENTITY)
+      .filter((r) => String(r.objective_id) === oid);
+    expect(receipts).toHaveLength(1);
+    expect(String(receipts[0]!.authorization_id)).toBe(aid);
+    expect(String(s.biz.objectives.get(oid).status)).toBe("ACTIVE");
+    // Third grant-path notify is receipt-dedup'd — armed queue untouched.
+    const q2 = readSchedulerRow<Row>(s.store, WAKE_STATE, oid)!;
+    scheduler.notifyKpiVerifierGrant(oid, aid);
+    expect(readSchedulerRow<Row>(s.store, WAKE_STATE, oid)!.pending_generation)
+      .toBe(q2.pending_generation);
     s.store.close();
   });
 });

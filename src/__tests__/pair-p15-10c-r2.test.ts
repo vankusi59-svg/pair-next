@@ -52,6 +52,9 @@ import {
   CEO_DECISION_ATTEMPT_ENTITY,
   SCHEDULER_RECEIPT,
   WAKE_STATE,
+  WORKFORCE_ALLOCATION_ENTITY,
+  DRIVER_STATE,
+  createDefaultObjectiveOperatingService,
   type CeoDecisionInvoker,
   type CeoInvokeInput,
   type CeoInvokeResult,
@@ -71,6 +74,15 @@ function freshSvc(name: string, initial = 1_000_000) {
   let t = initial;
   const dir = path.join(ROOT, `${counter++}-${name}`);
   fs.mkdirSync(dir, { recursive: true });
+  // AUDIT R2-F1 — per-stack CODEX_HOME with a persisted ChatGPT session
+  // file so the live auth-mode re-proof resolves CHATGPT.
+  const codexHome = path.join(dir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+  }));
+  process.env.CODEX_HOME = codexHome;
   const dbPath = path.join(dir, "pair.db");
   const store = new PairEvidenceStore(dbPath);
   const biz = new BusinessLayer({
@@ -184,12 +196,26 @@ const settleReceipts = (s: Svc) =>
 function mkDriver(s: Svc, runPassImpl: (input: {
   objective_id: string; actor: string; authority_gate: () => void;
 }) => Promise<{ outcome: string; objective_id: string }>, heartbeatMs = 60_000) {
+  // PR #121 — the configured autonomous id must exist as a canonical
+  // ENABLED+QUALIFIED executor row to enter the supply envelope.
+  if (!s.store.tryGet("executor", "CODEX")) {
+    s.store.put("executor", "CODEX", {
+      executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+      health_state: "READY", capabilities: [],
+      metadata: { qualification_state: "QUALIFIED" },
+    }, 0);
+  }
   return new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
     runPass: async (input) => runPassImpl(input) as never,
     executors: ["CODEX"],
-    billingFor: () => ({ mode: "UNMETERED", profile: null, unbounded: false }),
+    // AUDIT R1 F4 — CEO subscription lane: CODEX resolves SUBSCRIPTION
+    // billing (AUTH_OK provider session is seeded by seedCeoModel).
+    billingFor: (e: string) =>
+      e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false },
     costHaltActive: () => false,
     workerId: "r2-w", bootId: "r2-b",
     now: s.now, heartbeatMs,
@@ -457,5 +483,205 @@ describe("P15.10-C R2 — fenced authority closure", () => {
     const res = await review.runReview({ objective_id: s.oid, actor: OP });
     expect(res.outcome).toBe("AWAITING_PROGRESS");
     expect(reviews(s)).toHaveLength(1);
+  });
+});
+
+/* ==================== R1 closure — stale-observation boundaries ====================
+ *
+ * AUDIT R1 (PR #133): the raw `objective_version` equality pin was
+ * removed from the lease/authority staleness predicates because
+ * runtime writes — `recordProgress()` KPI evidence and
+ * `accountBudget()` spend — legitimately bump `row.version` while
+ * leaving protected authority identity (objective_digest, terms,
+ * policy binding, owner, business, lifecycle) untouched. Pinning the
+ * raw version made a pass's OWN verifier writes self-invalidate the
+ * lease (observed live as DRIVER_AUTHORITY_LOST mid-pass).
+ *
+ * These regressions prove the remaining pin + re-proof surface still
+ * fails closed on REAL stale state — every write below goes through
+ * the canonical authority service, and every commit path runs the
+ * actual production guard:
+ *
+ *   R1-KPI / R1-BUD — an external canonical writer drifts KPI
+ *     progress or budget consumption while a CEO model call is
+ *     awaited → the serialized commit re-observes, settles the
+ *     attempt STALE, and NEVER commits the decision computed from
+ *     the pre-drift observation.
+ *   R1-SELF — the pass's own runtime progress write is NOT drift:
+ *     the mid-pass authorityGate still holds and settle commits.
+ *   R1-AMEND — owner protected-terms amendment mid-pass stays
+ *     fail-closed: authorityGate throws DRIVER_AUTHORITY_LOST and
+ *     the pass never settles under lost authority.
+ *   R1-DISP — drift between review commit and NEW allocation → the
+ *     pre-allocation observation re-proof returns bounded WAITING;
+ *     no workforce allocation is minted from a stale strategy.
+ */
+describe("P15.10-C R3 — stale-observation commit boundaries (audit R1)", () => {
+
+  const kpiIdOf = (s: Svc) =>
+    String((s.objectives.get(s.oid).kpis as Array<Record<string, unknown>>)[0]!.kpi_id);
+
+  const writeExternalKpi = (s: Svc, tag: string) =>
+    s.objectives.recordProgress(s.oid, {
+      business_id: s.bid, kpi_id: kpiIdOf(s), value: 4,
+      evidence: { evidence_key: `ext-${tag}-${counter++}`, verifier: OWNER, source: "test" },
+      actor: OWNER,
+    });
+
+  const writeExternalSpend = (s: Svc, tag: string) =>
+    s.objectives.accountBudget(s.oid, {
+      business_id: s.bid, spend_key: `sp-${tag}-${counter++}`,
+      amount_microusd: 100, actor: OWNER,
+    });
+
+  it("R1-KPI external KPI write mid-await → attempt settles STALE, decision never commits", async () => {
+    const s = freshSvc("r1kpi");
+    enable(s);
+    const ceo = ceoSvc(s, async (i) => {
+      writeExternalKpi(s, "kpi"); // another canonical writer lands mid-await
+      return waitResult(i);
+    });
+    const driver = mkDriver(s, async (input) => {
+      await ceo.runCycle({
+        objective_id: input.objective_id, actor: input.actor,
+        autonomous_commit_guard: input.authority_gate,
+      });
+      return { outcome: "WAITING", objective_id: input.objective_id };
+    });
+    const out = await driver.tick();
+    expect(out.driven[0]!.outcome).toBe("FAULT");
+    // The stale decision computed from the pre-drift observation
+    // never reached the store; the attempt is durably STALE.
+    expect(decisions(s)).toHaveLength(0);
+    expect(attempts(s).map((a) => String(a.state))).toEqual(["STALE"]);
+  });
+
+  it("R1-BUD external budget write mid-await → attempt settles STALE, decision never commits", async () => {
+    const s = freshSvc("r1bud");
+    enable(s);
+    const ceo = ceoSvc(s, async (i) => {
+      writeExternalSpend(s, "b"); // canonical spend lands mid-await
+      return waitResult(i);
+    });
+    const driver = mkDriver(s, async (input) => {
+      await ceo.runCycle({
+        objective_id: input.objective_id, actor: input.actor,
+        autonomous_commit_guard: input.authority_gate,
+      });
+      return { outcome: "WAITING", objective_id: input.objective_id };
+    });
+    const out = await driver.tick();
+    expect(out.driven[0]!.outcome).toBe("FAULT");
+    expect(decisions(s)).toHaveLength(0);
+    expect(attempts(s).map((a) => String(a.state))).toEqual(["STALE"]);
+  });
+
+  it("R1-SELF the pass's own runtime progress write is not drift — gate holds, settle commits", async () => {
+    const s = freshSvc("r1self");
+    enable(s);
+    let gated = false;
+    const driver = mkDriver(s, async (input) => {
+      // The pass's own verifier-style runtime write: recordProgress
+      // bumps objective.version but NOT any protected-terms field.
+      writeExternalKpi(s, "self");
+      input.authority_gate(); // must NOT throw — authority identity unchanged
+      gated = true;
+      return { outcome: "WAITING", objective_id: input.objective_id };
+    });
+    const out = await driver.tick();
+    expect(gated).toBe(true);
+    expect(out.driven[0]).toMatchObject({ outcome: "WAITING", settled: true });
+    expect(settleReceipts(s)).toHaveLength(1);
+  });
+
+  it("R1-AMEND owner protected-terms amend mid-pass → gate throws DRIVER_AUTHORITY_LOST", async () => {
+    const s = freshSvc("r1amend");
+    enable(s);
+    let gateThrew = false;
+    const driver = mkDriver(s, async (input) => {
+      s.objectives.amend(s.oid, {
+        business_id: s.bid, patch: { title: "drifted title" }, actor: OWNER,
+      });
+      try {
+        input.authority_gate();
+      } catch {
+        gateThrew = true;
+        throw new IntegrityError("FAIL_CLOSED_AMEND", "gate rejected after amend");
+      }
+      return { outcome: "WAITING", objective_id: input.objective_id };
+    });
+    const out = await driver.tick();
+    expect(gateThrew).toBe(true);
+    expect(out.driven[0]!.outcome).toBe("FAULT");
+    // Queue never settles under lost authority — claimed generation
+    // stays unsettled for a later reclaim.
+    expect(settleReceipts(s)).toHaveLength(0);
+  });
+
+  it("R1-DISP drift between review commit and allocation → bounded WAITING, no WAL minted", async () => {
+    const s = freshSvc("r1disp");
+    enable(s);
+    const o = s.objectives.get(s.oid);
+    s.workstreams.decomposeObjective({
+      objective_id: s.oid,
+      expected_objective_version: Number(o.version),
+      expected_terms_version: Number(o.terms_version),
+      expected_objective_digest: String(o.objective_digest),
+      workstreams: [{ workstream_key: "w1", title: "t", goal: "g" }],
+      actor: OP,
+    });
+    // Break the §8 bootstrap path: with zero canonical reviews the
+    // pass executes the binding order directly and never consults the
+    // review/strategy checkpoint. One committed (WAIT) review forces
+    // the §12 review branch on the driven pass below.
+    const seedCeo = ceoSvc(s, async (i) => waitResult(i));
+    const seedReview = new ObjectiveAdaptiveReviewService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.objectives, workstreams: s.workstreams, ceoCycle: seedCeo,
+    });
+    await seedReview.runReview({ objective_id: s.oid, actor: OP });
+    // The review receipt id is deterministic per (objective,
+    // observation digest) — drift the KPI so the driven pass's review
+    // commits under a FRESH digest instead of replaying the seed row
+    // (a replay would exit early on the strategy re-read, before the
+    // observation re-proof this test targets).
+    writeExternalKpi(s, "seed-drift");
+    const ops = createDefaultObjectiveOperatingService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.objectives, workstreams: s.workstreams,
+      invoker: new FakeInvoker(async (i) => ({
+        model_entry_id: i.transport.model_entry_id,
+        provider_id: i.transport.provider_id,
+        model_id: i.transport.model_id,
+        raw_text: decisionJson({ decision_kind: "PRIORITIZE_EXISTING",
+          wait_reason: null, priority_order: ["w1"], summary: "p" }),
+      })),
+    });
+    const driver = mkDriver(s, async (input) =>
+      ops.service.runObjectivePass({
+        objective_id: input.objective_id,
+        actor: input.actor,
+        authority_gate: input.authority_gate,
+        hooks: { afterReview: () => writeExternalKpi(s, "disp") },
+      }) as never);
+    const out = await driver.tick();
+    // The committed PRIORITIZE review went stale before the first
+    // allocation: bounded WAITING, zero dispatch authority minted.
+    // The `detail` proves it is the R3.B observation re-proof (line:
+    // "canonical state drifted since review"), not an earlier guard.
+    expect(out.driven[0]).toMatchObject({ outcome: "WAITING", settled: true });
+    // The durable last_result.detail proves it is the R3.B
+    // observation re-proof, not an earlier guard exit.
+    const row = readSchedulerRow(s.store, DRIVER_STATE,
+      `auto-driver-state:${s.oid}`) as Record<string, unknown>;
+    const last = row.last_result as Record<string, unknown>;
+    expect(String(last.detail ?? "")).toContain("drifted since review");
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY)).toHaveLength(0);
+    // Reviews + the PRIORITIZE strategy legitimately committed — it
+    // is the dispatch, not the review, that the re-proof blocks:
+    // seeded WAIT review + this pass's PRIORITIZE review (fresh
+    // observation digest after the seed drift) + one strategy row.
+    expect(reviews(s)).toHaveLength(2);
+    expect(strategies(s)).toHaveLength(1);
   });
 });

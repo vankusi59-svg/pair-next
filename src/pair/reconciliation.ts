@@ -33,6 +33,12 @@ export function reconciliationDigest(r: Record<string, unknown>): string {
 }
 
 export class ReconciliationService {
+  /** Orphan executions that can never auto-settle (still running or
+   *  unknown side effects) are re-observed at most this often — remote
+   *  work may legitimately reach a terminal adapter state later, but
+   *  per-sweep evidence growth stays bounded. */
+  static readonly ORPHAN_RECHECK_MS = 30_000;
+
   constructor(
     private readonly service: PairControlPlane,
     private readonly adapters: Map<string, ExecutorAdapter>,
@@ -40,6 +46,122 @@ export class ReconciliationService {
 
   private get store(): PairEvidenceStore {
     return this.service.store;
+  }
+
+  /**
+   * P0-F1 — orphan-execution settlement sweep. A mission that reaches a
+   * terminal status no longer has a live runtime driving its execution
+   * barriers, so any non-terminal `executor_execution` row it leaves
+   * behind would otherwise consume CapabilityRouter capacity forever.
+   * (planRestartRecovery scans only NON-terminal missions; abort is the
+   * one writer that legitimately leaves in-flight executions unresolved.)
+   *
+   * For every unsettled execution whose mission is canonically terminal,
+   * run the canonical reconcile() proof and apply the outcome:
+   *   adapter-observed TERMINAL status (COMPLETED/FAILED/CANCELLED/
+   *     TIMEOUT) — authoritative terminal evidence: the row is durably
+   *     settled via `terminal_outcome` (the same marker operator
+   *     acknowledgment uses) and the capacity slot is released.
+   *     `execution_state` itself is never rewritten — it records what
+   *     the process last reported, not a claimed result.
+   *   everything else — the slot stays RESERVED. "No observation + no
+   *     run_root" is NOT proof nothing ran (adapter may be unavailable,
+   *     observe may throw, run_root persistence may have been lost):
+   *     R1-F1 forbids releasing capacity on that weak evidence —
+   *     the case stays fail-closed like UNKNOWN_SIDE_EFFECT_STATE.
+   *     Reserved orphans re-probe on a bounded cadence
+   *     (`orphan_recheck_after`) so a later terminal adapter observation
+   *     still settles them; explicit operator acknowledgment remains the
+   *     other release path.
+   *
+   * R1-F2 — one orphan's failure never blocks the sweep or the
+   * supervisor: each orphan is isolated in its own try/catch, and the row
+   * is re-read before mutating so a concurrent writer (operator
+   * acknowledgment, in-flight barrier, another sweep) is absorbed — never
+   * stomped — while an actual version conflict simply converges on a
+   * later sweep. Idempotent: settled rows are excluded by
+   * `terminal_outcome`, so repeated sweeps/restarts write no duplicate
+   * receipts/events.
+   */
+  settleTerminalMissionOrphans(nowMs: number = Date.now()): { settled: string[] } {
+    const TERMINAL_MISSION = new Set(["COMPLETED", "FAILED", "ABORTED", "CANCELLED"]);
+    const statusByMission = new Map(
+      this.store
+        .list("mission")
+        .map((m) => [String(m.mission_id), String(m.status)] as const),
+    );
+    const orphans = this.store.list("executor_execution").filter(
+      (e) =>
+        !TERMINAL.has(String(e.execution_state)) &&
+        !e.terminal_outcome &&
+        TERMINAL_MISSION.has(statusByMission.get(String(e.mission_id)) ?? "") &&
+        (!e.orphan_recheck_after ||
+          Date.parse(String(e.orphan_recheck_after)) <= nowMs),
+    );
+    const settled: string[] = [];
+    for (const candidate of orphans) {
+      const executionId = String(candidate.execution_id);
+      try {
+        const receipt = this.reconcile({ execution_id: executionId });
+        const outcome = String(receipt.outcome);
+        const facts = (receipt.facts as Record<string, unknown>) ?? {};
+        // R1-F1 — release capacity ONLY on authoritative terminal
+        // evidence: the adapter itself must have reported a terminal
+        // status. reconcile()'s CONFIRMED_FAILED for "no observation +
+        // no run_root" is a weak heuristic, not proof of death.
+        const authoritative = TERMINAL.has(
+          String(facts.observed_status ?? ""),
+        );
+        // R1-F2 — re-read before mutating: absorb benign concurrent
+        // writes, re-validate candidacy (an operator acknowledgment or
+        // barrier landing mid-sweep must never be overwritten).
+        const e = this.store.tryGet("executor_execution", executionId);
+        if (
+          !e ||
+          TERMINAL.has(String(e.execution_state)) ||
+          e.terminal_outcome ||
+          !TERMINAL_MISSION.has(
+            statusByMission.get(String(e.mission_id)) ?? "",
+          )
+        ) {
+          continue;
+        }
+        if (!authoritative) {
+          e.orphan_recheck_after = new Date(
+            nowMs + ReconciliationService.ORPHAN_RECHECK_MS,
+          ).toISOString();
+          this.store.put(
+            "executor_execution", executionId, e, Number(e.version),
+          );
+          continue;
+        }
+        e.terminal_outcome = `RECONCILED_${outcome}`;
+        e.settled_receipt_id = String(receipt.reconciliation_id);
+        e.orphan_recheck_after = null;
+        this.store.put(
+          "executor_execution", executionId, e, Number(e.version),
+        );
+        this.store.event({
+          entity_type: "executor_execution",
+          entity_id: executionId,
+          event_type: "EXECUTION_ORPHAN_SETTLED",
+          new_state: String(e.terminal_outcome),
+          actor: "PAIR_RECONCILIATION_SERVICE",
+          metadata: {
+            mission_id: e.mission_id,
+            receipt_id: receipt.reconciliation_id,
+            outcome,
+          },
+        });
+        settled.push(executionId);
+      } catch {
+        // Per-orphan failure (version race, adapter/store fault):
+        // converge on a later sweep — never block siblings, the resume
+        // path, or supervisor.tick().
+        continue;
+      }
+    }
+    return { settled };
   }
 
   /**
