@@ -113,6 +113,28 @@ function missionSummary(store: PairEvidenceStore, mission: Row): Record<string, 
   };
 }
 
+/** R2 — the ONE classification of "re-validation ended legitimately":
+ *  the objective is terminal AND the only failure is the delegated
+ *  KPI verifier grant reporting OBJECTIVE_TERMINAL (a grant pinned to
+ *  a live objective canonically ends when the objective achieves /
+ *  cancels / expires — historical progress is real but no longer
+ *  re-provable NOW). Every other error — forged progress, digest
+ *  mismatch, expired-but-not-terminal grant, unclassified — is
+ *  corruption or an honest gap and must fail closed. Exported for
+ *  the P16-A Brain Context Aggregator, which re-proves the same KPI/
+ *  budget claims on its own strict read path. */
+export function isLegitimateTerminalGrantEnd(
+  err: unknown,
+  objStatus: string,
+): boolean {
+  return (
+    TERMINAL_OBJECTIVE_STATUSES.has(objStatus as ObjectiveStatus) &&
+    err instanceof IntegrityError &&
+    String(err.code) === "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" &&
+    /authorization not effective \(OBJECTIVE_TERMINAL\)/.test(String(err.message))
+  );
+}
+
 export class ObjectiveCockpitService {
   constructor(private readonly deps: ObjectiveCockpitDeps) {}
 
@@ -197,23 +219,12 @@ export class ObjectiveCockpitService {
   }
 
   /** R2 — the ONE classification of "re-validation ended legitimately":
-   *  the objective is terminal AND the only failure is the delegated
-   *  KPI verifier grant reporting OBJECTIVE_TERMINAL (a grant pinned to
-   *  a live objective canonically ends when the objective achieves /
-   *  cancels / expires — historical progress is real but no longer
-   *  re-provable NOW). Every other error — forged progress, digest
-   *  mismatch, expired-but-not-terminal grant, unclassified — is
-   *  corruption or an honest gap and must fail closed. */
+   *  see the module-level isLegitimateTerminalGrantEnd. */
   private static isLegitimateTerminalGrantEnd(
     err: unknown,
     objStatus: string,
   ): boolean {
-    return (
-      TERMINAL_OBJECTIVE_STATUSES.has(objStatus as ObjectiveStatus) &&
-      err instanceof IntegrityError &&
-      String(err.code) === "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" &&
-      /authorization not effective \(OBJECTIVE_TERMINAL\)/.test(String(err.message))
-    );
+    return isLegitimateTerminalGrantEnd(err, objStatus);
   }
 
   /** KPI entries — `canonically_proven` marks whether `current` was

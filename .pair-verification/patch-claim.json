@@ -1,18 +1,22 @@
 {
-  "claim_id": "KPI_VERIFIER_GRANT_REARMS_EVIDENCE_WAIT",
-  "title": "Atomic KPI verifier grant wakes eligible evidence wait",
+  "claim_id": "P15_9_OWNER_ACTION_SEAMS_PLUS_P16_A_BRAIN_CONTEXT",
+  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator (R2 repair)",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10c.test.ts#KVA grant wake for settled KPI evidence queue",
-    "src/__tests__/pair-p15-10d.test.ts#P15.10-D",
-    "src/__tests__/pair-p15-10d.test.ts#A2 no KVA",
-    "src/__tests__/pair-p15-10c-r2.test.ts#P15.10-C R3"
+    "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
+    "src/__tests__/pair-p15-9-step0-owner-actions.test.ts#Step0",
+    "src/__tests__/pair-p15-9a-company-cockpit.test.ts#P15.9-A1",
+    "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
   ],
   "invariants": [
+    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "HIGH-risk scheduler/KPI endpoint repair vs BASE e0885f7de03e2a961680a3b72e458fb398bb4a62. (1) WAITING_EVIDENCE/VERIFIED_KPI_EVIDENCE deadlock: owner-scoped canonical KPI grant wakes a settled quiet queue atomically inside the same store.immediate as the grant; scheduler.notifyKpiVerifierGrant re-proves queue state, authority binding, no active lease, KVA identity+schema+digest+effective state, then writes a receipt-bound (kpi-verifier-grant:<authorization_id>) idempotent wake + pending_generation bump. Healthy/quarantined/blocked/active/non-KPI waits and malformed/forged/revoked/expired/foreign grants never wake; grant never mints progress — KVR comes only from the pass verifier. (2) Precision defect found by the real e2e: the pass's OWN verifier write (advance->recordProgress) bumps objective row.version, which raw-version pins treated as drift -> mid-pass DRIVER_AUTHORITY_LOST. Pins in claimable/requireCurrent/requireRebind/currentLease now bind authority identity only (policy_version, terms_digest_binding, terms_current = live objective_digest, owner, business, effective); terms/status/owner drift still fails closed, runtime progress/spend writes do not count as drift. No lease lifecycle/heartbeat/retry/sign-off changes; objective_version kept for diagnostics. AUDIT R1 CLOSURE — regression-only, zero production diff: new R3 tests in pair-p15-10c-r2 prove every commit boundary still fails closed without the raw version pin: external recordProgress mid-CEO-await -> attempt STALE, zero decision rows (R1-KPI); external accountBudget mid-await -> same (R1-BUD); pass's own runtime write -> gate holds, settle commits (R1-SELF); owner amend mid-pass -> DRIVER_AUTHORITY_LOST, no settle (R1-AMEND); drift between PRIORITIZE review and allocation -> bounded WAITING via observation re-proof, zero WAL (R1-DISP); pause/resume covered by R2-F1a. No bypass confirmed.",
+  "description": "Step 0 (P15.9): owner POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Authority is ONLY x-operator-id via canonicalOperatorActor/operatorRef — coercion artifacts AND whitespace refs rejected at every identity edge; owner_authority_id additionally gated at the canonical SERVICE layer (assertOwnerAuthorityRef: operator:<non-artifact non-whitespace ref>) so no caller — HTTP, service or amend patch — can mint a permanently-unclaimable owner (R1-M1/R2-M1′; H5/H6). Body identity fields never substitute (H3); verifier is always the header actor; evidence_key required; source pinned owner-console; value typeof-strict finite (H4). amend rejects zero-key patches AND dedups on optional idempotency_key vs last_amendment.patch_digest — ambiguous retry never double-commits (R2-M2′; H7). accountBudget stays unexposed. 403s carry the error code only — authority messages name real owner/business ids (R2-M4′). Identity edges normalized across create/legacy/business/routine/cost/secret-policy/work-items/budgets/org-agents/ceo-cycle/auto-*/cockpit/reviews/signoff/company. UI: diff-only amendments, strict numeric/date entry, REVOKED tone, per-op idempotency keys, exact-body retry. Step 1 (P16-A): brain-context.ts contextFor — owner-gated strict read-only aggregation over ObjectiveCockpitService (payload+event hash footprint identical — B7). context_digest pins canonical state only: asof + clock-derived status fields stripped from digest input; verified against a REAL ObjectiveAutoPolicyService across a live expiry instant (B1b-real — a future now()-derived key would fail it, R2-M6′). KPI/budget re-proven directly — BINDING_ABSENT never misreports UNPROVEN (B1d); ~2x proof charge documented (R2-M3′); nested budget fails closed (B1c); autonomy sources list wired deps only (R2-M7′). Unscoped memory/experience SCOPE_BINDING_ABSENT. Tamper propagates (B2); CAS drops+reports (B4); business isolation (B5). Library-only.",
   "risk_override": "HIGH"
 }

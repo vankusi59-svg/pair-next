@@ -172,6 +172,33 @@ function assertOptStr(field: string, value: unknown): string | null {
   return assertStr(field, value);
 }
 
+/* Refs that must never become an owner_authority_id — String()-coercion
+   artifacts minted at any edge (missing header/body, object values).
+   Mirror of mission-control-server's OPERATOR_COERCION_ARTIFACTS: the
+   canonical layer enforces the shape so NO caller — HTTP or service —
+   can mint an unclaimable owner (R2 M1′). */
+const OWNER_REF_ARTIFACTS = new Set([
+  "", "undefined", "null", "NaN", "Infinity", "[object Object]",
+]);
+
+/** Owner authority must be `operator:<ref>` — a whitespace-free,
+ *  non-artifact ref. An owner that is not exactly this shape is
+ *  permanently UNCLAIMABLE (every actor edge canonicalizes to
+ *  operator:<x>, and coercion-artifact refs are rejected there), so
+ *  minting one orphans the objective forever — even amend() could not
+ *  repair it because assertOwner requires the unreachable actor. */
+function assertOwnerAuthorityRef(field: string, value: unknown): string {
+  const s = assertStr(field, value);
+  const ref = s.startsWith("operator:") ? s.slice("operator:".length) : null;
+  if (ref === null || !ref || /\s/.test(ref) || OWNER_REF_ARTIFACTS.has(ref)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_OBJECTIVE_FIELD",
+      `${field} must be operator:<ref> — a non-canonical owner is permanently unclaimable`,
+    );
+  }
+  return s;
+}
+
 function assertNum(field: string, value: unknown): number {
   const n = Number(value);
   if (!Number.isFinite(n)) {
@@ -681,11 +708,18 @@ export class ObjectiveAuthorityService {
     // persisted under the old double-prefix convention are NOT
     // silently re-aliased — their stored owner stays canonical truth.
     const rawOperator = assertStr("operator_id", input.operator_id);
-    const ownerAuthority = input.owner_authority_id
-      ? assertStr("owner_authority_id", input.owner_authority_id)
-      : rawOperator.startsWith("operator:")
-        ? rawOperator
-        : `operator:${rawOperator}`;
+    // The FINAL owner is shape-gated either way — explicit
+    // owner_authority_id AND the operator-derived default. A garbage
+    // input at either field mints a permanently-unclaimable row, so
+    // both paths run the same canonical gate (R2 M1′).
+    const ownerAuthority = assertOwnerAuthorityRef(
+      "owner_authority_id",
+      input.owner_authority_id
+        ? input.owner_authority_id
+        : rawOperator.startsWith("operator:")
+          ? rawOperator
+          : `operator:${rawOperator}`,
+    );
     // F11 — the creator actor canonicalizes on the same once-only rule,
     // kept DISTINCT from ownerAuthority: an explicit owner_authority_id
     // must not leak into `actor` (creator ≠ owner is a real contract).
@@ -1069,14 +1103,23 @@ export class ObjectiveAuthorityService {
    */
   amend(
     objectiveId: string,
-    input: { business_id: string; patch: Record<string, unknown>; reason?: string; actor: string },
+    input: { business_id: string; patch: Record<string, unknown>; reason?: string; actor: string; idempotency_key?: string },
   ): Row {
     if (!input.actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective.amend");
     const businessId = assertStr("business_id", input.business_id);
     if (!input.patch || typeof input.patch !== "object" || Array.isArray(input.patch)) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must be an object");
     }
-    for (const k of Object.keys(input.patch)) {
+    const patchKeys = Object.keys(input.patch);
+    // A patch with no EFFECTIVE key is NOT an amendment — committing
+    // it would bump terms_version + rebind objective_digest
+    // (invalidating every pinned review/policy grant) while changing
+    // nothing. Keys present-but-undefined (service callers can send
+    // them; JSON cannot) are vacuous the same way.
+    if (!patchKeys.length || patchKeys.every((k) => input.patch[k] === undefined)) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must name at least one key");
+    }
+    for (const k of patchKeys) {
       if (!AMENDABLE_KEYS.has(k)) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TERMS", `not owner-amendable: ${k}`);
       }
@@ -1088,6 +1131,49 @@ export class ObjectiveAuthorityService {
       this.assertOwner(row, input.actor);
       this.assertNotTerminal(row);
       const patch = input.patch;
+      /* Idempotent amend (R2 M2′): recordProgress/attachEvidence dedup
+         on evidence_key; amendments had NO anchor — an ambiguous
+         retry after a committed-but-lost response would double-commit
+         (terms_version +2, every pinned review/policy invalidated
+         twice). A caller-supplied idempotency_key replays against the
+         LAST committed amendment: same key + same patch digest is an
+         idempotent no-op, same key + different patch is a typed
+         conflict — never a silent double-commit. Callers that send no
+         key (or an empty key — normalized away, never aliased to the
+         unkeyed null sentinel) keep the original always-commit
+         semantics.
+         Dedup window is ONE amendment deep: an older key retried after
+         a different amendment committed is treated as a NEW operation
+         and re-applies its patch — honest "latest-key replay", not a
+         full ledger (bounded ledgers already exist for evidence/spend
+         where collisions matter more). Replay is evaluated AFTER
+         scope/owner/terminal gates: a foreign or expired caller can
+         never probe whether a key committed — authz leaks nothing. */
+      const idemKey = input.idempotency_key || undefined;
+      if (idemKey !== undefined) {
+        const last = (row.last_amendment ?? null) as Record<string, unknown> | null;
+        if (last && last.idempotency_key === idemKey) {
+          let patchDigest: string;
+          try {
+            patchDigest = digest(patch);
+          } catch {
+            // Non-canonical patch values (e.g., NaN reachable only from
+            // a service caller — JSON cannot carry them) fail as the
+            // typed field error the validators would have produced.
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_FIELD",
+              "patch contains non-canonical values",
+            );
+          }
+          if (last.patch_digest === patchDigest) {
+            return row; // exact replay — never double-commits
+          }
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_AMEND_CONFLICT",
+            `${objectiveId}: idempotency_key ${idemKey} reused with different patch`,
+          );
+        }
+      }
       if (patch.title !== undefined) row.title = assertStr("title", patch.title).trim();
       if (patch.description !== undefined) row.description = assertStr("description", patch.description, { empty: true });
       if (patch.statement !== undefined) row.statement = assertOptStr("statement", patch.statement);
@@ -1128,7 +1214,7 @@ export class ObjectiveAuthorityService {
       if (patch.hard_constraints !== undefined) row.hard_constraints = normalizeStringList("hard_constraints", patch.hard_constraints);
       if (patch.success_conditions !== undefined) row.success_conditions = normalizeStringList("success_conditions", patch.success_conditions);
       if (patch.stop_conditions !== undefined) row.stop_conditions = normalizeStringList("stop_conditions", patch.stop_conditions);
-      if (patch.owner_authority_id !== undefined) row.owner_authority_id = assertStr("owner_authority_id", patch.owner_authority_id);
+      if (patch.owner_authority_id !== undefined) row.owner_authority_id = assertOwnerAuthorityRef("owner_authority_id", patch.owner_authority_id);
       row.terms_version = Number(row.terms_version) + 1;
       row.amendment_seq = Number(row.amendment_seq) + 1;
       row.last_amendment = {
@@ -1137,6 +1223,8 @@ export class ObjectiveAuthorityService {
         reason: input.reason ?? null,
         at: utcnow(),
         keys: Object.keys(patch),
+        idempotency_key: idemKey ?? null,
+        patch_digest: digest(patch),
       };
       row.objective_digest = objectiveDigest({
         objective_id: String(row.objective_id),

@@ -30,6 +30,7 @@ const S_TONE: Record<string, Tone> = {
   TARGET_MET_CANDIDATE: "purple", MET: "ok", GAP: "warn", UNVERIFIED: "unknown",
   DONE: "ok", COMPLETED: "ok", IN_PROGRESS: "info", BACKLOG: "unknown",
   ENABLED: "ok", DISABLED: "unknown", PAUSED_P: "warn", HALTED: "danger",
+  REVOKED: "danger",
   EXPIRED_P: "warn", ACTIVE: "ok", INTERVENTION: "warn", EXHAUSTED: "danger",
 };
 
@@ -55,7 +56,9 @@ const POLICY_LABELS: Record<string, string> = {
 
 type DlgCtx =
   | { kind: "ceo"; biz: string; oid: string }
-  | { kind: "policy"; action: string; biz: string; oid: string; policyVersion: number | null };
+  | { kind: "policy"; action: string; biz: string; oid: string; policyVersion: number | null }
+  | { kind: "measure" | "evidence" | "amend" | "kpi-grant"; biz: string; oid: string }
+  | { kind: "kpi-control"; action: "revoke" | "disable"; biz: string; oid: string; authorization_id: string };
 
 export function ObjectiveDetail() {
   const { id = "" } = useParams();
@@ -103,6 +106,22 @@ export function ObjectiveDetail() {
      surface does not show it as belonging to a different identity. */
   const opSeq = useRef(0);
   const [polLimits, setPolLimits] = useState({ expires: "", ceo: "", missions: "", budget: "" });
+  /* P15.9 Step-0 — owner measurement / evidence / amend / KPI-grant
+     operations. Same idempotent contract as the policy ops: the
+     submitted body (evidence_key / idempotency_key) is minted once per
+     operation signature and replayed verbatim on retry; a definitive
+     409 conflict or committed result discards it. */
+  const ownerOps = useRef<Record<string, Record<string, unknown>>>({});
+  const [meas, setMeas] = useState({ kpi: "", value: "", note: "" });
+  const [evNote, setEvNote] = useState("");
+  const [amend, setAmend] = useState({ title: "", deadline: "", budget: "", reason: "" });
+  const [grantF, setGrantF] = useState({ kpi: "", count: "", keys: "", value: "", expires: "" });
+  const [grTick, setGrTick] = useState(0);
+  const [grSt, setGrSt] = useState<
+    | { kind: "loading" }
+    | { kind: "ready"; data: Record<string, unknown> }
+    | { kind: "error"; err: ApiError }
+  >({ kind: "loading" });
 
   // Cross-objective isolation: switching objective or business drops
   // any pending dialog, note, and in-flight result ownership.
@@ -117,6 +136,12 @@ export function ObjectiveDetail() {
     lastApplied.current = { sch: 0, drv: 0, pol: 0 };
     pendingOps.current = {};
     pendingCfg.current = null;
+    ownerOps.current = {};
+    setMeas({ kpi: "", value: "", note: "" });
+    setEvNote("");
+    setAmend({ title: "", deadline: "", budget: "", reason: "" });
+    setGrantF({ kpi: "", count: "", keys: "", value: "", expires: "" });
+    setGrSt({ kind: "loading" });
     opSeq.current++;
   }, [biz, id]);
 
@@ -256,6 +281,30 @@ export function ObjectiveDetail() {
     return () => clearInterval(iv);
   }, []);
 
+  /* KPI-verifier grant status — the canonical POST action:"status"
+     read. Refetches on identity change, manual refresh and after any
+     grant op commit. A POST status read is not abortable through this
+     api seam — the dead flag drops late/foreign responses instead. */
+  useEffect(() => {
+    if (!biz || !id) return;
+    let dead = false;
+    api
+      .objectiveKpiVerificationApp(id, { action: "status" })
+      .then((r) => {
+        if (dead) return;
+        if (String(r.objective_id ?? id) !== id) {
+          setGrSt({ kind: "error", err: new ApiError(0, "IDENTITY_MISMATCH", "kpi-verification status does not belong to this objective.") });
+          return;
+        }
+        setGrSt({ kind: "ready", data: r });
+      })
+      .catch((e: unknown) => {
+        if (dead) return;
+        setGrSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
+      });
+    return () => { dead = true; };
+  }, [biz, id, grTick, tick]);
+
   /* Resolve a mutation only while its captured context is still the
      active view. The commit itself is never cancelled — only the
      stale UI attribution is dropped. */
@@ -317,7 +366,11 @@ export function ObjectiveDetail() {
        Unresolved ops are preserved separately — a pending Configure
        reopened by the owner is an explicit retry of THAT op even when
        canonical version has since drifted. */
-    const sig = `${action}:${ctx.oid}:${policyVersion ?? "none"}:${action === "configure" ? JSON.stringify(canonLimits) : ""}`;
+    /* Array-serialized signature — ":"-joined strings can collide when
+       a field itself contains ":" (kpi_id/notes are free strings), which
+       would replay the WRONG stored body on an ambiguous retry (R3 M7″). */
+    const sig = JSON.stringify([action, ctx.oid, policyVersion ?? "none",
+      action === "configure" ? canonLimits : null]);
     let bodySig = sig;
     let body = pendingOps.current[sig];
     if (!body && action === "configure" && pendingCfg.current && pendingCfg.current.oid === ctx.oid) {
@@ -386,6 +439,198 @@ export function ObjectiveDetail() {
         }
         settle(seq, ctx, "", `Policy ${action} failed (same operation kept for exact-body retry)`)(e, true);
       });
+  };
+
+  /* Shared idempotent owner-op runner (P15.9 Step-0): mint-or-replay
+     the stored body for this operation signature — the same inputs
+     always replay the same evidence_key / idempotency_key bytes, so
+     an ambiguous transport retry can never double-mint. A committed
+     result or a definitive 409 conflict discards the stored op. */
+  const runOwnerOp = (
+    ctx: { biz: string; oid: string },
+    sig: string,
+    buildBody: () => Record<string, unknown>,
+    post: (body: Record<string, unknown>) => Promise<unknown>,
+    okMsg: string,
+    failMsg: string,
+    after?: () => void,
+  ) => {
+    const seq = ++opSeq.current;
+    const body = ownerOps.current[sig] ?? buildBody();
+    ownerOps.current[sig] = body;
+    setDlg(null); setMutBusy(true); setMutNote(null);
+    post(body)
+      .then(() => {
+        delete ownerOps.current[sig];
+        refetch(); setPolTick((n) => n + 1);
+        after?.();
+        settle(seq, ctx, okMsg, "")(null, false);
+      })
+      .catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 409) {
+          delete ownerOps.current[sig];
+          refetch(); setPolTick((n) => n + 1);
+          settle(seq, ctx, "", `${failMsg} conflict — canonical state refreshed, re-confirm as a new operation`)(e, true);
+          return;
+        }
+        settle(seq, ctx, "", `${failMsg} failed (same operation kept for exact-body retry)`)(e, true);
+      });
+  };
+
+  const runMeasure = () => {
+    if (!dlg || dlg.kind !== "measure") return;
+    const ctx = { biz: dlg.biz, oid: dlg.oid };
+    /* Strict numeric: Number("")===0 and Number("  ")=0 would mint a
+       silent zero measurement — an empty/whitespace field must fail
+       here, not coerce. */
+    const value = meas.value.trim() === "" ? NaN : Number(meas.value);
+    if (!meas.kpi || !Number.isFinite(value)) {
+      setMutNote("Measurement rejected: a KPI and a numeric value are required.");
+      return;
+    }
+    runOwnerOp(
+      ctx,
+      JSON.stringify(["measure", ctx.oid, meas.kpi, value, meas.note]),
+      () => ({
+        business_id: ctx.biz, kpi_id: meas.kpi, value,
+        evidence_key: crypto.randomUUID(),
+        note: meas.note || undefined,
+      }),
+      (b) => api.objectiveRecordProgressApp(ctx.oid, b as never),
+      `Measurement committed — owner-attested progress written to ${meas.kpi}.`,
+      "Measurement",
+    );
+  };
+
+  const runEvidence = () => {
+    if (!dlg || dlg.kind !== "evidence") return;
+    const ctx = { biz: dlg.biz, oid: dlg.oid };
+    runOwnerOp(
+      ctx,
+      JSON.stringify(["evidence", ctx.oid, evNote]),
+      () => ({
+        business_id: ctx.biz,
+        evidence_key: crypto.randomUUID(),
+        note: evNote || undefined,
+      }),
+      (b) => api.objectiveAttachEvidenceApp(ctx.oid, b as never),
+      "Evidence attached — canonical EVIDENCE ref appended.",
+      "Attach evidence",
+    );
+  };
+
+  const runAmend = () => {
+    if (!dlg || dlg.kind !== "amend") return;
+    const ctx = { biz: dlg.biz, oid: dlg.oid };
+    const patch: Record<string, unknown> = {};
+    /* Diff-only: the canonical amend bumps terms_version and rebinds
+       objective_digest for EVERY supplied key — sending unchanged
+       values would invalidate pinned reviews/policy grants for no
+       reason. Only fields that genuinely differ are patched. */
+    if (amend.title.trim() && amend.title.trim() !== String(o.title ?? "")) {
+      patch.title = amend.title.trim();
+    }
+    if (amend.deadline) {
+      const dl = new Date(amend.deadline);
+      if (Number.isNaN(dl.getTime())) {
+        setMutNote("Amendment rejected: deadline is not a valid date.");
+        return;
+      }
+      patch.deadline = dl.toISOString();
+    }
+    if (amend.budget.trim()) {
+      const usd = Number(amend.budget);
+      if (!Number.isFinite(usd) || usd < 0) {
+        setMutNote("Amendment rejected: budget ceiling must be a non-negative USD amount.");
+        return;
+      }
+      const micro = Math.round(usd * 1e6);
+      if (micro !== Number(o.budget.ceiling_microusd)) {
+        patch.budget_ceiling_microusd = micro;
+      }
+    }
+    if (!Object.keys(patch).length) {
+      setMutNote("Amendment rejected: no field differs from the current terms — nothing to commit.");
+      return;
+    }
+    runOwnerOp(
+      ctx,
+      JSON.stringify(["amend", ctx.oid, patch, amend.reason]),
+      /* The key mints ONCE per stored op body — an ambiguous retry
+         replays the same bytes, and the service dedups on the key so
+         a committed-but-lost response can never double-commit. */
+      () => ({ business_id: ctx.biz, patch, reason: amend.reason || undefined,
+        idempotency_key: crypto.randomUUID() }),
+      (b) => api.objectiveAmendApp(ctx.oid, b as never),
+      "Amendment committed — terms re-bound (terms_version bumped).",
+      "Amendment",
+    );
+  };
+
+  const runGrant = () => {
+    if (!dlg || dlg.kind !== "kpi-grant") return;
+    const ctx = { biz: dlg.biz, oid: dlg.oid };
+    const rule: Record<string, unknown> = { rule_type: "DELIVERABLE_BUNDLE" };
+    if (grantF.count.trim()) {
+      const n = Number(grantF.count);
+      if (!Number.isSafeInteger(n) || n < 1 || n > 256) {
+        setMutNote("Grant rejected: required_count must be an integer 1–256.");
+        return;
+      }
+      rule.required_count = n;
+    }
+    const keys = grantF.keys.split(",").map((x) => x.trim()).filter(Boolean);
+    if (keys.length) rule.required_keys = keys;
+    if (rule.required_count === undefined && rule.required_keys === undefined) {
+      setMutNote("Grant rejected: the rule needs required_count and/or required_keys.");
+      return;
+    }
+    const pv = grantF.value.trim() === "" ? NaN : Number(grantF.value);
+    if (!Number.isFinite(pv)) {
+      setMutNote("Grant rejected: progress_value must be a finite number.");
+      return;
+    }
+    rule.progress_value = pv;
+    if (!grantF.kpi || !grantF.expires) {
+      setMutNote("Grant rejected: a KPI and a future expires_at are required.");
+      return;
+    }
+    const exp = new Date(grantF.expires);
+    if (Number.isNaN(exp.getTime())) {
+      setMutNote("Grant rejected: expires_at is not a valid date.");
+      return;
+    }
+    const expiresAt = exp.toISOString();
+    runOwnerOp(
+      ctx,
+      JSON.stringify(["kpi-grant", ctx.oid, grantF.kpi, rule, expiresAt]),
+      () => ({
+        action: "grant", kpi_id: grantF.kpi, rule, expires_at: expiresAt,
+        idempotency_key: crypto.randomUUID(),
+      }),
+      (b) => api.objectiveKpiVerificationApp(ctx.oid, b as never),
+      "KPI-verifier grant committed — scheduler woken inside the same commit.",
+      "Grant",
+      () => setGrTick((n) => n + 1),
+    );
+  };
+
+  const runKpiControl = () => {
+    if (!dlg || dlg.kind !== "kpi-control") return;
+    const ctx = { biz: dlg.biz, oid: dlg.oid };
+    const action = dlg.action;
+    runOwnerOp(
+      ctx,
+      JSON.stringify(["kpi", action, ctx.oid, dlg.authorization_id]),
+      () => ({
+        action, authorization_id: dlg.authorization_id,
+        idempotency_key: crypto.randomUUID(),
+      }),
+      (b) => api.objectiveKpiVerificationApp(ctx.oid, b as never),
+      `Grant ${action} committed.`,
+      `Grant ${action}`,
+      () => setGrTick((n) => n + 1),
+    );
   };
 
   /* Autonomous-loop input bundle — identity-guarded reads only. The
@@ -565,8 +810,29 @@ export function ObjectiveDetail() {
       <h2 className="sech">Owner actions</h2>
       <div className="actions">
         <button className="primary" disabled={mutBusy} onClick={() => setDlg({ kind: "ceo", biz: biz!, oid: id })}>Run CEO pass</button>
-        <button className="ghost" disabled title="Owner transition route ships in A2 — disabled, not a fake action">Accept ACHIEVED (A2)</button>
-        <button className="ghost" disabled title="Amend route ships in A2 — disabled, not a fake action">Amend objective (A2)</button>
+        <button
+          className="ghost" disabled={mutBusy || o.kpis.length === 0}
+          title={o.kpis.length === 0 ? "No KPIs declared — nothing to measure" : "Record an owner-attested KPI measurement (canonical owner-verifier seam)"}
+          onClick={() => { setMeas({ kpi: o.kpis[0]?.kpi_id ?? "", value: "", note: "" }); setDlg({ kind: "measure", biz: biz!, oid: id }); }}
+        >Record KPI measurement</button>
+        <button
+          className="ghost" disabled={mutBusy}
+          title="Attach an owner-verified evidence ref (no KPI write)"
+          onClick={() => { setEvNote(""); setDlg({ kind: "evidence", biz: biz!, oid: id }); }}
+        >Attach evidence</button>
+        <button
+          className="ghost" disabled={mutBusy}
+          title="Amend objective terms — canonical re-bind bumps terms_version"
+          onClick={() => { setAmend({ title: String(o.title ?? ""), deadline: "", budget: o.budget.ceiling_microusd > 0 ? String(o.budget.ceiling_microusd / 1e6) : "", reason: "" }); setDlg({ kind: "amend", biz: biz!, oid: id }); }}
+        >Amend objective</button>
+        {c.lifecycle.owner_action_required ? (
+          <Link className="go" to="/app/inbox" title="A TARGET_MET_CANDIDATE review is pending — accept it in the Inbox">review pending sign-off → Inbox</Link>
+        ) : null}
+      </div>
+      <div className="sub">
+        Measurement is <strong>owner-attested</strong>: the verifier is your operator identity, written
+        through the canonical owner-verifier seam — never model output. Grants below delegate that same
+        write to the KPI verifier under a bounded rule.
       </div>
 
       <h2 className="sech">KPIs</h2>
@@ -727,6 +993,71 @@ export function ObjectiveDetail() {
         ))}
       </div>
 
+      <h2 className="sech">KPI verifier grants</h2>
+      <div className="sub">
+        Delegated write authority: a grant lets the canonical KPI verifier write progress to one KPI
+        when its DELIVERABLE_BUNDLE rule is satisfied — expiry-bounded and revocable. Grant +
+        scheduler wake commit atomically; the verifier writer is never your identity.
+      </div>
+      <div className="need">
+        {grSt.kind === "loading" ? (
+          <div className="nrow"><span className="note">loading grant status…</span></div>
+        ) : null}
+        {grSt.kind === "error" ? (
+          <div className="nrow">
+            <span className="tt">status</span>
+            <span className="note">{grSt.err.code}: {grSt.err.detail}</span>
+            <button className="ghost" onClick={() => setGrTick((n) => n + 1)}>Retry</button>
+          </div>
+        ) : null}
+        {grSt.kind === "ready" ? (
+          <>
+            {(Array.isArray(grSt.data.grants) ? (grSt.data.grants as Array<Record<string, unknown>>) : []).length === 0 ? (
+              <div className="nrow"><span className="note">No KPI-verifier grants — KPI progress can only come from owner measurement.</span></div>
+            ) : null}
+            {(Array.isArray(grSt.data.grants) ? (grSt.data.grants as Array<Record<string, unknown>>) : []).map((g) => (
+              <div className="nrow" key={String(g.authorization_id)}>
+                <span className="tt">{String(g.authorization_id)}</span>
+                <StatusBadge tone={S_TONE[String(g.state)] ?? "unknown"} label={String(g.state)} />
+                {g.effective === true ? <ProofChip state="proven" /> : <StatusBadge tone="warn" label="INEFFECTIVE" />}
+                <span className="note">
+                  kpi {String(g.kpi_id)} · expires {String(g.expires_at).slice(0, 16).replace("T", " ")}
+                  {g.ineffective_reason ? ` · ${String(g.ineffective_reason)}` : ""}
+                </span>
+                {String(g.state) === "ENABLED" ? (
+                  <>
+                    <button className="ghost" disabled={mutBusy}
+                      onClick={() => setDlg({ kind: "kpi-control", action: "disable", biz: biz!, oid: id, authorization_id: String(g.authorization_id) })}
+                    >disable</button>
+                    <button className="ghost" disabled={mutBusy}
+                      onClick={() => setDlg({ kind: "kpi-control", action: "revoke", biz: biz!, oid: id, authorization_id: String(g.authorization_id) })}
+                    >revoke</button>
+                  </>
+                ) : null}
+              </div>
+            ))}
+            {(Array.isArray(grSt.data.receipts) ? (grSt.data.receipts as Array<Record<string, unknown>>) : []).length > 0 ? (
+              <div className="nrow">
+                <span className="tt">receipts</span>
+                <span className="note">
+                  {(grSt.data.receipts as Array<Record<string, unknown>>).length} committed —{" "}
+                  {(grSt.data.receipts as Array<Record<string, unknown>>)
+                    .map((r) => `${String(r.kpi_id)}→${String(r.progress_value)}`)
+                    .join(", ")}
+                </span>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </div>
+      <div className="actions">
+        <button
+          className="ghost" disabled={mutBusy || o.kpis.length === 0}
+          title={o.kpis.length === 0 ? "No KPIs declared — nothing to delegate" : "Grant bounded delegated write authority for one KPI"}
+          onClick={() => { setGrantF({ kpi: o.kpis[0]?.kpi_id ?? "", count: "", keys: "", value: "", expires: "" }); setDlg({ kind: "kpi-grant", biz: biz!, oid: id }); }}
+        >Grant KPI verification</button>
+      </div>
+
       <ConfirmDialog
         open={dlg?.kind === "ceo"}
         title="Run CEO pass"
@@ -766,6 +1097,123 @@ export function ObjectiveDetail() {
           </div>
         ) : null}
       </ConfirmDialog>
+
+      {/* ---- P15.9 Step-0 owner-action dialogs ---- */}
+      <ConfirmDialog
+        open={dlg?.kind === "measure"}
+        title="Record KPI measurement"
+        body="Commit an owner-attested KPI measurement? The evidence verifier is your operator identity — this is the canonical owner-verifier write, never model output. Idempotent by evidence_key."
+        confirmLabel="Commit measurement"
+        busy={mutBusy}
+        onConfirm={runMeasure}
+        onCancel={() => setDlg(null)}
+      >
+        {dlg?.kind === "measure" ? (
+          <div className="ofrow" aria-label="kpi measurement">
+            <label htmlFor="mkpi">KPI</label>
+            <select id="mkpi" value={meas.kpi} onChange={(e) => setMeas({ ...meas, kpi: e.target.value })}>
+              {o.kpis.map((k) => (
+                <option key={k.kpi_id} value={k.kpi_id}>
+                  {k.name} ({k.current ?? "—"}/{k.target} {k.unit})
+                </option>
+              ))}
+            </select>
+            <div className="ofrow2">
+              <input placeholder="value" aria-label="measured value" inputMode="decimal"
+                value={meas.value} onChange={(e) => setMeas({ ...meas, value: e.target.value })} />
+              <input placeholder="note (optional)" aria-label="measurement note"
+                value={meas.note} onChange={(e) => setMeas({ ...meas, note: e.target.value })} />
+            </div>
+          </div>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={dlg?.kind === "evidence"}
+        title="Attach evidence"
+        body="Attach an owner-verified evidence ref? It appends a canonical EVIDENCE entry (no KPI write) bound to your operator identity."
+        confirmLabel="Attach evidence"
+        busy={mutBusy}
+        onConfirm={runEvidence}
+        onCancel={() => setDlg(null)}
+      >
+        {dlg?.kind === "evidence" ? (
+          <div className="ofrow" aria-label="attach evidence">
+            <input placeholder="note describing the evidence (optional)" aria-label="evidence note"
+              value={evNote} onChange={(e) => setEvNote(e.target.value)} />
+          </div>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={dlg?.kind === "amend"}
+        title="Amend objective"
+        body="Commit an owner amendment? Canonical terms re-bind: terms_version bumps and pinned reviews/policy grants re-prove against the new terms. Only filled fields change."
+        confirmLabel="Commit amendment"
+        busy={mutBusy}
+        onConfirm={runAmend}
+        onCancel={() => setDlg(null)}
+      >
+        {dlg?.kind === "amend" ? (
+          <div className="ofrow" aria-label="amend objective">
+            <label htmlFor="atitle">title</label>
+            <input id="atitle" value={amend.title} onChange={(e) => setAmend({ ...amend, title: e.target.value })} />
+            <div className="ofrow2">
+              <input type="datetime-local" aria-label="new deadline" value={amend.deadline}
+                onChange={(e) => setAmend({ ...amend, deadline: e.target.value })} />
+              <input placeholder="budget ceiling (USD)" aria-label="new budget ceiling usd" inputMode="decimal"
+                value={amend.budget} onChange={(e) => setAmend({ ...amend, budget: e.target.value })} />
+            </div>
+            <input placeholder="reason (optional)" aria-label="amendment reason"
+              value={amend.reason} onChange={(e) => setAmend({ ...amend, reason: e.target.value })} />
+          </div>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={dlg?.kind === "kpi-grant"}
+        title="Grant KPI verification"
+        body="Grant the canonical KPI verifier bounded write authority for one KPI? It may write progress only while the grant is ENABLED, unexpired, and its DELIVERABLE_BUNDLE rule is provably satisfied by verified deliverables — then the scheduler wakes inside the same commit."
+        confirmLabel="Commit grant"
+        busy={mutBusy}
+        onConfirm={runGrant}
+        onCancel={() => setDlg(null)}
+      >
+        {dlg?.kind === "kpi-grant" ? (
+          <div className="ofrow" aria-label="kpi verifier grant">
+            <label htmlFor="gkpi">KPI</label>
+            <select id="gkpi" value={grantF.kpi} onChange={(e) => setGrantF({ ...grantF, kpi: e.target.value })}>
+              {o.kpis.map((k) => (
+                <option key={k.kpi_id} value={k.kpi_id}>{k.name} ({k.kpi_id})</option>
+              ))}
+            </select>
+            <div className="ofrow2">
+              <input placeholder="required_count" aria-label="required verified units" inputMode="numeric"
+                value={grantF.count} onChange={(e) => setGrantF({ ...grantF, count: e.target.value })} />
+              <input placeholder="required_keys (comma-sep)" aria-label="required workstream keys"
+                value={grantF.keys} onChange={(e) => setGrantF({ ...grantF, keys: e.target.value })} />
+            </div>
+            <div className="ofrow2">
+              <input placeholder="progress_value" aria-label="value written on satisfaction" inputMode="decimal"
+                value={grantF.value} onChange={(e) => setGrantF({ ...grantF, value: e.target.value })} />
+              <input type="datetime-local" aria-label="grant expiry" value={grantF.expires}
+                onChange={(e) => setGrantF({ ...grantF, expires: e.target.value })} />
+            </div>
+          </div>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={dlg?.kind === "kpi-control"}
+        title={dlg?.kind === "kpi-control" ? `${dlg.action === "revoke" ? "Revoke" : "Disable"} grant` : "Grant"}
+        body={dlg?.kind === "kpi-control"
+          ? `${dlg.action === "revoke" ? "Revoke" : "Disable"} grant ${dlg.authorization_id} on ${dlg.oid}? The KPI verifier loses write authority immediately (revoke is terminal; disable is reversible).`
+          : ""}
+        confirmLabel={dlg?.kind === "kpi-control" ? `Commit ${dlg.action}` : "Commit"}
+        busy={mutBusy}
+        onConfirm={runKpiControl}
+        onCancel={() => setDlg(null)}
+      />
     </>
   );
 }

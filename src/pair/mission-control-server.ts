@@ -404,6 +404,42 @@ function rejectCallerOperatorGoal(body: Record<string, unknown>): void {
   }
 }
 
+/* Coercion artifacts that must never become an operator identity. A
+   missing body/header coerces via String() into "undefined"/"null"/
+   "[object Object]" — without this gate an objective could be created
+   under `operator:undefined` and then legitimately claimed by ANY
+   caller sending the header "undefined" (the string is a real,
+   canonicalizable ref). Reject the artifact class at BOTH the mint
+   (objective create) and the actor edge (owner-scoped routes). */
+const OPERATOR_COERCION_ARTIFACTS = new Set([
+  "", "undefined", "null", "NaN", "Infinity", "[object Object]",
+]);
+
+/** Canonicalize an operator identity ONCE (bare `alice` →
+ *  `operator:alice`), failing closed on absent or coercion-artifact
+ *  refs. Single seam for every owner-scoped route — authority never
+ *  accepts a coerced garbage identity. */
+function canonicalOperatorActor(raw: unknown, pathLabel: string): string {
+  const s = String(raw ?? "").trim();
+  const ref = s.startsWith("operator:") ? s.slice("operator:".length).trim() : s;
+  if (OPERATOR_COERCION_ARTIFACTS.has(ref) || /\s/.test(ref)) {
+    throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", pathLabel);
+  }
+  return s.startsWith("operator:") ? `operator:${ref}` : `operator:${s}`;
+}
+
+/** Same artifact gate returning the BARE ref — for callees that
+ *  canonicalize `operator:` themselves in one place (business/routine
+ *  create stamp `operator:${operator_id}` unconditionally). */
+function operatorRef(raw: unknown, pathLabel: string): string {
+  const s = String(raw ?? "").trim();
+  const ref = s.startsWith("operator:") ? s.slice("operator:".length).trim() : s;
+  if (OPERATOR_COERCION_ARTIFACTS.has(ref) || /\s/.test(ref)) {
+    throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", pathLabel);
+  }
+  return ref;
+}
+
 export function createMissionControlServer(
   deps: MissionControlServerDeps,
 ): http.Server {
@@ -884,14 +920,14 @@ export function createMissionControlServer(
         return void json(
           res,
           200,
-          c.setExecutorEnabled(decodeURIComponent(m[1]), enabled, String(operator)),
+          c.setExecutorEnabled(decodeURIComponent(m[1]), enabled, canonicalOperatorActor(operator, p)),
         );
       }
       // P13 governance mutations — operator + CAS + audited, metadata only.
       if (method === "POST" && p === "/api/cost-policies") {
         // R3 §3: create-only — an existing identity fails closed; callers
         // must use the CAS /update path to change authority.
-        return void json(res, 200, c.createCostPolicy(body, `operator:${operator}`));
+        return void json(res, 200, c.createCostPolicy(body, `operator:${operatorRef(operator, p)}`));
       }
       if (method === "POST" && p === "/api/cost-policies/update") {
         // R1 §6: split API control fields from the strict policy payload —
@@ -905,7 +941,7 @@ export function createMissionControlServer(
           200,
           c.updateCostPolicy(
             { ...policyPayload, cost_policy_id: String(cost_policy_id ?? "") },
-            `operator:${operator}`,
+            `operator:${operatorRef(operator, p)}`,
             Number(expected_version),
           ),
         );
@@ -913,7 +949,7 @@ export function createMissionControlServer(
       if (method === "POST" && p === "/api/cost-profiles") {
         // R3 §3: create-only — an existing (ref_type, ref_id) identity
         // fails closed; callers must use the CAS /update path.
-        return void json(res, 200, c.createCostProfile(body, `operator:${operator}`));
+        return void json(res, 200, c.createCostProfile(body, `operator:${operatorRef(operator, p)}`));
       }
       if (method === "POST" && p === "/api/cost-profiles/update") {
         // R1 §6: `expected_version` is an API control field — never part
@@ -925,11 +961,11 @@ export function createMissionControlServer(
         return void json(
           res,
           200,
-          c.updateCostProfile(profilePayload, `operator:${operator}`, Number(expected_version)),
+          c.updateCostProfile(profilePayload, `operator:${operatorRef(operator, p)}`, Number(expected_version)),
         );
       }
       if (method === "POST" && p === "/api/secret-policies") {
-        return void json(res, 200, c.createSecretPolicy(body, `operator:${operator}`));
+        return void json(res, 200, c.createSecretPolicy(body, `operator:${operatorRef(operator, p)}`));
       }
       if (method === "POST" && p === "/api/secret-policies/update") {
         // R1 §6: `policy_id`/`expected_version` are control fields; the
@@ -945,7 +981,7 @@ export function createMissionControlServer(
             String(policy_id ?? ""),
             secretPayload,
             Number(expected_version),
-            `operator:${operator}`,
+            `operator:${operatorRef(operator, p)}`,
           ),
         );
       }
@@ -953,7 +989,7 @@ export function createMissionControlServer(
         return void json(
           res,
           200,
-          c.revokeSecretPolicy(String(body.policy_id ?? ""), `operator:${operator}`),
+          c.revokeSecretPolicy(String(body.policy_id ?? ""), `operator:${operatorRef(operator, p)}`),
         );
       }
       // Phase B two-step submit: preview persists a durable
@@ -1058,7 +1094,8 @@ export function createMissionControlServer(
         return void json(res, 200, biz.createBusiness({
           name: String(body.name ?? ""), project_id: String(body.project_id ?? ""),
           description: String(body.description ?? "") || undefined,
-          currency: String(body.currency ?? "") || undefined, operator_id: String(operator),
+          currency: String(body.currency ?? "") || undefined,
+          operator_id: operatorRef(operator, p),
         }));
       }
       m = p.match(/^\/api\/businesses\/([^/]+)$/);
@@ -1076,14 +1113,14 @@ export function createMissionControlServer(
           department: String(body.department ?? ""), role: String(body.role ?? "") || undefined,
           reports_to: String(body.reports_to ?? "") || undefined,
           executor_binding: String(body.executor_binding ?? "") || undefined,
-          operator_id: String(operator),
+          operator_id: operatorRef(operator, p),
         }));
       }
       m = p.match(/^\/api\/org-agents\/([^/]+)\/(pause|resume|terminate)$/);
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         const st = m[2] === "pause" ? "PAUSED" : m[2] === "resume" ? "ACTIVE" : "TERMINATED";
-        return void json(res, 200, biz.setOrgAgentStatus(m[1], st, String(operator)));
+        return void json(res, 200, biz.setOrgAgentStatus(m[1], st, canonicalOperatorActor(operator, p)));
       }
       // P12: agent execution contract management — canonical business-layer
       // ops only; CAS-protected, audited, business-isolated.
@@ -1095,7 +1132,7 @@ export function createMissionControlServer(
         }
         if (method === "POST" || method === "PUT") {
           return void json(res, 200, biz.upsertAgentContract(
-            m[1], String(operator),
+            m[1], canonicalOperatorActor(operator, p),
             body.policy as Record<string, unknown> | undefined,
             typeof body.expected_version === "number" ? body.expected_version : undefined,
           ));
@@ -1105,7 +1142,7 @@ export function createMissionControlServer(
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         return void json(res, 200, biz.setAgentContractStatus(
-          m[1], m[2] === "disable" ? "DISABLED" : "ACTIVE", String(operator)));
+          m[1], m[2] === "disable" ? "DISABLED" : "ACTIVE", canonicalOperatorActor(operator, p)));
       }
       m = p.match(/^\/api\/org-agents\/([^/]+)\/effective-policy$/);
       if (method === "GET" && m) {
@@ -1125,7 +1162,7 @@ export function createMissionControlServer(
           assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
           objective_id: String(body.objective_id ?? "") || undefined,
           priority: typeof body.priority === "number" ? body.priority : undefined,
-          operator_id: String(operator),
+          operator_id: operatorRef(operator, p),
         }));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/(claim|release|heartbeat|comment|block|unblock|artifacts|messages)$/);
@@ -1146,17 +1183,17 @@ export function createMissionControlServer(
           }));
         }
         const out =
-          wact === "claim" ? biz.claimWorkItem(wid, String(body.agent_id ?? ""), String(operator))
-          : wact === "release" ? biz.releaseClaim(wid, String(operator), String(body.claim_token ?? "") || undefined)
+          wact === "claim" ? biz.claimWorkItem(wid, String(body.agent_id ?? ""), canonicalOperatorActor(operator, p))
+          : wact === "release" ? biz.releaseClaim(wid, canonicalOperatorActor(operator, p), String(body.claim_token ?? "") || undefined)
           : wact === "heartbeat" ? biz.heartbeatWorkItem(
-              wid, String(body.agent_id ?? ""), String(body.claim_token ?? ""), String(operator))
+              wid, String(body.agent_id ?? ""), String(body.claim_token ?? ""), canonicalOperatorActor(operator, p))
           : wact === "comment" ? biz.commentOnWorkItem(wid, String(body.author ?? operator), String(body.body ?? ""))
-          : wact === "block" ? biz.blockWorkItem(wid, String(body.reason ?? ""), String(operator))
-          : wact === "unblock" ? biz.unblockWorkItem(wid, String(operator))
+          : wact === "block" ? biz.blockWorkItem(wid, String(body.reason ?? ""), canonicalOperatorActor(operator, p))
+          : wact === "unblock" ? biz.unblockWorkItem(wid, canonicalOperatorActor(operator, p))
           : biz.attachWorkItemArtifact(wid, {
               name: String(body.name ?? ""), uri: String(body.uri ?? ""),
               content_type: String(body.content_type ?? "") || undefined,
-            }, String(operator));
+            }, canonicalOperatorActor(operator, p));
         // The raw token is returned ONLY by the claim creation response;
         // every other work-item payload has it stripped (P2 §2).
         return void json(res, 200, wact === "claim" ? out : stripClaimToken(out));
@@ -1181,7 +1218,7 @@ export function createMissionControlServer(
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         return void json(res, 200, biz.ackWorkforceMessage(
-          m[1], String(body.agent_id ?? ""), String(operator)));
+          m[1], String(body.agent_id ?? ""), canonicalOperatorActor(operator, p)));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel|review)$/);
       if (method === "POST" && m) {
@@ -1189,7 +1226,7 @@ export function createMissionControlServer(
         const [, wid, wact] = m;
         const out =
           wact === "open"
-            ? biz.openWorkItem(wid, String(operator), undefined, {
+            ? biz.openWorkItem(wid, canonicalOperatorActor(operator, p), undefined, {
                 // Phase C — direct delegated opens run through the SAME
                 // shared async Planner Pool seam before the sole
                 // bound-mission authority commits. The awaited plan is
@@ -1197,14 +1234,14 @@ export function createMissionControlServer(
                 // goal; openWorkItem re-proves its goal digest inside
                 // the dedup write. Planner absent/exhausted propagates
                 // fail-closed — never a template mission.
-                prepared_plan: await biz.prepareDelegatedPlan(wid, String(operator)),
+                prepared_plan: await biz.prepareDelegatedPlan(wid, canonicalOperatorActor(operator, p)),
               })
-          : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
+          : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), canonicalOperatorActor(operator, p))
           : wact === "review" ? biz.reviewWorkItem(wid, {
               reviewer_agent_id: String(body.reviewer_agent_id ?? ""),
               decision: String(body.decision ?? ""),
-            }, String(operator))
-          : biz.cancelWorkItem(wid, String(operator)); // governed cancel: live mission cancelled first, then CANCELLED
+            }, canonicalOperatorActor(operator, p))
+          : biz.cancelWorkItem(wid, canonicalOperatorActor(operator, p)); // governed cancel: live mission cancelled first, then CANCELLED
         return void json(res, 200, out);
       }
       // ----- P14 Workforce V2 Phase 1: governed work graph -----
@@ -1215,7 +1252,7 @@ export function createMissionControlServer(
         return void json(res, 200, wf.decomposeWorkItem(m[1], {
           decomposition_id: String(body.decomposition_id ?? ""),
           children: Array.isArray(body.children) ? body.children : [],
-        }, String(operator)));
+        }, canonicalOperatorActor(operator, p)));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/delegate$/);
       if (method === "POST" && m) {
@@ -1226,7 +1263,7 @@ export function createMissionControlServer(
           delegated_to_agent_id: String(body.delegated_to_agent_id ?? ""),
           reason: body.reason === undefined ? undefined : String(body.reason),
           delegation_key: body.delegation_key === undefined ? undefined : String(body.delegation_key),
-        }, String(operator)));
+        }, canonicalOperatorActor(operator, p)));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/dependencies$/);
       if (method === "PUT" && m) {
@@ -1235,7 +1272,7 @@ export function createMissionControlServer(
           m[1],
           Array.isArray(body.depends_on) ? body.depends_on.map(String) : [],
           typeof body.expected_version === "number" ? body.expected_version : -1,
-          String(operator),
+          canonicalOperatorActor(operator, p),
         ));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/completion$/);
@@ -1265,13 +1302,13 @@ export function createMissionControlServer(
           goal_template: String(body.goal_template ?? ""), cron: String(body.cron ?? ""),
           department: String(body.department ?? "") || undefined,
           assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
-          operator_id: String(operator),
+          operator_id: operatorRef(operator, p),
         }));
       }
       m = p.match(/^\/api\/routines\/([^/]+)\/(enable|disable)$/);
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
-        return void json(res, 200, biz.setRoutineEnabled(m[1], m[2] === "enable", String(operator)));
+        return void json(res, 200, biz.setRoutineEnabled(m[1], m[2] === "enable", canonicalOperatorActor(operator, p)));
       }
       if (method === "GET" && p === "/api/objectives") {
         const bid = url.searchParams.get("business_id") ?? undefined;
@@ -1285,7 +1322,7 @@ export function createMissionControlServer(
           parent_objective_id: String(body.parent_objective_id ?? "") || undefined,
           metric: String(body.metric ?? "") || undefined,
           target: String(body.target ?? "") || undefined,
-          operator_id: String(operator),
+          operator_id: canonicalOperatorActor(operator, p),
         }));
       }
       // ----- P15.7 — canonical vnext Objective API (P15.1 authority) -----
@@ -1322,7 +1359,12 @@ export function createMissionControlServer(
           success_conditions: body.success_conditions as string[] | undefined,
           stop_conditions: body.stop_conditions as string[] | undefined,
           dedup_key: body.dedup_key === undefined ? undefined : String(body.dedup_key),
-          operator_id: String(operator),
+          // Edge gate (audit M1): String(undefined|{}|null) would mint
+          // `operator:undefined`-class owners — identities any caller
+          // could then claim by echoing the same garbage header. The
+          // owner_authority_id minted here is write authority forever,
+          // so a coercion-artifact identity fails closed, never mints.
+          operator_id: canonicalOperatorActor(operator, p),
         }));
       }
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)$/);
@@ -1348,7 +1390,7 @@ export function createMissionControlServer(
           invoker: deps.ceoInvoker,
         });
         const out = await ceoOps.service.runObjectivePass({
-          objective_id: m[1], actor: String(operator),
+          objective_id: m[1], actor: canonicalOperatorActor(operator, p),
         });
         return void json(res, 200, out);
       }
@@ -1373,12 +1415,7 @@ export function createMissionControlServer(
           invoker: deps.ceoInvoker,
         });
         const svc = ceoOps.kpiVerification;
-        const rawActor = String(req.headers["x-operator-id"] ?? "");
-        if (!rawActor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
-        const kpiActor = rawActor.startsWith("operator:")
-          ? rawActor : `operator:${rawActor}`;
+        const kpiActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         const action = String(body.action ?? "");
         if (action === "status") {
           return void json(res, 200, svc.status(m[1]!, kpiActor));
@@ -1410,19 +1447,105 @@ export function createMissionControlServer(
         }
         throw new IntegrityError("FAIL_CLOSED_KPI_VERIFY", `action ${action} unsupported`);
       }
+      /* ----- P15.9 Step-0 — owner-scoped measurement / evidence /
+         amendment. These HTTP seams were absent: the P15.1 authority
+         methods recordProgress / attachEvidence / amend existed but
+         were unreachable over the wire (curl-only for kpi-verification,
+         nothing for the rest). Owner proof comes ONLY from the trusted
+         x-operator-id header — a body-declared owner field is never
+         authority. The verifier inside the evidence is always the
+         header-derived actor itself (operator:<id>): the P15.1
+         assertOwnerVerifier gate then requires actor ===
+         owner_authority_id, so a non-owner fails closed inside the
+         service. All semantics (scope, terminal, ledger idempotency,
+         CAS version, AMENDABLE_KEYS, budget re-proof) stay in
+         ObjectiveAuthorityService — the route only authenticates and
+         passes schema-checked inputs through. accountBudget is
+         deliberately NOT exposed: the service does not assertOwner for
+         it (it is the canonical cost-pipeline seam), so an HTTP seam
+         would weaken the call discipline for zero owner-facing need. */
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/(progress|evidence|amend)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        // Header-only authority — the shared edge gate also rejects
+        // coercion-artifact identities (a row minted under a garbage
+        // owner can never be claimed by echoing that garbage back).
+        const ownerActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        const ownerAction = m[2]!;
+        const businessId = String(body.business_id ?? "");
+        if (ownerAction === "amend") {
+          if (!body.patch || typeof body.patch !== "object" || Array.isArray(body.patch)) {
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_AMEND",
+              "patch must be a non-null object (keys restricted by AMENDABLE_KEYS in the authority service)",
+            );
+          }
+          return void json(res, 200, biz.objectives.amend(m[1]!, {
+            business_id: businessId,
+            patch: body.patch as Record<string, unknown>,
+            reason: body.reason === undefined ? undefined : String(body.reason),
+            actor: ownerActor,
+            /* Idempotency anchor (R2 M2′): without it an ambiguous
+               retry after a committed-but-lost response would bump
+               terms_version and invalidate pinned reviews twice. */
+            idempotency_key: body.idempotency_key === undefined
+              ? undefined : String(body.idempotency_key),
+          }));
+        }
+        /* progress + evidence share the owner-verifier evidence shape:
+           - verifier is ALWAYS the header-derived actor — a
+             body-supplied verifier can never substitute authority;
+           - evidence_key is REQUIRED (the canonical idempotency
+             anchor): a server-minted key would defeat ledger dedup on
+             an ambiguous transport retry;
+           - source is pinned to "owner-console" — the honest
+             provenance label of THIS seam; a body-chosen source would
+             let a caller falsify where the evidence came from. */
+        const evidenceKey = String(body.evidence_key ?? "");
+        if (!evidenceKey) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_FIELD",
+            "evidence_key is required — it is the canonical idempotency anchor",
+          );
+        }
+        const evidence = {
+          evidence_key: evidenceKey,
+          verifier: ownerActor,
+          source: "owner-console",
+        };
+        const note = body.note === undefined ? undefined : String(body.note);
+        if (ownerAction === "progress") {
+          // typeof-strict: Number(null)===0 / Number("")===0 would
+          // otherwise mint a silent zero measurement.
+          if (typeof body.value !== "number" || !Number.isFinite(body.value)) {
+            throw new IntegrityError(
+              "FAIL_CLOSED_OBJECTIVE_FIELD",
+              "value must be a finite JSON number",
+            );
+          }
+          return void json(res, 200, biz.objectives.recordProgress(m[1]!, {
+            business_id: businessId,
+            kpi_id: String(body.kpi_id ?? ""),
+            value: body.value,
+            evidence,
+            note,
+            actor: ownerActor,
+          }));
+        }
+        return void json(res, 200, biz.objectives.attachEvidence(m[1]!, {
+          business_id: businessId,
+          evidence,
+          note,
+          actor: ownerActor,
+        }));
+      }
       // ----- P15.10-B — owner-scoped RECONCILE_ONLY scheduler status -----
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-scheduler$/);
       if (m && method === "GET") {
         if (!biz || !deps.autoScheduler) {
           return void json(res, 404, { error: "AUTO_SCHEDULER_DISABLED" });
         }
-        const rawSchedulerActor = String(req.headers["x-operator-id"] ?? "");
-        if (!rawSchedulerActor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
-        const schedulerActor = rawSchedulerActor.startsWith("operator:")
-          ? rawSchedulerActor
-          : `operator:${rawSchedulerActor}`;
+        const schedulerActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         // P15.10-C R3 F3 — readiness is the driver's OWN truthful
         // proof for THIS objective, not a deployment flag.
         const r = deps.autoDriver?.readiness(m[1]!, schedulerActor);
@@ -1441,16 +1564,7 @@ export function createMissionControlServer(
         if (!biz || !deps.autoDriver) {
           return void json(res, 404, { error: "AUTO_DRIVER_DISABLED" });
         }
-        const rawDriverActor = String(req.headers["x-operator-id"] ?? "");
-        if (!rawDriverActor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
-        // Owner-scope proof runs inside the same owner revalidation
-        // the auto-policy status route enforces — a non-owner actor
-        // fails closed there before any driver state is read.
-        const driverActor = rawDriverActor.startsWith("operator:")
-          ? rawDriverActor
-          : `operator:${rawDriverActor}`;
+        const driverActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         return void json(res, 200, {
           auto_driver: deps.autoDriver.status(m[1]!, driverActor),
         });
@@ -1461,17 +1575,11 @@ export function createMissionControlServer(
         if (!biz || !deps.store) {
           return void json(res, 404, { error: "AUTO_POLICY_DISABLED" });
         }
-        const rawPolicyActor = String(req.headers["x-operator-id"] ?? "");
-        if (!rawPolicyActor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
         // Canonical actor derivation — same convention the Objective
         // create path uses (`operator:<id>`), so an owner who created
         // the objective with a raw header can operate its policy with
         // the same raw header. Body-declared identity never consulted.
-        const policyActor = rawPolicyActor.startsWith("operator:")
-          ? rawPolicyActor
-          : `operator:${rawPolicyActor}`;
+        const policyActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
         // P15.10-C R3 F3 — truthful readiness: the driver's own
         // canonical proof for this objective (scheduler READY + policy
@@ -1531,10 +1639,7 @@ export function createMissionControlServer(
         if (!biz || !wf || !deps.store) {
           return void json(res, 404, { error: "COCKPIT_DISABLED" });
         }
-        const actor = String(req.headers["x-operator-id"] ?? "");
-        if (!actor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
+        const cockpitActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         cockpitSvc ??= new ObjectiveCockpitService({
           store: deps.store,
           business: biz,
@@ -1549,8 +1654,6 @@ export function createMissionControlServer(
           autoDriver: deps.autoDriver,
           artifacts: deps.artifacts,
         });
-        const cockpitActor = actor.startsWith("operator:")
-          ? actor : `operator:${actor}`;
         return void json(res, 200, {
           cockpit: cockpitSvc.objectiveCockpit(m[1]!, cockpitActor),
         });
@@ -1560,10 +1663,7 @@ export function createMissionControlServer(
         if (!biz || !wf || !deps.store) {
           return void json(res, 404, { error: "COCKPIT_DISABLED" });
         }
-        const actor = String(req.headers["x-operator-id"] ?? "");
-        if (!actor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
+        const reviewsActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         cockpitSvc ??= new ObjectiveCockpitService({
           store: deps.store,
           business: biz,
@@ -1578,8 +1678,6 @@ export function createMissionControlServer(
           autoDriver: deps.autoDriver,
           artifacts: deps.artifacts,
         });
-        const reviewsActor = actor.startsWith("operator:")
-          ? actor : `operator:${actor}`;
         const limitParam = url.searchParams.get("limit");
         const limit = limitParam === null ? 50 : Number(limitParam);
         if (!Number.isFinite(limit) || limit < 1) {
@@ -1599,12 +1697,7 @@ export function createMissionControlServer(
         if (!biz || !wf || !deps.store) {
           return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
         }
-        const rawSignoffActor = String(req.headers["x-operator-id"] ?? "");
-        if (!rawSignoffActor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
-        const signoffActor = rawSignoffActor.startsWith("operator:")
-          ? rawSignoffActor : `operator:${rawSignoffActor}`;
+        const signoffActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         // R1-F2 — strict request schema BEFORE any coercion: wrong JSON
         // types (arrays/objects/numbers) are a typed 400 client error
         // with zero mutation — String(body.action) must never turn
@@ -1660,10 +1753,7 @@ export function createMissionControlServer(
         if (!biz || !wf || !deps.store) {
           return void json(res, 404, { error: "COCKPIT_DISABLED" });
         }
-        const actor = String(req.headers["x-operator-id"] ?? "");
-        if (!actor) {
-          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
-        }
+        const companyActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         cockpitSvc ??= new ObjectiveCockpitService({
           store: deps.store,
           business: biz,
@@ -1678,8 +1768,6 @@ export function createMissionControlServer(
           autoDriver: deps.autoDriver,
           artifacts: deps.artifacts,
         });
-        const companyActor = actor.startsWith("operator:")
-          ? actor : `operator:${actor}`;
         return void json(res, 200, {
           company: cockpitSvc.businessCompany(m[1]!, companyActor),
         });
@@ -1697,7 +1785,7 @@ export function createMissionControlServer(
           period: String(body.period ?? "DAY") as never,
           max_missions: Number(body.max_missions ?? 0),
           hard_stop: body.hard_stop !== false,
-          operator_id: String(operator),
+          operator_id: operatorRef(operator, p),
         }));
       }
       // ----- P15.8-D — conversation layer (Chat + governed drafts) -----
@@ -1994,11 +2082,22 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_POLICY_OWNER" ||
         e.code === "FAIL_CLOSED_COCKPIT_AUTHORITY" ||
         e.code === "FAIL_CLOSED_OBJECTIVE_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_OBJECTIVE_UNVERIFIED" ||
+        e.code === "FAIL_CLOSED_OBJECTIVE_SCOPE" ||
+        e.code === "FAIL_CLOSED_BRAIN_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_BRAIN_SCOPE" ||
         e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;
-      json(res, status, { error: e.code ?? "ERROR", detail: String(e.message ?? error) });
+      /* 403 responses carry the CODE only — authority-check messages
+         name the real owner/business ids ("actor X is not owner Y"),
+         and echoing them to a denied foreign caller would disclose
+         canonical scope internals (R2 M4′). The code is sufficient for
+         the UI's fail-closed handling. */
+      json(res, status, status === 403
+        ? { error: e.code ?? "ERROR" }
+        : { error: e.code ?? "ERROR", detail: String(e.message ?? error) });
     }
   });
 }

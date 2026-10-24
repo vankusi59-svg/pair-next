@@ -98,6 +98,7 @@ export * from "./objective-auto-wakeup.js";
 export * from "./objective-auto-policy.js";
 export * from "./objective-auto-driver.js";
 export * from "./objective-cockpit.js";
+export * from "./brain-context.js";
 export * from "./operational-query.js";
 
 export * from "./objective-kpi-verifier-authority.js";
