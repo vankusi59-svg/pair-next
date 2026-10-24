@@ -6,6 +6,8 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 
 ## STATUS
 
+- PR #134 open: feat/p15-9-owner-seams-p16a → staging/pr59-safe (HEAD 55edffb, R3 PASS)
+- PR #135 open: feat/p16-b-reasoning-brief → feat/p15-9-owner-seams-p16a (HEAD 47be280, R2 PASS)
 - Step 0 (P15.9 owner-action gaps): DONE — HEAD 3616737840a6b2ff86d7c69be466357d649f7d1d
   - POST /api/vnext/objectives/:id/{progress,evidence,amend} — x-operator-id only authority
   - accountBudget intentionally NOT exposed (no assertOwner — pipeline seam)
@@ -19,7 +21,9 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 
 ## PENDING
 
-- P16-B ReasoningBrief contract (evidence-linked facts/hypotheses/options)
+- P16-B ReasoningBrief contract: DONE — PR #135 (47be280); ReasoningBriefService.briefFor
+  deterministic from contextFor; provenance from integrity notes; volatile-stripped digest;
+  options name existing authority channels only; reasoner = transport+usable gates reported
 - P16-C CEO consumption via ceo-planning-cycle injection (no ceo-decision schema change)
 - P16-D capability-gap advisory (DRIVER_* fault classification → persisted projection)
 - Chat company-status read blocked by UNVERIFIED_IDENTITY (operational-query.ts) — prerequisite seam
@@ -34,8 +38,11 @@ program_BASE: cad17a296f3bcf35a65e28e9e5749bc558014550
 
 ## NEXT ACTION
 
-P16-B implementation brief: ReasoningBrief schema (facts/hypotheses/confidence/options/tradeoffs/
-missing-info) bound to brain-context context_digest; reuse model catalog + governed transport.
+P16-C — CEO consumes ReasoningBrief: inject brief into buildCeoObservation/CEO user prompt
+(seam: ceo-planning-cycle.ts ~:822/946-950, observation feeds buildCeoUserPrompt). Requirements:
+deterministic CEO validation + commit authority intact; no ceo-decision schema change unless
+governed; brief staleness check via context_digest pin. Also: PR #134 (P15.9+P16-A) and #135
+(P16-B) await owner merge — #135 base must retarget to staging/pr59-safe after #134 merges.
 
 ---
 ## R1 REPAIR CHECKPOINT (2026-10-24)
