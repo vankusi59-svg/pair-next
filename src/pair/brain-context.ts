@@ -6,12 +6,16 @@
  * owner-scoped objective — the input a later ReasoningBrief (P16-B)
  * may consume. This service is deliberately ADVISORY-ONLY:
  *
- *  - READ-ONLY by construction: it holds the same read-only deps
- *    shape as the cockpit and delegates ALL strict reads to the ONE
- *    existing ObjectiveCockpitService composition (strict objective
- *    get + KPI/budget re-proof + buildReviewObservation + verified
- *    artifact re-validation). No store.put, no store.event, no model
- *    call, no execution authority is reachable from this class.
+ *  - READ-ONLY by discipline (tested, not type-claimed): the service
+ *    holds no write method of its own and delegates ALL strict reads
+ *    to the ONE existing ObjectiveCockpitService composition (strict
+ *    objective get + KPI/budget re-proof + buildReviewObservation +
+ *    verified-artifact CAS re-validation). No store.put, no
+ *    store.event, no model call, no execution authority is invoked.
+ *    The deps DO type wider seams (cockpit needs the full services),
+ *    so the no-write guarantee is enforced by the canonical-log
+ *    identity invariant — the event/payload log is byte-identical
+ *    across any contextFor call.
  *  - OWNER-GATED: actor must equal the objective's
  *    owner_authority_id — foreign business/objective access fails
  *    closed (FAIL_CLOSED_BRAIN_AUTHORITY), never a filtered view.
@@ -22,13 +26,17 @@
  *  - BOUNDED: the whole read runs inside store.withReadBudget; budget
  *    exhaustion surfaces as the typed FAIL_CLOSED_*_PROOF_LIMIT
  *    IntegrityError — never silent truncation. Section lists inherit
- *    the cockpit's MAX_LIST caps.
+ *    the cockpit's MAX_LIST caps. A nested outer read budget (a caller
+ *    bug that would silently discard this bound while the envelope
+ *    still reports it) fails closed: FAIL_CLOSED_BRAIN_BUDGET.
  *  - DETERMINISTIC: context_digest pins {schema, objective, business,
  *    per-section digests}; identical canonical state → identical
- *    digest. The wall-clock `asof` is freshness metadata and is
- *    EXCLUDED from the digest (two reads of unchanged state share the
- *    digest even across time). P16-B may pin context_digest for
- *    stale-check.
+ *    digest. Wall-clock freshness (`asof`) and clock-DERIVED
+ *    projection fields (auto-policy expiry_pending/effective/reasons
+ *    and the driver equivalents) are excluded from digested values —
+ *    they describe "now", not canonical state, and would otherwise
+ *    flip the digest across a policy-expiry instant on unchanged
+ *    rows. P16-B may pin context_digest for stale-check.
  *
  *  - UNSCOPED DATA EXCLUDED BY DESIGN: Semantic/Procedural Memory and
  *    Verified Experience have NO business/objective tenancy binding in
@@ -36,13 +44,27 @@
  *    cross-scope poisoning window, both sections are reported as
  *    typed `unavailable` — P17's tenancy scope must land before the
  *    Brain may consume them.
+ *
+ *  - KNOWN INHERITED GAP (canonical contract, not this layer): an
+ *    ACTIVE objective whose KPI progress was minted through an
+ *    expired/revoked delegated grant fails the strict KPI re-proof
+ *    permanently — only the OBJECTIVE_TERMINAL grant end is classified
+ *    legitimate (objective-cockpit.ts isLegitimateTerminalGrantEnd).
+ *    For those objectives contextFor fails closed rather than serving
+ *    unproven claims; a later milestone must surface this as a typed
+ *    capability-gap reason rather than a generic integrity error.
  */
 import { IntegrityError } from "./errors.js";
 import { digest, utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { Row } from "./routine-mirror.js";
 import {
+  assertCanonicalObjectiveBudget,
+  assertCanonicalObjectiveKpiProgress,
+} from "./objective-adaptive-review.js";
+import {
   ObjectiveCockpitService,
+  isLegitimateTerminalGrantEnd,
   type ObjectiveCockpitDeps,
 } from "./objective-cockpit.js";
 
@@ -71,10 +93,12 @@ export interface BrainContextSection {
    *  by design or by wiring (never silently empty). */
   unavailable: string[];
   /** Integrity observations surfaced during the read (e.g. artifacts
-   *  dropped because canonical re-verification failed). */
+   *  dropped because canonical re-verification failed, KPI/budget
+   *  claims that could not be re-proven NOW). */
   integrity: string[];
   /** digest({sources, unavailable, integrity, value}) — stable across
-   *  identical canonical state. */
+   *  identical canonical state (volatile clock-derived fields are
+   *  normalized out before digesting; see stripVolatile). */
   digest: string;
   value: unknown;
 }
@@ -119,6 +143,27 @@ function section(
   };
 }
 
+/* Clock-derived projection fields — statusReadOnly embeds
+   this.now()-derived claims (expiry_pending / effective / reasons)
+   that change at a policy-expiry instant over byte-identical
+   canonical rows. They stay VISIBLE in section.value (a consumer
+   should see them) but are stripped from the digest input so
+   context_digest only tracks canonical state. */
+const VOLATILE_STATUS_KEYS = new Set(["expiry_pending", "effective", "reasons"]);
+
+function stripVolatile(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripVolatile);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (VOLATILE_STATUS_KEYS.has(k)) continue;
+      out[k] = stripVolatile(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 export class BrainContextService {
   /** The ONE strict-read composition — cockpit internals are not
    *  duplicated here; sections are projections OF the cockpit payload. */
@@ -140,10 +185,42 @@ export class BrainContextService {
     actor: string,
     opts?: BrainContextOpts,
   ): BrainContext {
+    // Nested-budget refusal — store.withReadBudget silently inherits
+    // an outer scope (store.ts: if readBudget set, fn runs under it),
+    // which would discard OUR bound while the envelope still reports
+    // it. Check BEFORE installing ours. A caller that wants a tighter
+    // bound passes it via opts.read_budget.
+    if (this.store.readBudgetRemaining() !== null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BRAIN_BUDGET",
+        "contextFor under an outer read budget would lie about its bound",
+      );
+    }
     const budget = opts?.read_budget ?? BRAIN_CONTEXT_READ_BUDGET;
     return this.store.withReadBudget(budget, () =>
       this.contextForBounded(objectiveId, actor, opts, budget),
     );
+  }
+
+  /** Re-prove the objective's KPI progress + budget ledger against
+   *  the canonical evidence chains NOW — the same validators
+   *  buildReviewObservation runs. Returns false ONLY for the
+   *  classified legitimate terminal-grant end; every other failure
+   *  propagates (fail closed). This is deliberately a direct
+   *  re-proof: an observation failure elsewhere (workstream,
+   *  mission) must not downgrade provable KPI/budget claims into
+   *  false UNPROVEN notes. */
+  private proveClaims(obj: Row): boolean {
+    try {
+      assertCanonicalObjectiveKpiProgress(this.store, obj);
+      assertCanonicalObjectiveBudget(this.store, obj);
+      return true;
+    } catch (err) {
+      if (isLegitimateTerminalGrantEnd(err, String(obj.status))) {
+        return false;
+      }
+      throw err;
+    }
   }
 
   private contextForBounded(
@@ -169,6 +246,11 @@ export class BrainContextService {
       );
     }
 
+    // Direct claim re-proof (see proveClaims) — decides whether the
+    // KPI/budget integrity notes below are honest, independent of
+    // whether the observation composition failed elsewhere.
+    const claimsProven = this.proveClaims(obj);
+
     // ONE strict composition — same re-proofs as the owner cockpit.
     const c = this.cockpit.objectiveCockpit(objectiveId, actor);
     const o = c.objective as Record<string, unknown>;
@@ -176,11 +258,9 @@ export class BrainContextService {
     const obsError = c.observation_error as string | null;
 
     const objectiveIntegrity: string[] = [];
-    if ((o.budget as Row | undefined)?.canonically_proven !== true) {
+    if (!claimsProven) {
       objectiveIntegrity.push("BUDGET_LEDGER_UNPROVEN");
-    }
-    for (const k of kpis) {
-      if (k.canonically_proven !== true) {
+      for (const k of kpis) {
         objectiveIntegrity.push(`KPI_PROGRESS_UNPROVEN:${String(k.kpi_id)}`);
       }
     }
@@ -257,12 +337,23 @@ export class BrainContextService {
     const autoUnavailable: string[] = [];
     if (!this.deps.autoPolicy) autoUnavailable.push("AUTO_POLICY_NOT_WIRED");
     if (!this.deps.autoDriver) autoUnavailable.push("AUTO_DRIVER_NOT_WIRED");
-    sections.autonomy = section(
-      ["auto_policy.statusReadOnly", "auto_driver.statusReadOnly"],
-      { auto_policy: c.auto_policy, auto_driver: c.auto_driver },
-      autoUnavailable,
-      [],
-    );
+    /* The section VALUE keeps the full status projection (consumers
+       should see expiry/effective/reasons), but the DIGEST pins only
+       its canonical subset — clock-derived fields are stripped so an
+       expiry-instant flip cannot fake a state change. */
+    const autoValue = { auto_policy: c.auto_policy, auto_driver: c.auto_driver };
+    sections.autonomy = {
+      sources: ["auto_policy.statusReadOnly", "auto_driver.statusReadOnly"],
+      unavailable: autoUnavailable,
+      integrity: [],
+      digest: digest({
+        sources: ["auto_policy.statusReadOnly", "auto_driver.statusReadOnly"],
+        unavailable: autoUnavailable,
+        integrity: [],
+        value: stripVolatile(autoValue),
+      }),
+      value: autoValue,
+    };
 
     /* Unscoped-memory exclusion — Semantic/Procedural Memory and
        Verified Experience carry NO business/objective tenancy binding

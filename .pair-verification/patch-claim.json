@@ -1,6 +1,6 @@
 {
   "claim_id": "P15_9_OWNER_ACTION_SEAMS_PLUS_P16_A_BRAIN_CONTEXT",
-  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator",
+  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator (R1 repair)",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
@@ -9,6 +9,7 @@
   ],
   "required_tests": [
     "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
+    "src/__tests__/pair-p15-9-step0-owner-actions.test.ts#Step0",
     "src/__tests__/pair-p15-9a-company-cockpit.test.ts#P15.9-A1",
     "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
   ],
@@ -16,6 +17,6 @@
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Step 0 (P15.9): owner-scoped POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Owner proof is ONLY the trusted x-operator-id header (canonicalized once to operator:<id>); a body-declared owner/verifier is never authority — the evidence verifier is always the header-derived actor so assertOwnerVerifier enforces actor === owner_authority_id in the service. All semantics stay inside ObjectiveAuthorityService. accountBudget is deliberately NOT exposed (no assertOwner — cost-pipeline seam). UI: api.ts wrappers + ObjectiveDetail owner actions (measurement/evidence/amend) with exact-body idempotent retry + KPI-verifier grants card; grant+wake atomicity unchanged. Measurement is owner-attested via the owner-verifier seam — UI never mints verified state or sends a verifier field. Step 1 (P16-A ms1): brain-context.ts BrainContextService.contextFor — the Brain's only canonical read surface. Read-only by construction: strict reads delegate to the existing ObjectiveCockpitService composition; zero puts/events/model calls (B7). Owner-gated FAIL_CLOSED_BRAIN_AUTHORITY/SCOPE; tamper propagates strict-read errors (B2); broken CAS artifacts drop+report, never trusted (B4); business isolation (B5). Bounded via store.withReadBudget — typed PROOF_LIMIT on exhaustion, never silent truncation (B6). Deterministic context_digest stable iff canonical state unchanged, asof excluded (B1). Unscoped memory/experience report typed SCOPE_BINDING_ABSENT gaps (P17 prerequisite). Library-only — no server/UI Brain wiring this milestone.",
+  "description": "Step 0 (P15.9): owner POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Authority is ONLY the x-operator-id header via canonicalOperatorActor/operatorRef — coercion artifacts (empty/undefined/null/[object Object]/NaN/Infinity) rejected at the objective-create mint edge AND every owner-scoped actor edge, so no operator:undefined owner can be minted or claimed (H5/H6). Body operator_id/verifier/actor never substitutes (H3); evidence verifier is always the header actor; evidence_key required; source pinned owner-console; value typeof-strict finite (H4). amend rejects zero-key patches at the canonical service layer. accountBudget stays unexposed (cost-pipeline seam). FAIL_CLOSED_OBJECTIVE_UNVERIFIED/SCOPE/BRAIN_* map to 403. UI: diff-only amendments, strict numeric/date entry, REVOKED tone, exact-body retry. Step 1 (P16-A): brain-context.ts contextFor — owner-gated strict read-only aggregation over ObjectiveCockpitService (payload+event hash footprint identical — B7). Deterministic context_digest pins canonical state only: asof + clock-derived status fields (expiry_pending/effective/reasons) excluded from digest input — expiry instant cannot fake a state change (B1/B1b). KPI/budget re-proven directly — binding absence reports BINDING_ABSENT, never false UNPROVEN notes (B1d); only classified terminal-grant end degrades. Bounded withReadBudget; nested outer budget fails closed FAIL_CLOSED_BRAIN_BUDGET (B1c); PROOF_LIMIT typed (B6). Unscoped memory/experience report SCOPE_BINDING_ABSENT (P17 prerequisite). Tamper propagates (B2); broken CAS drops+reports (B4); business isolation (B5). Library-only — no Brain wiring. R1 repair of reviewer M1 (identity), M2 (digest), M3 (HTTP coverage) + minors.",
   "risk_override": "HIGH"
 }

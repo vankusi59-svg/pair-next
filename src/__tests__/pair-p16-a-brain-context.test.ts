@@ -90,14 +90,23 @@ function sqlRewriteEntity(
 }
 
 /** Raw event/entity footprint — the read-only proof: contextFor must
- *  leave the canonical log byte-identical. */
+ *  leave the canonical log byte-identical. Counts alone are weak (a
+ *  put that rewrites a row without an event is invisible) — digest
+ *  the actual event_hash + payload_hash multisets. */
 function logFootprint(store: PairEvidenceStore) {
   const db = dbOf(store);
-  const ev = db.prepare(
-    "SELECT COUNT(*) n, COALESCE(SUM(LENGTH(event_hash)),0) h FROM events",
-  ).get() as Row;
+  const ev = db.prepare("SELECT COUNT(*) n FROM events").get() as Row;
   const en = db.prepare("SELECT COUNT(*) n FROM entities").get() as Row;
-  return { events: `${ev.n}:${ev.h}`, entities: Number(en.n) };
+  const eventHashes = digest(
+    (db.prepare("SELECT event_hash h FROM events").all() as { h: string }[])
+      .map((r) => r.h));
+  const payloadHashes = digest(
+    (db.prepare("SELECT payload_hash h FROM entities").all() as { h: string }[])
+      .map((r) => r.h));
+  return {
+    events: Number(ev.n), entities: Number(en.n),
+    eventHashes, payloadHashes,
+  };
 }
 
 type FullStack = {
@@ -285,6 +294,61 @@ describe("P16-A BrainContextService.contextFor", () => {
     });
     const c3 = s.brain.contextFor(oid, OWNER);
     expect(c3.context_digest).not.toBe(c1.context_digest);
+    s.store.close();
+  });
+
+  it("B1b wired auto-policy: wall-clock status fields never move context_digest", () => {
+    const { s, oid } = seeded("b1v", []);
+    /* statusReadOnly embeds now()-derived expiry/effective/reasons —
+       two reads on identical canonical rows return different payload
+       VALUES but must produce the SAME digest. */
+    let clockFlip = false;
+    const autoPolicy = {
+      statusReadOnly: () => ({
+        policy_id: `oap:${oid}`,
+        state: "ENABLED",
+        expiry_pending: clockFlip,
+        effective: clockFlip ? "expired-now" : "live",
+        reasons: clockFlip ? ["expires_at passed"] : [],
+        version: 1,
+      }),
+    };
+    const brain = new BrainContextService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: autoPolicy as never,
+    });
+    const c1 = brain.contextFor(oid, OWNER);
+    clockFlip = true; // the expiry instant passed — value changes, state does not
+    const c2 = brain.contextFor(oid, OWNER);
+    const ap = (c2.sections.autonomy!.value as Row).auto_policy as Row;
+    expect(ap.expiry_pending).toBe(true); // transient status IS visible…
+    expect(c2.context_digest).toBe(c1.context_digest); // …but never digested
+    s.store.close();
+  });
+
+  it("B1c nested read budget fails closed instead of lying about the bound", () => {
+    const { s, oid } = seeded("b1n", []);
+    // withReadBudget silently inherits an outer scope (store.ts) —
+    // contextFor must refuse rather than report a bound it did not
+    // install, while normal composition stays unaffected.
+    expect(() =>
+      s.store.withReadBudget({ entities: 100, events: 100 }, () =>
+        s.brain.contextFor(oid, OWNER)),
+    ).toThrowError(expect.objectContaining({ code: "FAIL_CLOSED_BRAIN_BUDGET" }));
+    s.store.withReadBudget({ entities: 100, events: 100 }, () => undefined);
+    expect(() => s.brain.contextFor(oid, OWNER)).not.toThrow();
+    s.store.close();
+  });
+
+  it("B1d binding-absent objective emits NO false UNPROVEN integrity notes", () => {
+    const { s, oid } = seeded("b1d", []);
+    // Pre-INITIALIZE: KPI/budget rows are clean canonical zero state —
+    // trivially provable. BINDING_ABSENT is a typed UNAVAILABLE signal,
+    // never an UNPROVEN claim.
+    const c = s.brain.contextFor(oid, OWNER);
+    expect(c.integrity).toEqual([]);
+    expect(c.unavailable.some((u) => u.startsWith("BINDING_ABSENT"))).toBe(true);
     s.store.close();
   });
 

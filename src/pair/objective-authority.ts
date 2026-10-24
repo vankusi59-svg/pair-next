@@ -1076,7 +1076,14 @@ export class ObjectiveAuthorityService {
     if (!input.patch || typeof input.patch !== "object" || Array.isArray(input.patch)) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must be an object");
     }
-    for (const k of Object.keys(input.patch)) {
+    const patchKeys = Object.keys(input.patch);
+    // A zero-key patch is NOT an amendment — committing it would bump
+    // terms_version + rebind objective_digest (invalidating every
+    // pinned review/policy grant) while changing nothing.
+    if (!patchKeys.length) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "patch must name at least one key");
+    }
+    for (const k of patchKeys) {
       if (!AMENDABLE_KEYS.has(k)) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TERMS", `not owner-amendable: ${k}`);
       }

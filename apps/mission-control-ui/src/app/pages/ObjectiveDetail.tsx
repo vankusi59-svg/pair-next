@@ -30,6 +30,7 @@ const S_TONE: Record<string, Tone> = {
   TARGET_MET_CANDIDATE: "purple", MET: "ok", GAP: "warn", UNVERIFIED: "unknown",
   DONE: "ok", COMPLETED: "ok", IN_PROGRESS: "info", BACKLOG: "unknown",
   ENABLED: "ok", DISABLED: "unknown", PAUSED_P: "warn", HALTED: "danger",
+  REVOKED: "danger",
   EXPIRED_P: "warn", ACTIVE: "ok", INTERVENTION: "warn", EXHAUSTED: "danger",
 };
 
@@ -475,7 +476,10 @@ export function ObjectiveDetail() {
   const runMeasure = () => {
     if (!dlg || dlg.kind !== "measure") return;
     const ctx = { biz: dlg.biz, oid: dlg.oid };
-    const value = Number(meas.value);
+    /* Strict numeric: Number("")===0 and Number("  ")=0 would mint a
+       silent zero measurement — an empty/whitespace field must fail
+       here, not coerce. */
+    const value = meas.value.trim() === "" ? NaN : Number(meas.value);
     if (!meas.kpi || !Number.isFinite(value)) {
       setMutNote("Measurement rejected: a KPI and a numeric value are required.");
       return;
@@ -515,18 +519,34 @@ export function ObjectiveDetail() {
     if (!dlg || dlg.kind !== "amend") return;
     const ctx = { biz: dlg.biz, oid: dlg.oid };
     const patch: Record<string, unknown> = {};
-    if (amend.title.trim()) patch.title = amend.title.trim();
-    if (amend.deadline) patch.deadline = new Date(amend.deadline).toISOString();
+    /* Diff-only: the canonical amend bumps terms_version and rebinds
+       objective_digest for EVERY supplied key — sending unchanged
+       values would invalidate pinned reviews/policy grants for no
+       reason. Only fields that genuinely differ are patched. */
+    if (amend.title.trim() && amend.title.trim() !== String(o.title ?? "")) {
+      patch.title = amend.title.trim();
+    }
+    if (amend.deadline) {
+      const dl = new Date(amend.deadline);
+      if (Number.isNaN(dl.getTime())) {
+        setMutNote("Amendment rejected: deadline is not a valid date.");
+        return;
+      }
+      patch.deadline = dl.toISOString();
+    }
     if (amend.budget.trim()) {
       const usd = Number(amend.budget);
       if (!Number.isFinite(usd) || usd < 0) {
         setMutNote("Amendment rejected: budget ceiling must be a non-negative USD amount.");
         return;
       }
-      patch.budget_ceiling_microusd = Math.round(usd * 1e6);
+      const micro = Math.round(usd * 1e6);
+      if (micro !== Number(o.budget.ceiling_microusd)) {
+        patch.budget_ceiling_microusd = micro;
+      }
     }
     if (!Object.keys(patch).length) {
-      setMutNote("Amendment rejected: fill at least one field to change.");
+      setMutNote("Amendment rejected: no field differs from the current terms — nothing to commit.");
       return;
     }
     runOwnerOp(
@@ -557,7 +577,7 @@ export function ObjectiveDetail() {
       setMutNote("Grant rejected: the rule needs required_count and/or required_keys.");
       return;
     }
-    const pv = Number(grantF.value);
+    const pv = grantF.value.trim() === "" ? NaN : Number(grantF.value);
     if (!Number.isFinite(pv)) {
       setMutNote("Grant rejected: progress_value must be a finite number.");
       return;
@@ -567,7 +587,12 @@ export function ObjectiveDetail() {
       setMutNote("Grant rejected: a KPI and a future expires_at are required.");
       return;
     }
-    const expiresAt = new Date(grantF.expires).toISOString();
+    const exp = new Date(grantF.expires);
+    if (Number.isNaN(exp.getTime())) {
+      setMutNote("Grant rejected: expires_at is not a valid date.");
+      return;
+    }
+    const expiresAt = exp.toISOString();
     runOwnerOp(
       ctx,
       `kpi-grant:${ctx.oid}:${grantF.kpi}:${JSON.stringify(rule)}:${expiresAt}`,
