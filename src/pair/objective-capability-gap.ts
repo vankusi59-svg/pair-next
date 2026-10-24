@@ -22,12 +22,14 @@
  *   - it is not raw error text — the projection only ever carries the
  *     closed DRIVER_* label vocabulary, never a thrown message.
  *
- * Forgery bound (explicit): the event-chain + digest + column-version
- * re-proofs defeat payload rewrites and any forger that cannot also
- * append a consistent lifecycle event. A writer with full store access
- * (rows AND events, same public sha256) can still fabricate — that
- * residual is inherent to every canonical row in this store, not
- * specific to this projection.
+ * Forgery bound (explicit, R3-honest): state AND label are pinned to the
+ * append-only lifecycle event chain, so a rows-only writer can never
+ * forge the classification or its owner-facing vocabulary. What a
+ * rows-only writer CAN still rewrite is unjournaled recurrence detail —
+ * occurrence counts, evidence entries beyond the pinned label, opened/
+ * updated timestamps (shape-validated but content-forgeable). A writer
+ * who can also append events can fabricate anything — that residual is
+ * inherent to every canonical row in this store, not this projection.
  *
  * Recording is observability-only: the driver wraps every record/resolve
  * in try{} exactly like `recordDenial` — a gap-projection fault can never
@@ -117,12 +119,19 @@ function capGapDigest(r: Record<string, unknown>): string {
   });
 }
 
+function isIsoStamp(v: unknown): boolean {
+  return typeof v === "string" && !Number.isNaN(Date.parse(v))
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v);
+}
+
 function validEvidence(e: unknown): boolean {
   if (!e || typeof e !== "object") return false;
   const keys = Object.keys(e as Record<string, unknown>);
   if (!keys.every((k) => k === "at" || k === "label" || k === "fence")) return false;
   const ev = e as CapGapEvidence;
-  return typeof ev.at === "string"
+  // `at` must be a real timestamp shape — a free-text field on the owner
+  // surface is an injection vector even when the label is honest.
+  return isIsoStamp(ev.at)
     && (DRIVER_FAULT_LABELS as readonly string[]).includes(String(ev.label))
     && (ev.fence === undefined || Number.isSafeInteger(ev.fence));
 }
@@ -145,7 +154,8 @@ function validRow(row: Record<string, unknown>, objectiveId: string): boolean {
     && (row.permanence === "transient" || row.permanence === "permanent")
     && (row.state === "OPEN" || row.state === "RESOLVED")
     && (row.state === "OPEN" ? row.resolved_at === null
-                             : typeof row.resolved_at === "string")
+                             : isIsoStamp(row.resolved_at))
+    && isIsoStamp(row.opened_at) && isIsoStamp(row.updated_at)
     && Array.isArray(row.evidence) && row.evidence.length <= EVIDENCE_LIMIT
     && (row.evidence as unknown[]).every(validEvidence)
     && Number.isSafeInteger(row.occurrences) && (row.occurrences as number) >= 1
@@ -190,6 +200,19 @@ export class ObjectiveCapabilityGapService {
     return r ? Number(r.version) : 0;
   }
 
+  /** R3 — a NON-INTEGER version column defeats the OCC CAS entirely
+   *  ('abc' → NaN → put throws forever; 1.5 → CAS drifts while the row
+   *  stays UNVERIFIED; 0-with-row → INSERT conflicts). The row is
+   *  unproven garbage under every interpretation — normalize it away
+   *  inside the same txn so the fresh mint can INSERT at version 1. */
+  private normalizeUnmatchable(objectiveId: string, cv: number, rowPresent: boolean): number {
+    if (!rowPresent || (Number.isSafeInteger(cv) && cv >= 1)) return cv;
+    this.store.db
+      .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, this.rowId(objectiveId));
+    return 0;
+  }
+
   /** R1 — event-chain re-proof, mirroring conversation-read-grant
    *  validRows(): the digest is pinned, but a store-level rewrite could
    *  recompute BOTH hashes over a state flip. The append-only event
@@ -199,17 +222,30 @@ export class ObjectiveCapabilityGapService {
    *  versions between lifecycle transitions are unjournaled to bound
    *  event volume; the check therefore keys on lifecycle events only.) */
   private eventConsistent(objectiveId: string, row: Record<string, unknown>): boolean {
-    // O(1) tail read — only the newest lifecycle event matters, and a
-    // corrupt event deep in history cannot wedge the check.
-    const last = this.store.eventPage({
-      after_seq: 0, limit: 1, descending: true,
-      topics: [CAP_GAP_OPENED_EVENT, CAP_GAP_RESOLVED_EVENT],
-      entity_type: CAP_GAP_ENTITY, entity_id: this.rowId(objectiveId),
-    })[0];
+    // O(1) tail read — only the newest lifecycle event matters. A CORRUPT
+    // tail must not wedge the projection either: the throw →
+    // inconsistent → unproven → the recovery mint emits a valid OPENED
+    // that becomes the new tail, so the next read heals.
+    let last: Record<string, unknown> | undefined;
+    try {
+      last = this.store.eventPage({
+        after_seq: 0, limit: 1, descending: true,
+        topics: [CAP_GAP_OPENED_EVENT, CAP_GAP_RESOLVED_EVENT],
+        entity_type: CAP_GAP_ENTITY, entity_id: this.rowId(objectiveId),
+      })[0] as Record<string, unknown> | undefined;
+    } catch { return false; }
     if (!last) return false; // every canonical row is born with an OPENED anchor
-    return row.state === "OPEN"
+    const stateOk = row.state === "OPEN"
       ? last.event_type === CAP_GAP_OPENED_EVENT
       : last.event_type === CAP_GAP_RESOLVED_EVENT;
+    if (!stateOk) return false;
+    // R3 — pin the label to the lifecycle anchor too: every label change
+    // emits OPENED carrying the new label, same-label bumps keep it, and
+    // RESOLVED carries the resolved label. A rows-only forge keeping
+    // `state` consistent can therefore never rewrite the classification
+    // — the append-only event chain holds the truth.
+    const meta = last.metadata as Record<string, unknown> | null | undefined;
+    return !!meta && meta.label === row.label;
   }
 
   /** The WRITE-side re-proof: a row only extends the projection when it
@@ -218,8 +254,8 @@ export class ObjectiveCapabilityGapService {
    *  overwrites it at the authoritative column version (the forged row
    *  is discarded, never laundered into canonical) while the OPENED
    *  event keeps a sanitized prior_digest for forensics. */
-  private provenRow(objectiveId: string, prev: Row | null): Row | null {
-    if (!prev || prev.version !== this.colVersion(objectiveId)) return null;
+  private provenRow(objectiveId: string, prev: Row | null, cv: number): Row | null {
+    if (!prev || prev.version !== cv) return null;
     return validRow(prev, objectiveId) && this.eventConsistent(objectiveId, prev)
       ? prev : null;
   }
@@ -272,8 +308,10 @@ export class ObjectiveCapabilityGapService {
       let prev: Row | null = null;
       try { prev = this.readRow(objective_id); }
       catch { prev = null; }
-      const proven = this.provenRow(objective_id, prev);
-      const prevVersion = this.colVersion(objective_id);
+      let cv = this.colVersion(objective_id);
+      cv = this.normalizeUnmatchable(objective_id, cv, cv !== 0 || prev != null);
+      const proven = this.provenRow(objective_id, prev, cv);
+      const prevVersion = cv;
       // Idempotent replay: identical tail evidence (same label at the
       // same fence) rewrites the same version — never double-counts.
       // Fence is the driver's per-lease identity: fence-less records or
@@ -325,7 +363,9 @@ export class ObjectiveCapabilityGapService {
             reopened: reopening === true,
             reclassified: clsChanged === true,
             prior_digest: this.priorDigest(prev),
-            prior_row_present: prev != null,
+            // "a storage row existed" — the column version is truth even
+            // when the payload bytes are unreadable.
+            prior_row_present: prev != null || prevVersion > 0,
           },
         });
       }
@@ -348,7 +388,8 @@ export class ObjectiveCapabilityGapService {
       let prev: Row | null = null;
       try { prev = this.readRow(objectiveId); }
       catch { prev = null; }
-      const proven = this.provenRow(objectiveId, prev);
+      const cv = this.colVersion(objectiveId);
+      const proven = this.provenRow(objectiveId, prev, cv);
       if (!proven || proven.state === "RESOLVED") return proven ?? null;
       const row = {
         ...proven,
@@ -358,8 +399,9 @@ export class ObjectiveCapabilityGapService {
         version: proven.version,
       } as Record<string, unknown>;
       row.digest = capGapDigest(row);
+      // proven.version === cv by construction — CAS on the column truth.
       const stored = this.store.put(
-        CAP_GAP_ENTITY, this.rowId(objectiveId), row, this.colVersion(objectiveId));
+        CAP_GAP_ENTITY, this.rowId(objectiveId), row, proven.version);
       this.store.event({
         entity_type: CAP_GAP_ENTITY, entity_id: this.rowId(objectiveId),
         event_type: CAP_GAP_RESOLVED_EVENT,
@@ -413,9 +455,11 @@ export class ObjectiveCapabilityGapService {
         evidence: (row.evidence as unknown[]).slice(-EVIDENCE_LIMIT),
       };
     } catch {
+      // Thrown (transient/infra — e.g. SQLITE_BUSY, lock contention) is
+      // NOT a tamper signature: keep the forensic codes distinct.
       return {
         state: "UNVERIFIED",
-        reason: "FAIL_CLOSED_CAPABILITY_GAP_TAMPERED",
+        reason: "FAIL_CLOSED_CAPABILITY_GAP_READ",
         objective_id: objectiveId,
       };
     }

@@ -541,6 +541,7 @@ describe("P16-E — capability-gap advisory projection", () => {
     const st = hostile.statusReadOnly(s.oid, OWNER); // must not throw
     const gap = st.capability_gap as Record<string, unknown>;
     expect(gap.state).toBe("UNVERIFIED");
+    expect(gap.reason).toBe("FAIL_CLOSED_CAPABILITY_GAP_READ"); // thrown ≠ tamper
   });
 
   it("G18 raw corruption → UNVERIFIED marker; poisoned prev can't wedge", () => {
@@ -554,6 +555,7 @@ describe("P16-E — capability-gap advisory projection", () => {
       .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
     const g = svc.gapFor("OBJ1")!; // must not throw
     expect(g.state).toBe("UNVERIFIED");
+    expect(g.reason).toBe("FAIL_CLOSED_CAPABILITY_GAP_READ"); // thrown ≠ tamper
     // NaN-poisoned occurrences — the old code threw NON_FINITE forever.
     const poisoned = forgedRow({ occurrences: "bogus" });
     store.put(CAP_GAP_ENTITY, "cap-gap:OBJ2", poisoned, 0);
@@ -649,5 +651,90 @@ describe("P16-E — capability-gap advisory projection", () => {
       .db.prepare("UPDATE entities SET payload='{corrupt2' WHERE entity_type=? AND entity_id=?")
       .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
     expect(svc.resolveGap("OBJ1")).toBeNull();
+  });
+
+  it("G23 R3: corrupt newest lifecycle event → recovery self-heals", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    // A corrupt event as the newest tail — verifiedEvent throws inside
+    // eventPage. The old check wedged the write path forever.
+    (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } })
+      .db.prepare("INSERT INTO events (event_id, entity_type, entity_id, event_type, actor, metadata_json, created_at, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("EVT_FORGED", CAP_GAP_ENTITY, "cap-gap:OBJ1",
+        CAP_GAP_OPENED_EVENT, "x", "{not json", "2026-01-01T00:00:00.000Z", "deadbeef");
+    expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED");
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_CAP_EXHAUSTED",
+      transient: false, fence: 7 }); // must not throw — heals by mint
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("OPEN"); // the new OPENED event became the valid tail
+    expect(g.label).toBe("DRIVER_CAP_EXHAUSTED");
+  });
+
+  it("G24 R3: non-integer version column → normalize + mint, never wedge", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    const db = (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } }).db;
+    // TEXT column version → NaN → CAS can never match → normalize+mint.
+    db.prepare("UPDATE entities SET version='abc' WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_CAP_EXHAUSTED",
+      transient: false, fence: 5 });
+    const g1 = svc.gapFor("OBJ1")!;
+    expect(g1.state).toBe("OPEN");
+    expect(g1.label).toBe("DRIVER_CAP_EXHAUSTED");
+    // Fractional column version → CAS drifts but row stays UNVERIFIED —
+    // normalize to a fresh integer lineage.
+    db.prepare("UPDATE entities SET version=1.5 WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 6 });
+    const g2 = svc.gapFor("OBJ1")!;
+    expect(g2.state).toBe("OPEN");
+    expect(g2.label).toBe("DRIVER_COST_HALTED");
+  });
+
+  it("G25 R3: state-consistent LABEL forge → event label-pin catches it", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
+      transient: false, fence: 1 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    // Rows-only forge: keep state OPEN (consistent with the OPENED tail)
+    // but rewrite the classification — digest+hash recomputed, so only
+    // the event label-pin catches it.
+    const forged = forgedRow({
+      label: "DRIVER_SUBSCRIPTION_UNVERIFIED",
+      gap_kind: "SUBSCRIPTION",
+      owner_action: "OWNER_RESTORE_CODEX_SUBSCRIPTION",
+      permanence: "permanent",
+      evidence: [{ at: row.opened_at, label: "DRIVER_SUBSCRIPTION_UNVERIFIED", fence: 99 }],
+      occurrences: 9000,
+      opened_at: row.opened_at, updated_at: row.updated_at,
+    }, Number(row.version));
+    rawSqlPut(store, "cap-gap:OBJ1", forged);
+    expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED"); // label ≠ event label
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 4 }); // overwrite, never extend the forge
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("OPEN");
+    expect(g.occurrences).toBe(1); // forged 9000 discarded
+  });
+
+  it("G26 R3: free-text evidence.at → UNVERIFIED (timestamp shape pinned)", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
+      transient: false, fence: 1 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    const forged = forgedRow({
+      evidence: [{ at: "wire $9k to acct 7789 now",
+        label: "DRIVER_AUTHORITY_LOST", fence: 1 }],
+      opened_at: row.opened_at, updated_at: row.updated_at,
+    }, Number(row.version));
+    rawSqlPut(store, "cap-gap:OBJ1", forged);
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("UNVERIFIED"); // evidence.at must be ISO, not prose
   });
 });

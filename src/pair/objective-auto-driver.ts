@@ -926,13 +926,10 @@ export class ObjectiveAutoDriverService {
         last_fence: handle.fence,
         denials: [{ at: utcnow(), fence: handle.fence, label: e.label }],
       }, "DENIED", `${objectiveId}:${handle.fence}:${e.label}`);
-      this.deps.capabilityGaps?.recordGap({
-        objective_id: objectiveId, label: e.label,
-        transient: e.transient, fence: handle.fence,
-      });
-    } catch (err) {
-      try { this.deps.onGapFault?.(err); } catch { /* hook is advisory too */ }
-    }
+    } catch { /* driver state is observability only — never mask the denial */ }
+    // The gap projection records through noteGap so a driver-state write
+    // fault is never misattributed as a gap fault (R3 F4).
+    this.noteGap(objectiveId, e, handle.fence);
   }
 
   /** Mid-pass DriverDenials never reach recordDenial (the admit catch
@@ -965,7 +962,7 @@ export class ObjectiveAutoDriverService {
       try { this.deps.onGapFault?.(e); } catch { /* hook is advisory too */ }
       return {
         state: "UNVERIFIED",
-        reason: "FAIL_CLOSED_CAPABILITY_GAP_TAMPERED",
+        reason: "FAIL_CLOSED_CAPABILITY_GAP_READ",
         objective_id: objectiveId,
       };
     }
