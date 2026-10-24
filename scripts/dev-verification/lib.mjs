@@ -77,6 +77,7 @@ const SURFACE_FILES = {
   "src/pair/self-improvement.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/routine-mirror.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/brain-context.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/reasoning-brief.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/graph-authority.ts": ["RECOVERY_REPLAY"],
   "src/pair/adapter.ts": ["REMOTE_EXECUTION"],
   "src/pair/codex-adapter.ts": ["REMOTE_EXECUTION"],

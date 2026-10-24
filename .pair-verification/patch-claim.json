@@ -1,22 +1,18 @@
 {
-  "claim_id": "P15_9_OWNER_ACTION_SEAMS_PLUS_P16_A_BRAIN_CONTEXT",
-  "title": "P15.9 owner-action HTTP/UI seams + P16-A Brain Context Aggregator (R2 repair)",
+  "claim_id": "P16_B_REASONING_BRIEF",
+  "title": "P16-B Strategic ReasoningBrief — deterministic advisory contract",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "UI",
-    "DEV_INFRA"
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
+    "src/__tests__/pair-p16-b-reasoning-brief.test.ts#P16-B",
     "src/__tests__/pair-p16-a-brain-context.test.ts#P16-A",
-    "src/__tests__/pair-p15-9-step0-owner-actions.test.ts#Step0",
-    "src/__tests__/pair-p15-9a-company-cockpit.test.ts#P15.9-A1",
     "src/__tests__/pair-p15-1-objective-authority.test.ts#P15.1"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Step 0 (P15.9): owner POST routes /api/vnext/objectives/:id/{progress,evidence,amend}. Authority is ONLY x-operator-id via canonicalOperatorActor/operatorRef — coercion artifacts AND whitespace refs rejected at every identity edge; owner_authority_id additionally gated at the canonical SERVICE layer (assertOwnerAuthorityRef: operator:<non-artifact non-whitespace ref>) so no caller — HTTP, service or amend patch — can mint a permanently-unclaimable owner (R1-M1/R2-M1′; H5/H6). Body identity fields never substitute (H3); verifier is always the header actor; evidence_key required; source pinned owner-console; value typeof-strict finite (H4). amend rejects zero-key patches AND dedups on optional idempotency_key vs last_amendment.patch_digest — ambiguous retry never double-commits (R2-M2′; H7). accountBudget stays unexposed. 403s carry the error code only — authority messages name real owner/business ids (R2-M4′). Identity edges normalized across create/legacy/business/routine/cost/secret-policy/work-items/budgets/org-agents/ceo-cycle/auto-*/cockpit/reviews/signoff/company. UI: diff-only amendments, strict numeric/date entry, REVOKED tone, per-op idempotency keys, exact-body retry. Step 1 (P16-A): brain-context.ts contextFor — owner-gated strict read-only aggregation over ObjectiveCockpitService (payload+event hash footprint identical — B7). context_digest pins canonical state only: asof + clock-derived status fields stripped from digest input; verified against a REAL ObjectiveAutoPolicyService across a live expiry instant (B1b-real — a future now()-derived key would fail it, R2-M6′). KPI/budget re-proven directly — BINDING_ABSENT never misreports UNPROVEN (B1d); ~2x proof charge documented (R2-M3′); nested budget fails closed (B1c); autonomy sources list wired deps only (R2-M7′). Unscoped memory/experience SCOPE_BINDING_ABSENT. Tamper propagates (B2); CAS drops+reports (B4); business isolation (B5). Library-only.",
+  "description": "P16-B: src/pair/reasoning-brief.ts — ReasoningBriefService.briefFor composes the Strategic ReasoningBrief DETERMINISTICALLY from BrainContextService.contextFor (ONE read path: owner gate, scope, read budget, nested-budget refusal, fail-closed strict reads inherited; RB5/RB9). facts[] carry provenance tiers + section names — tier derives from the context's OWN integrity notes (KPI_PROGRESS_UNPROVEN:<id>/BUDGET_LEDGER_UNPROVEN), NOT the cockpit obsOk flag which conflates 'observation composed' with 'claims re-proven' (R1-M3; RB2/RB11). brief_digest pins canonical content only: asof/actor excluded, reasoner gates excluded (model-catalog state lives outside context_digest scope — a catalog mutation must not move the digest while context stands still), AUTO_POLICY facts digested as volatile-stripped projections (effective/expiry_pending stay visible in value) — verified stable across a REAL policy expiry instant while DISABLED row state moves it (R1-M1; RB10). Hypothesis/option gating uses canonical row fields only (state/configured/halt — never volatile). Binding truth: null+obsError → UNVERIFIED 'unobservable' never 'absent' — no PRE_DECOMPOSITION, no INITIALIZE/PRIORITIZE under observation_error (R1-M6 + brain-context BINDING_UNOBSERVABLE/WORKSTREAMS_UNOBSERVABLE labels; RB11). Terminal → zero options (RB3). POLICY_CONTROL names every legal owner recovery move — DISABLED→enable, PAUSED→resume (with lapsed-window caveat), EXPIRED→configure, HALTED→reset_halt, REVOKED→none (RB13). OWNER_GATE_BLOCKS_AUTONOMY requires a wired autoDriver (no driver to block when absent; RB13). reasoner = BOTH canonical gates in cycle order: resolveCeoModelTransport THEN assertCeoModelUsable, IntegrityError→UNRESOLVED/UNQUALIFIED+failure_code, non-IntegrityError propagates (R1-M4/M8; RB7). BRIEF_TRUNCATED markers appended after caps (R1-M2; RB12). Expected gaps exact-matched (R1-M5). ZERO writes (RB6); ADVISORY_ONLY; no second authority. Stacked on P16-A; CEO wiring is P16-C.",
   "risk_override": "HIGH"
 }
