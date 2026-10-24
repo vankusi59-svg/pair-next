@@ -462,11 +462,14 @@ export class OrgAgentDutyService {
     for (;;) {
       let page: Row[];
       try {
+        // No upper_id sentinel — no finite sentinel dominates every
+        // possible suffix byte in UTF-8 order (astral chars sort above
+        // ￿). Prefix ranges are contiguous: the first key lacking
+        // the prefix IS the range end.
         page = this.store.entityPage<Row>({
           entity_type: DUTY_INDEX_ENTITY,
           after_id: after,
           limit: pageSize,
-          upper_id: pfx + String.fromCharCode(0xffff),
         }) as Row[];
       } catch (e) {
         // Corrupt pointer row: strict propagates (dedup can't silently
@@ -484,8 +487,13 @@ export class OrgAgentDutyService {
         continue;
       }
       if (!page.length) break;
+      let exited = false;
       for (const ptr of page) {
         const key = String(ptr.entity_id);
+        // Prefix ranges are contiguous — the first key lacking the
+        // prefix ends the range (sorted order; out-of-range keys sort
+        // entirely above it). Check BEFORE the payload match.
+        if (!key.startsWith(pfx)) { exited = true; break; }
         const dutyId = key.slice(pfx.length);
         // The pointer's own payload must agree with its key — a forged
         // or tampered index row is inconsistency, never an absent duty.
@@ -537,7 +545,7 @@ export class OrgAgentDutyService {
       // the range end).
       const wasShort = page.length < pageSize;
       pageSize = DUTY_PAGE;
-      if (wasShort) break;
+      if (exited || wasShort) break;
     }
     return [...out.values()].sort((a, b) => byId(a.duty_id, b.duty_id));
   }

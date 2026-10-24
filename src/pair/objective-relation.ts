@@ -585,6 +585,10 @@ export class ObjectiveRelationService {
 
   /** All proven relations where the objective is either endpoint. */
   relationsFor(objectiveId: string): ObjectiveRelationRow[] {
+    if (!keyableEndpoint(objectiveId)) {
+      fail("FAIL_CLOSED_RELATION_FIELDS",
+        "objective id must be a non-empty ':'-free string (index-keyed)");
+    }
     return this.allProven()
       .filter((r) => r.from_objective_id === objectiveId ||
         r.to_objective_id === objectiveId)
@@ -602,6 +606,10 @@ export class ObjectiveRelationService {
    *  seam P18-C admission gating consumes. Zero-write, dedup'd —
    *  forged duplicate edges must not inflate the answer. */
   upstreamOf(objectiveId: string): string[] {
+    if (!keyableEndpoint(objectiveId)) {
+      fail("FAIL_CLOSED_RELATION_FIELDS",
+        "objective id must be a non-empty ':'-free string (index-keyed)");
+    }
     const out = new Set<string>();
     for (const r of this.allProven()) {
       if (r.kind === "DEPENDS_ON" && r.state === "ACTIVE" &&
@@ -614,6 +622,10 @@ export class ObjectiveRelationService {
 
   /** ACTIVE CONFLICTS partners — the parallel seam's exclusion set. */
   conflictsWith(objectiveId: string): string[] {
+    if (!keyableEndpoint(objectiveId)) {
+      fail("FAIL_CLOSED_RELATION_FIELDS",
+        "objective id must be a non-empty ':'-free string (index-keyed)");
+    }
     const out = new Set<string>();
     for (const r of this.allProven()) {
       if (r.kind !== "CONFLICTS" || r.state !== "ACTIVE") continue;
@@ -655,15 +667,21 @@ export class ObjectiveRelationService {
     const prefix = `${objectiveId}:`;
     let after = prefix;
     for (;;) {
+      // No upper_id sentinel — no finite sentinel dominates every
+      // possible suffix byte (an astral-char relation id sorts above
+      // \uffff in UTF-8 order). Prefix ranges are contiguous, so the
+      // first key lacking the prefix IS the range end; an empty or
+      // exhausted range costs one extra page, never O(table).
       const page = this.store.entityPage<Row>({
         entity_type: RELATION_INDEX_ENTITY,
         after_id: after,
         limit: RELATION_PAGE,
-        upper_id: prefix + String.fromCharCode(0xffff),
       }) as Row[];
       if (!page.length) break;
+      let exited = false;
       for (const idx of page) {
         const key = String(idx.entity_id);
+        if (!key.startsWith(prefix)) { exited = true; break; }
         const relId = key.slice(prefix.length);
         if (String(idx.relation_id) !== relId ||
             String(idx.objective_id) !== objectiveId) {
@@ -708,7 +726,7 @@ export class ObjectiveRelationService {
         }
         after = key;
       }
-      if (page.length < RELATION_PAGE) break;
+      if (exited || page.length < RELATION_PAGE) break;
     }
     return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
   }
