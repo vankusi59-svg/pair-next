@@ -28,6 +28,10 @@
  *   C12 chunked rebuild — a >INDEX_CHUNK legacy table converges over
  *       calls; `built` must NEVER be marked on a page the chunk cap
  *       cut mid-way (R2-F1: partial index = dropped gates forever).
+ *   C13 proof-agnostic pointers — a relation unproven AT REBUILD TIME
+ *       (owner amended away) still gets its pointer; when it re-proves
+ *       (owner amended back) the gate sees it again (R3-F1: proven-set
+ *       drift must never permanently hide a real edge).
  */
 
 import { describe, expect, it } from "vitest";
@@ -403,6 +407,37 @@ describe("P18-C — parallel admission gating", () => {
     // The indexed tail edge still gates — identical verdict to the
     // global fallback, now at O(degree).
     expect(s.scheduler.claimable(x).reason).toBe("UPSTREAM_UNMET");
+    s.store.close();
+  });
+
+  it("C13 proof-agnostic pointers — owner flip-flop across rebuild re-gates", () => {
+    const s = fresh("c13");
+    const bid = mkBiz(s.store);
+    const x = claimable(s, bid);
+    const y = oid(mkObjective(s, bid));
+    s.relations.create({ from_objective_id: x, to_objective_id: y,
+      kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    // Simulate a pre-index store.
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index_state'").run();
+    db.prepare("DELETE FROM entities WHERE entity_type='objective_relation_index'").run();
+    // Amend x's owner AWAY — the relation drops out of the proven set
+    // at rebuild time; the pointer must still be written (a pure
+    // table projection, immune to proven-set drift).
+    s.objectives.amend(x, { business_id: bid,
+      patch: { owner_authority_id: "operator:successor" }, actor: OWNER });
+    s.store.immediate(() => s.relations.ensureIndex());
+    expect((db.prepare("SELECT COUNT(*) c FROM entities WHERE entity_type='objective_relation_index'")
+      .get() as { c: number }).c).toBe(2);
+    // While unproven the edge cannot gate — the pointer exists but the
+    // relation fails its read-time re-proof.
+    expect(s.relations.admissionView(x).upstream).toEqual([]);
+    // Amend the owner BACK — the same row re-proves; the index path
+    // must see the edge again (pre-fix: skipped at rebuild → hidden
+    // from the gate forever).
+    s.objectives.amend(x, { business_id: bid,
+      patch: { owner_authority_id: OWNER }, actor: "operator:successor" });
+    expect(s.relations.admissionView(x).upstream).toEqual([y]);
     s.store.close();
   });
 });

@@ -721,21 +721,27 @@ export class ObjectiveRelationService {
     }, 0);
   }
 
-  /** Resumable STRICT index rebuild — advances at most INDEX_CHUNK
-   *  edges per call, persisting the cursor in the marker so migration
-   *  converges over write calls rather than demanding one giant
-   *  enumeration inside the caller's proof budget. Corruption wedges
-   *  the rebuild (and the calling write) loudly — the marker only
-   *  reports `built` after the COMPLETE strict set is indexed, so a
-   *  partial index is never mistaken for authoritative. Idempotent;
-   *  a no-op once built. Call inside a store.immediate writer. */
+  /** Resumable index rebuild — advances at most INDEX_CHUNK rows per
+   *  call, persisting the cursor in the marker so migration converges
+   *  over write calls rather than demanding one giant enumeration
+   *  inside the caller's proof budget. The index is a pure table
+   *  projection: EVERY entityPage-bound-valid row gets its endpoint
+   *  pointers, proven or not — read-time provenRow still drops
+   *  unproven rows (forged, owner-amended), so a row that is only
+   *  TEMPORARILY unproven at rebuild time (owner amended away, later
+   *  amended back) keeps its pointer and re-gates the moment it
+   *  re-proves; indexing only then-proven rows would drop those edges
+   *  from the gate permanently. Corrupt rows wedge at the page level
+   *  — the marker only reports `built` after the complete bound set is
+   *  indexed. Idempotent; a no-op once built. Call inside a
+   *  store.immediate writer. */
   ensureIndex(): void {
     const marker = this.indexMarker();
     if (marker?.built === true) return;
     let after = String(marker?.cursor ?? "");
-    let built = 0;
+    let processed = 0;
     let exhausted = false;
-    while (!exhausted && built < INDEX_CHUNK) {
+    while (!exhausted && processed < INDEX_CHUNK) {
       const page = this.store.entityPage<Row>({
         entity_type: OBJECTIVE_RELATION_ENTITY,
         after_id: after,
@@ -744,14 +750,15 @@ export class ObjectiveRelationService {
       if (!page.length) { exhausted = true; break; }
       let cut = false;
       for (const row of page) {
-        const proven = this.provenRow(row, true);
-        after = String(row.entity_id);
-        if (proven) {
-          this.indexEdge(proven.relation_id, proven.from_objective_id);
-          this.indexEdge(proven.relation_id, proven.to_objective_id);
-          built++;
-        }
-        if (built >= INDEX_CHUNK) { cut = true; break; }
+        // Pointers name the STORAGE KEY — entityPage already bound it
+        // to the payload; a row whose payload relation_id disagrees is
+        // semantically unproven at read time (dead pointer, no gate).
+        const relId = String(row.entity_id);
+        after = relId;
+        this.indexEdge(relId, String(row.from_objective_id ?? ""));
+        this.indexEdge(relId, String(row.to_objective_id ?? ""));
+        processed++;
+        if (processed >= INDEX_CHUNK) { cut = true; break; }
       }
       // `exhausted` means the FETCH reached the table end AND the whole
       // page was processed — a short page cut mid-way by the chunk cap
