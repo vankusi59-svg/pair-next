@@ -128,3 +128,11 @@ as its predecessor merges (stacked chain).
 - All downstream proofs unchanged: per-allocation authority re-proof, bound-mission provenance, ACCEPTED-artifact + anchored PASS validation, exact artifact identity + CAS bytes. Single canonical listEligibleExternalInputSources seam feeds pin/resolve/dispatch re-proofs — assertCrossMissionEligibleNow closes revoke-after-pin at the byte boundary.
 - verify:change --base b246a90 → READY_FOR_INDEPENDENT_AUDIT on d0e8a00. Tests 11/11 (D1–D11 incl. transitive exclusion, index/fallback parity, revoke-after-pin). Review: R1 PASS first round (14 probes; MINOR/TRIVIAL only, all fail-closed: index-vs-fallback wedge asymmetry, semantic-unproven marker bound, widened allocation-DoS scope, deleted-endpoint silent de-auth, discarded conflicts read).
 - Next: P18-E org-agent duties spanning objectives, P18-F recovery + company E2E.
+
+## P18-E — canonical org_agent_duty (PR #144)
+- `feat/p18-e-org-duties` → stacked on `feat/p18-d-deliverable-handoff` (#143). HEAD `ba4a8ff`.
+- Canonical `org_agent_duty`: agent ↔ sorted-unique objective set, one business; N-lateral owner consent (actor = current owner of EVERY covered objective); ACTIVE→SUSPENDED⇄ACTIVE→REVOKED via canonical events; digest + storage-key/entity binding + full event-tail re-proof.
+- Reads: `dutiesForObjective`/`dutiesForAgent`/`coveringDuties`/`covers` — no union of partial duties; `covers` needs ONE proven ACTIVE duty over the full set.
+- Indexes `org_agent_duty_index` (O:/A: pointer rows) + chunked resumable rebuild (marker only after complete scan); proof-agnostic pointers; corrupt → FAIL_CLOSED_DUTY_INDEX, poison → isolate-and-skip.
+- Endpoint keyability gate (no ':' ids → unforgeable index keys); sentinel-free `startsWith` prefix scans (astral keys included — R4 parity fix applied to relation index too).
+- verify:change READY_FOR_INDEPENDENT_AUDIT; review R3+R4 PASS. 18/18 focused, 15/15 p18-c (C14/C15 parity regressions).
