@@ -678,12 +678,6 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
   it("RB13 policy-state options cover every legal owner recovery move", async () => {
     const { s, oid, binding } = seeded("rb13", ["a"]);
     const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives);
-    policy.control({
-      objective_id: oid, actor: OWNER, action: "configure",
-      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
-        max_ceo_calls: 8 },
-      idempotency_key: `cfg-rb13-${counter}`,
-    });
     const policyVersion = () =>
       Number(policy.statusReadOnly(oid, OWNER).policy_version);
     const briefWithPolicy = () => {
@@ -694,6 +688,18 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
       return new ReasoningBriefService(s.store, { brain }).briefFor(oid, OWNER);
     };
     const optIds = () => briefWithPolicy().options.map((o) => o.id);
+
+    // configured:false (no row yet) → the only live POLICY_CONTROL id.
+    expect(optIds()).toContain("OWNER_CONFIGURE_POLICY");
+
+    policy.control({
+      objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
+        max_ceo_calls: 8 },
+      idempotency_key: `cfg-rb13-${counter}`,
+    });
+    // DISABLED row now exists → enable is the named move.
+    expect(optIds()).toContain("OWNER_ENABLE_POLICY");
 
     policy.control({ objective_id: oid, actor: OWNER, action: "enable",
       policy_version: policyVersion(), idempotency_key: `en-rb13-${counter}` });
@@ -752,7 +758,7 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
     policy.control({ objective_id: oid, actor: OWNER, action: "enable",
       policy_version: policyVersion(), idempotency_key: `en2-rb13-${counter}` });
     policy.control({ objective_id: oid, actor: OWNER, action: "halt",
-      policy_version: policyVersion(), reason: "test halt",
+      policy_version: policyVersion(), halt_reason: "test halt",
       idempotency_key: `ht-rb13-${counter}` });
     expect(optIds()).toContain("OWNER_RESET_HALT");
 
@@ -761,7 +767,7 @@ describe("P16-B ReasoningBriefService.briefFor", () => {
     policy.control({ objective_id: oid, actor: OWNER, action: "enable",
       policy_version: policyVersion(), idempotency_key: `en3-rb13-${counter}` });
     policy.control({ objective_id: oid, actor: OWNER, action: "revoke",
-      policy_version: policyVersion(), reason: "owner revoked",
+      policy_version: policyVersion(),
       idempotency_key: `rv-rb13-${counter}` });
     // REVOKED has no legal path back — no POLICY_CONTROL option.
     expect(briefWithPolicy().options.filter((o) => o.kind === "POLICY_CONTROL"))

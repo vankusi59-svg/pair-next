@@ -539,7 +539,7 @@ export class ReasoningBriefService {
       out.push({
         id: "OWNER_GATE_BLOCKS_AUTONOMY",
         detail: "an adaptive review requires owner action — the auto-driver cannot pass until the owner resolves it",
-        rests_on: ["AUTO_POLICY", "LATEST_REVIEW"],
+        rests_on: ["AUTO_POLICY", "LATEST_REVIEW", "LIFECYCLE"],
       });
     }
     const ks = observation.kpi_summary as Record<string, unknown> | undefined;
@@ -646,7 +646,10 @@ export class ReasoningBriefService {
             authority_channel: "policy-enable route",
             rationale: "auto-policy exists but is DISABLED — enabling is the owner-gated step that authorizes driver passes",
             rests_on: ["AUTO_POLICY"],
-            tradeoff: "enabling authorizes bounded autonomy within the configured limits; the digest pin means any terms bump re-gates it",
+            // Honest caveat, not gating: limits carry expires_at — if
+            // it lapsed, enable fail-closes and the completable path
+            // is configure → enable. Clock fields never gate options.
+            tradeoff: "enabling authorizes bounded autonomy within the configured limits — but if the limits' expires_at already lapsed, enable fail-closes and the completable path is configure → enable",
           });
         } else if (policy.state === "PAUSED") {
           out.push({
