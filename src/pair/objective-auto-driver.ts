@@ -202,6 +202,12 @@ export interface DriverDeps {
    *  wraps every call in try{} exactly like recordDenial. */
   capabilityGaps?: Pick<ObjectiveCapabilityGapService,
     "recordGap" | "resolveGap" | "gapFor">;
+  /** P16-E — observability hook for gap-projection faults: every
+   *  advisory call site swallows projection errors by contract (they
+   *  may never mask a denial/settle), so this hook is how a swallowed
+   *  fault stays VISIBLE. Production wires console.error — a silent
+   *  wedge is never acceptable for a canonical surface. */
+  onGapFault?: (e: unknown) => void;
 }
 
 interface LeaseRow {
@@ -908,7 +914,9 @@ export class ObjectiveAutoDriverService {
     // P16-E — a settled pass proves the capability chain end-to-end;
     // close the gap projection. try{} like every advisory write.
     try { this.deps.capabilityGaps?.resolveGap(objectiveId); }
-    catch { /* advisory only — never mask the settle */ }
+    catch (e) {
+      try { this.deps.onGapFault?.(e); } catch { /* hook is advisory too */ }
+    }
     return { objective_id: objectiveId, outcome: result.outcome, settled: true };
   }
 
@@ -922,7 +930,9 @@ export class ObjectiveAutoDriverService {
         objective_id: objectiveId, label: e.label,
         transient: e.transient, fence: handle.fence,
       });
-    } catch { /* driver state is observability only — never mask the denial */ }
+    } catch (err) {
+      try { this.deps.onGapFault?.(err); } catch { /* hook is advisory too */ }
+    }
   }
 
   /** Mid-pass DriverDenials never reach recordDenial (the admit catch
@@ -939,7 +949,9 @@ export class ObjectiveAutoDriverService {
         objective_id: objectiveId, label: e.label,
         transient: e.transient, fence,
       });
-    } catch { /* advisory only — never mask the fault */ }
+    } catch (err) {
+      try { this.deps.onGapFault?.(err); } catch { /* hook is advisory too */ }
+    }
   }
 
   /** Status-read seam: gapFor must never throw into the owner status
@@ -949,7 +961,8 @@ export class ObjectiveAutoDriverService {
   private gapForStatus(objectiveId: string): Record<string, unknown> | null {
     try {
       return this.deps.capabilityGaps?.gapFor(objectiveId) ?? null;
-    } catch {
+    } catch (e) {
+      try { this.deps.onGapFault?.(e); } catch { /* hook is advisory too */ }
       return {
         state: "UNVERIFIED",
         reason: "FAIL_CLOSED_CAPABILITY_GAP_TAMPERED",

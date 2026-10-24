@@ -586,6 +586,8 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
     // row; a settled pass closes it. Observability-only — never masks
     // the denial/settle it annotates.
     capabilityGaps: new ObjectiveCapabilityGapService(store),
+    onGapFault: (e) =>
+      console.error("capability-gap advisory:", String(e).slice(0, 200)),
     onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
   });
   // Phase C — deferred: the driver only mints missions through the

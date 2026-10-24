@@ -279,15 +279,12 @@ describe("P16-E — capability-gap advisory projection", () => {
       .filter((e) => e.event_type === CAP_GAP_OPENED_EVENT);
     expect((evs[1]!.metadata as Record<string, unknown>).reopened).toBe(true);
     // Idempotent resolve — no-op on a RESOLVED row.
-    const v = row.version;
-    // (RESOLVED row, not re-resolving the OPEN one)
     svc.recordGap({ objective_id: "OBJ2", label: "DRIVER_COST_HALTED",
       transient: true, fence: 1 });
     svc.resolveGap("OBJ2");
     const v2 = (store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ2") as Record<string, unknown>).version;
     svc.resolveGap("OBJ2");
     expect((store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ2") as Record<string, unknown>).version).toBe(v2);
-    void v;
   });
 
   it("G6 non-vocabulary label fails closed", () => {
@@ -466,7 +463,7 @@ describe("P16-E — capability-gap advisory projection", () => {
       evidence: [{ at: "x", label: "DRIVER_PASS_FAULT", fence: -1,
         planted: "forged-entry" }],
     });
-    forged.digest = "stale-on-purpose"; // the weakest forger — no event, bad digest
+    forged.digest = "f".repeat(64); // well-formed but wrong — forensic copy preserves it
     store.put(CAP_GAP_ENTITY, "cap-gap:OBJ1", forged, 0);
     expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED");
     svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
@@ -482,7 +479,7 @@ describe("P16-E — capability-gap advisory projection", () => {
     const evs = (store.listEvents(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Array<Record<string, unknown>>)
       .filter((e) => e.event_type === CAP_GAP_OPENED_EVENT);
     expect((evs[0]!.metadata as Record<string, unknown>).prior_digest)
-      .toBe("stale-on-purpose"); // forensic trail preserved
+      .toBe("f".repeat(64)); // forensic trail preserved
   });
 
   it("G15 digest-recomputed state flip → event chain still exposes it", () => {
@@ -577,5 +574,80 @@ describe("P16-E — capability-gap advisory projection", () => {
     expect(gap.gap_kind).toBe("EXECUTION");
     expect(gap.permanence).toBe("transient");
     expect(gap.owner_action).toBe("OWNER_INSPECT_PASS_FAULT");
+  });
+
+  /** Raw-SQL forge: rewrite the stored payload + hash directly — the
+   *  primitive store.put can never produce (put keeps body.version ===
+   *  column version by construction). */
+  function rawSqlPut(store: PairEvidenceStore, id: string,
+    body: Record<string, unknown>) {
+    const text = JSON.stringify(body);
+    (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } })
+      .db.prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type=? AND entity_id=?")
+      .run(text, digest(body), CAP_GAP_ENTITY, id);
+  }
+
+  it("G20 R2: version-skewed forge → UNVERIFIED + recovery overwrites", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    const row = store.tryGet(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Record<string, unknown>;
+    // Payload claims version 77 while the column stays 1 — the exact
+    // primitive that wedged the old code on FAIL_CLOSED_VERSION_CONFLICT.
+    rawSqlPut(store, "cap-gap:OBJ1", { ...row, version: 77, occurrences: 9000 });
+    expect(svc.gapFor("OBJ1")!.state).toBe("UNVERIFIED");
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_AUTHORITY_LOST",
+      transient: false, fence: 9 }); // must overwrite, not throw
+    const fixed = svc.gapFor("OBJ1")!;
+    expect(fixed.state).toBe("OPEN");
+    expect(fixed.label).toBe("DRIVER_AUTHORITY_LOST");
+    expect(fixed.occurrences).toBe(1); // forged 9000 discarded
+  });
+
+  it("G21 R2: secret-shaped digest field can't poison the forensic event", () => {
+    const { store, svc } = rawGapStore();
+    // put() itself rejects secret-shaped payload fields — the primitive
+    // is raw SQL, which is exactly the access the defense assumes.
+    const forged = forgedRow({});
+    store.put(CAP_GAP_ENTITY, "cap-gap:OBJ1", forged, 0);
+    rawSqlPut(store, "cap-gap:OBJ1",
+      { ...forged, digest: { password: "hunter2" }, version: 1 });
+    // Recovery mints — prior_digest sanitized to null, event lands.
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 2 });
+    expect(svc.gapFor("OBJ1")!.state).toBe("OPEN");
+    const evs = (store.listEvents(CAP_GAP_ENTITY, "cap-gap:OBJ1") as Array<Record<string, unknown>>)
+      .filter((e) => e.event_type === CAP_GAP_OPENED_EVENT);
+    expect(evs).toHaveLength(1);
+    const m = evs[0]!.metadata as Record<string, unknown>;
+    expect(m.prior_digest).toBeNull();
+    expect(m.prior_row_present).toBe(true);
+  });
+
+  it("G22 R2: unreadable payload can't wedge recovery or resolve", () => {
+    const { store, svc } = rawGapStore();
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_COST_HALTED",
+      transient: true, fence: 1 });
+    (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } })
+      .db.prepare("UPDATE entities SET payload='{corrupt' WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
+    // Recovery overwrites the unreadable row via the column version —
+    // the old code threw out of immediate() and wedged forever.
+    svc.recordGap({ objective_id: "OBJ1", label: "DRIVER_CAP_EXHAUSTED",
+      transient: false, fence: 4 });
+    const g = svc.gapFor("OBJ1")!;
+    expect(g.state).toBe("OPEN");
+    expect(g.label).toBe("DRIVER_CAP_EXHAUSTED");
+    expect(g.occurrences).toBe(1);
+    // resolveGap on an unproven row returns null, never forged internals.
+    expect(svc.resolveGap("OBJ1")).not.toBeNull();
+    // Re-corrupt and confirm resolve is a no-op (no RESOLVED forge).
+    (store as unknown as { db: { prepare: (s: string) =>
+      { run: (...a: unknown[]) => unknown } } })
+      .db.prepare("UPDATE entities SET payload='{corrupt2' WHERE entity_type=? AND entity_id=?")
+      .run(CAP_GAP_ENTITY, "cap-gap:OBJ1");
+    expect(svc.resolveGap("OBJ1")).toBeNull();
   });
 });
