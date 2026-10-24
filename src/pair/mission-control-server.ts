@@ -38,6 +38,8 @@ import {
   type ObjectiveOperatingService,
 } from "./objective-operating-loop.js";
 import { ObjectiveCockpitService } from "./objective-cockpit.js";
+import { ObjectivePortfolioService } from "./objective-portfolio.js";
+import { ObjectiveRelationService } from "./objective-relation.js";
 import type { ArtifactAuthority } from "./artifact-authority.js";
 
 export interface MissionControlServerDeps {
@@ -459,6 +461,7 @@ export function createMissionControlServer(
   // header — a body-declared owner field is never authority here.
   let autoPolicySvc: ObjectiveAutoPolicyService | null = null;
   let cockpitSvc: ObjectiveCockpitService | null = null;
+  let portfolioSvc: ObjectivePortfolioService | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -1784,6 +1787,31 @@ export function createMissionControlServer(
           company: cockpitSvc.businessCompany(m[1]!, companyActor),
         });
       }
+      // ----- P18-B — business portfolio over canonical relations ----
+      // READ-ONLY advisory projection (same owner-scope contract as
+      // /company): the actor's owned objectives annotated with the
+      // proven relation graph + derived dependency state. It never
+      // gates admission/scheduling — P18-C consumes the same seams.
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/portfolio$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "PORTFOLIO_DISABLED" });
+        }
+        const portfolioActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
+        portfolioSvc ??= new ObjectivePortfolioService({
+          store: deps.store,
+          objectives: biz.objectives,
+          relations: new ObjectiveRelationService(deps.store),
+        });
+        // Bounded like the scheduler's read paths: a pathological
+        // store trips the budget loudly instead of hanging the route.
+        const portfolioBid = m[1]!;
+        const portfolio = deps.store.withReadBudget(
+          { entities: 1024, events: 512 },
+          () => portfolioSvc!.businessPortfolio(portfolioBid, portfolioActor),
+        );
+        return void json(res, 200, { portfolio });
+      }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;
         return void json(res, 200, { budgets: biz ? biz.listBudgetPolicies(bid) : [] });
@@ -2159,7 +2187,8 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_BRAIN_AUTHORITY" ||
         e.code === "FAIL_CLOSED_BRAIN_SCOPE" ||
         e.code === "FAIL_CLOSED_CONVERSATION_READ_GRANT_AUTHORITY" ||
-        e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
+        e.code === "FAIL_CLOSED_COMPANY_SCOPE" ||
+        e.code === "FAIL_CLOSED_PORTFOLIO_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;

@@ -10,8 +10,10 @@ const GLOSS: Record<string, string> = {
     "An operator id is required — set it in Settings.",
   FAIL_CLOSED_ENTITY_HASH_MISMATCH:
     "A stored record failed its integrity check; the data cannot be trusted.",
-  FAIL_CLOSED_COCKPIT_IDENTITY:
+  FAIL_CLOSED_OBJECTIVE_IDENTITY:
     "A stored record's identity does not match its canonical key.",
+  FAIL_CLOSED_PORTFOLIO_SCOPE:
+    "You don't have owner authority over any objective in this business.",
   FAIL_CLOSED_COCKPIT_PROOF:
     "Required canonical proof failed; claims are shown as unverified.",
   OBJECTIVE_TERMINAL: "The objective already reached a final state.",
