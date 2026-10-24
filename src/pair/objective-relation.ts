@@ -581,4 +581,32 @@ export class ObjectiveRelationService {
     }
     return [...out].sort();
   }
+
+  /** STRICT admission seam (P18-C): the ACTIVE edge sets an admission
+   *  gate must judge — DEPENDS_ON upstreams of the objective (edges it
+   *  must wait on) and CONFLICTS partners (either direction). Unlike
+   *  upstreamOf/conflictsWith this enumerates STRICT: any corrupt
+   *  relation row propagates loudly instead of being silently
+   *  excluded — a corrupted-but-real edge can never silently clear an
+   *  objective for admission. Semantic unproven-ness (fabrications,
+   *  owner amendments) still drops the row — a forged edge can never
+   *  gate. Budget trips propagate. Callers judge semantics (upstream
+   *  status, lease roster) — this view only proves WHICH edges exist. */
+  admissionView(objectiveId: string): {
+    upstream: string[];
+    conflicts: string[];
+  } {
+    const upstream = new Set<string>();
+    const conflicts = new Set<string>();
+    for (const r of this.allProven(true)) {
+      if (r.state !== "ACTIVE") continue;
+      if (r.kind === "DEPENDS_ON" && r.from_objective_id === objectiveId) {
+        upstream.add(r.to_objective_id);
+      } else if (r.kind === "CONFLICTS") {
+        if (r.from_objective_id === objectiveId) conflicts.add(r.to_objective_id);
+        if (r.to_objective_id === objectiveId) conflicts.add(r.from_objective_id);
+      }
+    }
+    return { upstream: [...upstream].sort(), conflicts: [...conflicts].sort() };
+  }
 }

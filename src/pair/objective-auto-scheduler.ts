@@ -3,6 +3,7 @@ import { digest } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { DriverDenial, DRIVER_FAULT_LABELS } from "./objective-driver-fault.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
+import { ObjectiveRelationService } from "./objective-relation.js";
 import { AUTO_POLICY_ENTITY } from "./objective-auto-policy.js";
 import { KPI_AUTH_ENTITY, KPI_VERIFIER_SCHEMA, kpiAuthEffectiveReason } from "./objective-kpi-verifier-authority.js";
 import type { ObjectiveAutoPolicyService, AutoPolicyStatus } from "./objective-auto-policy.js";
@@ -257,10 +258,61 @@ export class ObjectiveAutoScheduler {
    *  keyspace, so detection stays bounded per process lifetime. */
   private integrityAfter: { t: string; id: string } | null = null;
 
+  /** P18-C — canonical relation substrate, lazily composed (same
+   *  pattern ObjectiveRelationService uses for objectives). The
+   *  scheduler is the ONLY consumer of the strict admission view —
+   *  portfolio/status reads use the lenient helpers. */
+  private _relations?: ObjectiveRelationService;
+  private get relations(): ObjectiveRelationService {
+    this._relations ??= new ObjectiveRelationService(this.store);
+    return this._relations;
+  }
+
   private instant(): number {
     const now = this.now();
     if (!Number.isSafeInteger(now) || now < 0) invalid("invalid trusted clock");
     return now;
+  }
+
+  /** P18-C — the canonical relation admission gate shared by
+   *  claimable() (read-only readiness predicate), nextFairCandidate()
+   *  (scan skip), and claim() (atomic re-proof under the writer lock).
+   *  UPSTREAM_UNMET: any ACTIVE DEPENDS_ON upstream not ACHIEVED —
+   *  pending AND terminally-failed upstreams both block (owner action:
+   *  wait / revoke / supersede). CONFLICT_LEASE_HELD: an ACTIVE
+   *  CONFLICTS partner holds a live lease — mutual exclusion on the
+   *  parallel lane. The relation set is STRICT-enumerated
+   *  (admissionView): a corrupt relation row propagates and wedges
+   *  admission rather than silently clearing it; an unproven/forged
+   *  edge never gates. Upstream status re-reads strict here because
+   *  the relation proof pins endpoints, not their mutable status. */
+  private relationGate(objectiveId: string, activeLeases: string[]): string | null {
+    const { upstream, conflicts } = this.relations.admissionView(objectiveId);
+    for (const up of upstream) {
+      const u = this.objectives.get(up) as Row;
+      if (String(u.status) !== "ACHIEVED") return "UPSTREAM_UNMET";
+    }
+    const active = new Set(activeLeases);
+    if (conflicts.some((c) => active.has(c))) return "CONFLICT_LEASE_HELD";
+    return null;
+  }
+
+  /** Read-only roster view for claimable()'s conflict gate — mirrors
+   *  activeRoster()'s liveness predicate WITHOUT its reaping writes
+   *  (claimable never mutates). Malformed roster state fails closed
+   *  like the write path. */
+  private activeLeaseIdsReadOnly(): string[] {
+    const f = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL);
+    if (!f) return [];
+    if (!Array.isArray(f.active_leases) || f.active_leases.length > MAX_ACTIVE ||
+        f.active_leases.some(id => typeof id !== "string") ||
+        new Set(f.active_leases).size !== f.active_leases.length) {
+      invalid("global lease roster corrupt");
+    }
+    return (f.active_leases as string[]).filter((id) => {
+      const lease = this.lease(id);
+      return lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
+    });
   }
 
   private proof<T>(fn: () => T): T {
@@ -298,11 +350,14 @@ export class ObjectiveAutoScheduler {
   }
 
   /** Read-only canonical claim-eligibility proof: the same queue
-   *  predicate claim() enforces, plus the objective-level authority and
-   *  lease conditions a real claim requires. Global contention checks
-   *  (roster cap, rate window) stay in claim() — they are transient,
-   *  never an objective-readiness fact. Never mutates: no wake, no
-   *  lease, no invalidation. */
+   *  predicate claim() enforces, plus the objective-level authority,
+   *  lease and P18-C relation conditions a real claim requires. Global
+   *  contention checks (roster cap, rate window) stay in claim() —
+   *  they are transient, never an objective-readiness fact — while the
+   *  objective-scoped relation gates (UPSTREAM_UNMET,
+   *  CONFLICT_LEASE_HELD) ARE readiness facts the owner should see.
+   *  Never mutates: no wake, no lease, no invalidation (the roster
+   *  view is the read-only mirror — activeRoster reaps). */
   claimable(objectiveId: string): { eligible: boolean; reason: string | null } {
     return this.proof(() => {
       const q = this.queue(objectiveId);
@@ -328,6 +383,10 @@ export class ObjectiveAutoScheduler {
       if (prior?.state === "ACTIVE" && Number(prior.expires_at) > this.instant()) {
         return { eligible: false, reason: "LEASE_HELD" };
       }
+      // P18-C — relation admission gate LAST: strict enumeration is
+      // the most expensive check and corruption wedges loudly.
+      const gate = this.relationGate(objectiveId, this.activeLeaseIdsReadOnly());
+      if (gate !== null) return { eligible: false, reason: gate };
       return { eligible: true, reason: null };
     });
   }
@@ -866,6 +925,13 @@ export class ObjectiveAutoScheduler {
       const a = this.authority(objectiveId);
       this.requireCurrent(q!, a);
       const { f, active } = this.activeRoster();
+      // P18-C — relation admission gate re-proven atomically with the
+      // roster the lease mint joins: a DEPENDS_ON edge minted or a
+      // CONFLICTS partner claimed between candidate selection and this
+      // check cannot be raced — the whole gate+mint is one immediate
+      // transaction.
+      const gate = this.relationGate(objectiveId, active);
+      if (gate !== null) invalid(`relation admission gate: ${gate}`);
       if (active.length >= MAX_ACTIVE || active.includes(objectiveId)) invalid("global/Objective lease cap");
       const rateWindowStart = Number(f.rate_window_start ?? 0);
       const rateWindowCount = rateWindowStart + 60_000 > this.instant()
@@ -1071,6 +1137,13 @@ export class ObjectiveAutoScheduler {
       const last = Number(f.last_visited_rank);
       const upper = Number(f.cohort_high_rank);
       const now = this.instant();
+      // P18-C — one roster snapshot for the whole scan: CONFLICTS
+      // gates judge against the leases live at selection time (the
+      // winning candidate's own claim() still re-proves under the
+      // writer lock, so a race can't mint two conflicting leases).
+      // activeRoster also reaps stale entries here — an expired
+      // partner lease must not hold a conflict closed forever.
+      const { active: activeLeases } = this.activeRoster();
       // R2-F1: push the field-level usability predicate (and the active-
       // lease exclusion) into the uncharged SQL filter, so the WHOLE
       // remaining cohort is proven empty in a bounded query instead of
@@ -1162,6 +1235,14 @@ export class ObjectiveAutoScheduler {
              q.claimed_generation > q.settled_generation) &&
             (q.next_due === null || q.next_due <= now);
           if (usable) {
+            // P18-C — a relation-gated candidate is skipped transiently
+            // (furthest already advanced past it; it re-enters next
+            // rotation when its upstream completes or the edge is
+            // revoked). Corrupt relations propagate — an admission
+            // authority never scans on an unprovable graph.
+            if (this.relationGate(item.entity_id, activeLeases) !== null) {
+              continue;
+            }
             // the claim decision is the visit that must be journaled — it
             // records where the deterministic rotation stopped. The row is
             // re-read because fault() may have updated faulted_ids mid-scan
