@@ -22,7 +22,7 @@
  *       objectives by (created_at, id).
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -30,7 +30,6 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
   ApprovalQueue,
-  ArtifactAuthority,
   BusinessLayer,
   createMissionControlServer,
   ExecutorRegistry,
