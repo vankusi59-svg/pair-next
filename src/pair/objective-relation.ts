@@ -28,9 +28,21 @@
  *
  * Integrity: digest pins every canonical field (updated_at excluded),
  * OCC on the entities-table version column, lifecycle event anchors
- * pin state transitions. Reads re-prove exactly like writes — a
- * digest-recomputed state flip, a foreign pairing, or an event-less
- * forge is never served (P16-E re-proof pattern).
+ * pin state transitions. Reads re-prove exactly like writes (P16-E
+ * pattern): digest + storage-key↔payload entity binding + strict
+ * objective resolution + bilateral-owner re-check + the FULL event
+ * tail (first event must be CREATED with matching identity pins; every
+ * STATE hop must be a legal transition chaining from the prior
+ * new_state). A digest-recomputed flip, an anchor-borrowed clone, an
+ * event-less forge, or a resurrected terminal row is never served.
+ *
+ * Known bounds (fail-closed, recoverable): amending an endpoint's
+ * owner_authority_id invalidates every relation it touches — the
+ * bilateral re-check is against CURRENT owners, so the relation
+ * silently drops out of the proven set until re-minted under the new
+ * owner. CYCLE_DEPTH_CAP bounds total walk WORK (edges visited), not
+ * path depth — a pathological graph denser than the cap fails mints/
+ * resumes closed rather than scanning forever.
  *
  * What a relation is NOT (P18-A boundary): minting one changes nothing
  * executable by itself — no admission gate, no scheduling effect, no
@@ -40,7 +52,10 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
-import { assertOwnerAuthorityRef } from "./objective-authority.js";
+import {
+  assertOwnerAuthorityRef,
+  ObjectiveAuthorityService,
+} from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const OBJECTIVE_RELATION_ENTITY = "objective_relation";
@@ -103,57 +118,127 @@ export function relationDigest(r: Record<string, unknown>): string {
   });
 }
 
+/** Legal STATE hops — a hop outside this set is a forged transition
+ *  (REVOKED is terminal: nothing may leave it). */
+const RELATION_PAGE = 256;
+
+const LEGAL_TRANSITIONS = new Set([
+  "ACTIVE>SUSPENDED",
+  "SUSPENDED>ACTIVE",
+  "ACTIVE>REVOKED",
+  "SUSPENDED>REVOKED",
+]);
+
 export class ObjectiveRelationService {
+  private _objectives?: ObjectiveAuthorityService;
   constructor(private readonly store: PairEvidenceStore) {}
 
   private objective(id: string): Row {
-    const row = this.store.tryGet("objective", id) as Row | null;
-    if (!row) {
+    this._objectives ??= new ObjectiveAuthorityService(this.store);
+    try {
+      // Strict read — schema + objective_digest re-proof, not a bare
+      // hash-consistent payload (a forged endpoint never validates).
+      return this._objectives.get(id) as Row;
+    } catch {
       fail("FAIL_CLOSED_RELATION_OBJECTIVE", `objective ${id} does not resolve`);
     }
-    return row;
   }
 
-  /** Row must be digest-valid AND identity-consistent — a raw-forged
-   *  payload that re-computed its own digest still fails the entity
-   *  binding (relation_id/business consistency are digest-pinned, and
-   *  the objectives must still resolve to the pinned business). */
+  /** Re-prove a stored row end-to-end — same bound P16-E established:
+   *  the row must be digest-valid, storage-key↔payload identity-bound,
+   *  strictly-resolved against current canonical objectives, owner-
+   *  consistent with BOTH endpoints NOW, and its event tail must be a
+   *  legal chain ending at the row's state. Anything else is unproven
+   *  — skipped on reads, TAMPERED on control. */
   private provenRow(row: Row): ObjectiveRelationRow | null {
     if (String(row.schema) !== OBJECTIVE_RELATION_SCHEMA) return null;
     if (!RELATION_KINDS.has(row.kind as never)) return null;
     const state = String(row.state);
     if (state !== "ACTIVE" && state !== "SUSPENDED" && state !== "REVOKED") return null;
     if (String(row.relation_digest) !== relationDigest(row)) return null;
-    // Re-prove the scope claim — a forged business pairing never serves.
+    // Storage key must equal the payload's claimed relation_id — a
+    // clone planted under a different key can never borrow the
+    // victim's event anchors (put injects entity_id; the check is
+    // exactly the entityPage binding for list()-enumerated rows).
+    if (String(row.entity_id ?? "") !== String(row.relation_id)) return null;
+    // Re-prove the scope claim AND bilateral authority against CURRENT
+    // canonical state — a forged business pairing or a relation whose
+    // consenting owner no longer owns both endpoints never serves.
     try {
       const from = this.objective(String(row.from_objective_id));
       const to = this.objective(String(row.to_objective_id));
       if (String(from.business_id) !== String(row.business_id)) return null;
       if (String(to.business_id) !== String(row.business_id)) return null;
+      const createdBy = String(row.created_by ?? "");
+      if (createdBy !== String(from.owner_authority_id)) return null;
+      if (createdBy !== String(to.owner_authority_id)) return null;
     } catch {
       return null;
     }
-    // Newest lifecycle event must agree with the row's state — an
-    // event-less forge or a state flip without its anchor is unproven.
+    // Event tail must be a legal chain: CREATED first (with identity
+    // pins matching the row), then STATE hops that are legal
+    // transitions chaining from the prior new_state, ending at the
+    // row's current state.
     const events = this.store.listEvents(
-      OBJECTIVE_RELATION_ENTITY, String(row.relation_id));
-    const last = events[events.length - 1] as Row | undefined;
-    if (!last) return null;
-    if (last.event_type === RELATION_CREATED_EVENT) {
-      if (state !== "ACTIVE") return null;
-    } else if (last.event_type === RELATION_STATE_EVENT) {
-      if (String(last.new_state ?? "") !== state) return null;
-    } else {
-      return null;
+      OBJECTIVE_RELATION_ENTITY, String(row.relation_id)) as Row[];
+    if (events.length === 0) return null;
+    const first = events[0];
+    if (first.event_type !== RELATION_CREATED_EVENT) return null;
+    const meta = (first.metadata ?? null) as Row | null;
+    if (!meta) return null;
+    if (String(meta.business_id ?? "") !== String(row.business_id)) return null;
+    if (String(meta.from_objective_id ?? "") !== String(row.from_objective_id)) return null;
+    if (String(meta.to_objective_id ?? "") !== String(row.to_objective_id)) return null;
+    if (String(meta.kind ?? "") !== String(row.kind)) return null;
+    let prevState = "ACTIVE";
+    for (let i = 1; i < events.length; i++) {
+      const e = events[i];
+      if (e.event_type !== RELATION_STATE_EVENT) return null;
+      const hop = `${String(e.old_state ?? "")}>${String(e.new_state ?? "")}`;
+      if (!LEGAL_TRANSITIONS.has(hop)) return null;
+      if (String(e.old_state ?? "") !== prevState) return null;
+      prevState = String(e.new_state ?? "");
     }
+    if (prevState !== state) return null;
     return row as ObjectiveRelationRow;
   }
 
+  /** Enumerate via entityPage — it binds payload.entity_id to the
+   *  actual storage key (+ hash + version) before returning, which is
+   *  the binding list()/tryGet() cannot provide: a raw-SQL clone under
+   *  key K claiming another relation's identity is rejected by the
+   *  page itself (thrown IntegrityError carries the key in .detail —
+   *  resume past it; the row never enters the proven set). */
   private allProven(): ObjectiveRelationRow[] {
     const out: ObjectiveRelationRow[] = [];
-    for (const row of this.store.list(OBJECTIVE_RELATION_ENTITY) as Row[]) {
-      const proven = this.provenRow(row);
-      if (proven) out.push(proven);
+    let after = "";
+    let pageSize = RELATION_PAGE;
+    for (;;) {
+      let page: Row[];
+      try {
+        page = this.store.entityPage({
+          entity_type: OBJECTIVE_RELATION_ENTITY, after_id: after,
+          limit: pageSize,
+        }) as Row[];
+      } catch (e) {
+        // A bad row kills its whole page — don't drop the legit rows
+        // sharing it: shrink to single-row pages to isolate, then skip
+        // the offender (its key is in err.detail).
+        if (pageSize > 1) { pageSize = 1; continue; }
+        const bad = e instanceof IntegrityError ? String(e.detail) : "";
+        if (!bad || bad <= after) throw e;
+        after = bad;
+        pageSize = RELATION_PAGE;
+        continue;
+      }
+      if (page.length === 0) break;
+      for (const row of page) {
+        const proven = this.provenRow(row);
+        if (proven) out.push(proven);
+      }
+      if (page.length < pageSize) break;
+      after = String(page[page.length - 1].entity_id);
+      pageSize = RELATION_PAGE;
     }
     return out;
   }
@@ -161,11 +246,8 @@ export class ObjectiveRelationService {
   /** DEPENDS_ON acyclicity over non-REVOKED relations (a SUSPENDED edge
    *  stays in the graph — reviving it must not reopen a cycle). */
   private assertAcyclic(
-    businessId: string, fromId: string, toId: string,
+    edges: ObjectiveRelationRow[], fromId: string, toId: string,
   ): void {
-    const edges = this.allProven().filter(
-      (r) => r.business_id === businessId &&
-        r.kind === "DEPENDS_ON" && r.state !== "REVOKED");
     // Walk upstream from `to`: if `from` is reachable, adding
     // from→to closes a cycle.
     const seen = new Set<string>();
@@ -212,64 +294,74 @@ export class ObjectiveRelationService {
     if (fromId === toId) {
       fail("FAIL_CLOSED_RELATION_FIELDS", "self-relation is meaningless");
     }
-    const from = this.objective(fromId);
-    const to = this.objective(toId);
-    const businessId = String(from.business_id ?? "");
-    if (String(to.business_id ?? "") !== businessId || !businessId) {
-      fail("FAIL_CLOSED_RELATION_BUSINESS",
-        "relations live inside one business — cross-business pairing");
-    }
-    // Bilateral authority: the actor must own BOTH endpoints. Two
-    // different owners means consent is needed from both — deferred,
-    // not silently bypassed.
-    const fromOwner = String(from.owner_authority_id ?? "");
-    const toOwner = String(to.owner_authority_id ?? "");
-    if (actor !== fromOwner || actor !== toOwner) {
-      fail("FAIL_CLOSED_RELATION_AUTHORITY",
-        "actor must be the owner_authority_id of both objectives");
-    }
-    if (kind === "DEPENDS_ON") this.assertAcyclic(businessId, fromId, toId);
+    // BEGIN IMMEDIATE: dedup/cycle reads and the row+event writes run
+    // under the writer lock — a racing mint on another connection
+    // serializes instead of passing a stale check (no wedge/orphan).
+    return this.store.immediate(() => {
+      const from = this.objective(fromId);
+      const to = this.objective(toId);
+      const businessId = String(from.business_id ?? "");
+      if (String(to.business_id ?? "") !== businessId || !businessId) {
+        fail("FAIL_CLOSED_RELATION_BUSINESS",
+          "relations live inside one business — cross-business pairing");
+      }
+      // Bilateral authority: the actor must own BOTH endpoints. Two
+      // different owners means consent is needed from both — deferred,
+      // not silently bypassed.
+      const fromOwner = String(from.owner_authority_id ?? "");
+      const toOwner = String(to.owner_authority_id ?? "");
+      if (actor !== fromOwner || actor !== toOwner) {
+        fail("FAIL_CLOSED_RELATION_AUTHORITY",
+          "actor must be the owner_authority_id of both objectives");
+      }
+      const proven = this.allProven();
+      if (kind === "DEPENDS_ON") {
+        const edges = proven.filter(
+          (r) => r.business_id === businessId &&
+            r.kind === "DEPENDS_ON" && r.state !== "REVOKED");
+        this.assertAcyclic(edges, fromId, toId);
+      }
+      // Idempotent replay — checked AFTER authority so a replay can't
+      // oracle the relation's existence to a foreign owner.
+      const existing = proven.find(
+        (r) => r.from_objective_id === fromId &&
+          r.to_objective_id === toId && r.kind === kind &&
+          r.state !== "REVOKED");
+      if (existing) return existing;
 
-    // Idempotent replay — checked AFTER authority so a replay can't
-    // oraclescope the relation's existence to a foreign owner.
-    const existing = this.allProven().find(
-      (r) => r.from_objective_id === fromId &&
-        r.to_objective_id === toId && r.kind === kind &&
-        r.state !== "REVOKED");
-    if (existing) return existing;
-
-    const now = utcnow();
-    const row: ObjectiveRelationRow = {
-      relation_id: newId("REL"),
-      schema: OBJECTIVE_RELATION_SCHEMA,
-      business_id: businessId,
-      from_objective_id: fromId,
-      to_objective_id: toId,
-      kind: kind as RelationKind,
-      state: "ACTIVE",
-      note: input.note != null ? String(input.note).slice(0, NOTE_CAP) : null,
-      created_by: actor,
-      dedup_key: input.dedup_key ?? digest({ fromId, toId, kind }),
-      created_at: now,
-      updated_at: now,
-      relation_digest: "",
-    };
-    row.relation_digest = relationDigest(row);
-    this.store.put(OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...row }, 0);
-    this.store.event({
-      entity_type: OBJECTIVE_RELATION_ENTITY,
-      entity_id: row.relation_id,
-      event_type: RELATION_CREATED_EVENT,
-      new_state: "ACTIVE",
-      actor,
-      metadata: {
+      const now = utcnow();
+      const row: ObjectiveRelationRow = {
+        relation_id: newId("REL"),
+        schema: OBJECTIVE_RELATION_SCHEMA,
         business_id: businessId,
         from_objective_id: fromId,
         to_objective_id: toId,
-        kind,
-      },
+        kind: kind as RelationKind,
+        state: "ACTIVE",
+        note: input.note != null ? String(input.note).slice(0, NOTE_CAP) : null,
+        created_by: actor,
+        dedup_key: input.dedup_key ?? digest({ fromId, toId, kind }),
+        created_at: now,
+        updated_at: now,
+        relation_digest: "",
+      };
+      row.relation_digest = relationDigest(row);
+      this.store.put(OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...row }, 0);
+      this.store.event({
+        entity_type: OBJECTIVE_RELATION_ENTITY,
+        entity_id: row.relation_id,
+        event_type: RELATION_CREATED_EVENT,
+        new_state: "ACTIVE",
+        actor,
+        metadata: {
+          business_id: businessId,
+          from_objective_id: fromId,
+          to_objective_id: toId,
+          kind,
+        },
+      });
+      return row;
     });
-    return row;
   }
 
   /** Lifecycle: SUSPEND | RESUME | REVOKE — owner-of-both authority,
@@ -280,62 +372,78 @@ export class ObjectiveRelationService {
     actor: string;
   }): ObjectiveRelationRow {
     const actor = assertOwnerAuthorityRef("actor", input.actor);
-    const stored = this.store.tryGet(
-      OBJECTIVE_RELATION_ENTITY, String(input.relation_id)) as Row | null;
-    if (!stored) {
-      fail("FAIL_CLOSED_RELATION_NOT_FOUND", String(input.relation_id));
+    const action = String(input.action ?? "");
+    // Closed vocabulary — an out-of-set action must never reach the
+    // transition map (undefined would be silently persisted + journaled).
+    if (action !== "SUSPEND" && action !== "RESUME" && action !== "REVOKE") {
+      fail("FAIL_CLOSED_RELATION_ACTION", `unknown action ${action}`);
     }
-    const row = this.provenRow(stored);
-    if (!row) {
-      fail("FAIL_CLOSED_RELATION_TAMPERED", String(input.relation_id));
-    }
-    const from = this.objective(row.from_objective_id);
-    const to = this.objective(row.to_objective_id);
-    if (actor !== String(from.owner_authority_id) ||
-        actor !== String(to.owner_authority_id)) {
-      fail("FAIL_CLOSED_RELATION_AUTHORITY",
-        "actor must be the owner_authority_id of both objectives");
-    }
-    const action = input.action;
-    const next: Record<typeof action, RelationState | null> = {
-      SUSPEND: row.state === "ACTIVE" ? "SUSPENDED" : null,
-      RESUME: row.state === "SUSPENDED" ? "ACTIVE" : null,
-      REVOKE: row.state !== "REVOKED" ? "REVOKED" : null,
-    };
-    const target = next[action];
-    if (action === "REVOKE" && row.state === "REVOKED") return row; // terminal idempotent
-    if (target === null) {
-      fail("FAIL_CLOSED_RELATION_STATE",
-        `${action} not legal from ${row.state}`);
-    }
-    if (action === "RESUME" && row.kind === "DEPENDS_ON") {
-      // Re-activation re-proves acyclicity — a graph that changed
-      // under SUSPENDED must not silently revive into a cycle.
-      this.assertAcyclic(row.business_id, row.from_objective_id, row.to_objective_id);
-    }
-    const colVersion = Number(
-      (stored as { version?: unknown }).version ?? NaN);
-    if (!Number.isInteger(colVersion) || colVersion < 1) {
-      fail("FAIL_CLOSED_RELATION_TAMPERED", "version column unmatchable");
-    }
-    const updated: ObjectiveRelationRow = {
-      ...row,
-      state: target,
-      updated_at: utcnow(),
-    };
-    updated.relation_digest = relationDigest(updated);
-    this.store.put(
-      OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...updated }, colVersion);
-    this.store.event({
-      entity_type: OBJECTIVE_RELATION_ENTITY,
-      entity_id: row.relation_id,
-      event_type: RELATION_STATE_EVENT,
-      old_state: row.state,
-      new_state: target,
-      actor,
-      metadata: { action },
+    return this.store.immediate(() => {
+      const stored = this.store.tryGet(
+        OBJECTIVE_RELATION_ENTITY, String(input.relation_id)) as Row | null;
+      if (!stored) {
+        fail("FAIL_CLOSED_RELATION_NOT_FOUND", String(input.relation_id));
+      }
+      // Storage-key binding — tryGet returns the payload, so a row
+      // planted under this key claiming a different relation_id must
+      // be caught before its borrowed anchors are consulted.
+      if (String(stored.entity_id ?? "") !== String(input.relation_id)) {
+        fail("FAIL_CLOSED_RELATION_TAMPERED", String(input.relation_id));
+      }
+      const row = this.provenRow(stored);
+      if (!row) {
+        fail("FAIL_CLOSED_RELATION_TAMPERED", String(input.relation_id));
+      }
+      const from = this.objective(row.from_objective_id);
+      const to = this.objective(row.to_objective_id);
+      if (actor !== String(from.owner_authority_id) ||
+          actor !== String(to.owner_authority_id)) {
+        fail("FAIL_CLOSED_RELATION_AUTHORITY",
+          "actor must be the owner_authority_id of both objectives");
+      }
+      const next: Record<string, RelationState | null> = {
+        SUSPEND: row.state === "ACTIVE" ? "SUSPENDED" : null,
+        RESUME: row.state === "SUSPENDED" ? "ACTIVE" : null,
+        REVOKE: row.state !== "REVOKED" ? "REVOKED" : null,
+      };
+      const target = next[action];
+      if (action === "REVOKE" && row.state === "REVOKED") return row; // terminal idempotent
+      if (target === null || target === undefined) {
+        fail("FAIL_CLOSED_RELATION_STATE",
+          `${action} not legal from ${row.state}`);
+      }
+      if (action === "RESUME" && row.kind === "DEPENDS_ON") {
+        // Re-activation re-proves acyclicity — a graph that changed
+        // under SUSPENDED must not silently revive into a cycle.
+        const edges = this.allProven().filter(
+          (r) => r.business_id === row.business_id &&
+            r.kind === "DEPENDS_ON" && r.state !== "REVOKED");
+        this.assertAcyclic(edges, row.from_objective_id, row.to_objective_id);
+      }
+      const colVersion = Number(
+        (stored as { version?: unknown }).version ?? NaN);
+      if (!Number.isInteger(colVersion) || colVersion < 1) {
+        fail("FAIL_CLOSED_RELATION_TAMPERED", "version column unmatchable");
+      }
+      const updated: ObjectiveRelationRow = {
+        ...row,
+        state: target,
+        updated_at: utcnow(),
+      };
+      updated.relation_digest = relationDigest(updated);
+      const saved = this.store.put(
+        OBJECTIVE_RELATION_ENTITY, row.relation_id, { ...updated }, colVersion);
+      this.store.event({
+        entity_type: OBJECTIVE_RELATION_ENTITY,
+        entity_id: row.relation_id,
+        event_type: RELATION_STATE_EVENT,
+        old_state: row.state,
+        new_state: target,
+        actor,
+        metadata: { action },
+      });
+      return saved as ObjectiveRelationRow;
     });
-    return updated;
   }
 
   /** All proven relations where the objective is either endpoint. */
@@ -354,13 +462,17 @@ export class ObjectiveRelationService {
   }
 
   /** ACTIVE DEPENDS_ON upstream objectives of `objectiveId` — the
-   *  seam P18-C admission gating consumes. Zero-write. */
+   *  seam P18-C admission gating consumes. Zero-write, dedup'd —
+   *  forged duplicate edges must not inflate the answer. */
   upstreamOf(objectiveId: string): string[] {
-    return this.allProven()
-      .filter((r) => r.kind === "DEPENDS_ON" && r.state === "ACTIVE" &&
-        r.from_objective_id === objectiveId)
-      .map((r) => String(r.to_objective_id))
-      .sort();
+    const out = new Set<string>();
+    for (const r of this.allProven()) {
+      if (r.kind === "DEPENDS_ON" && r.state === "ACTIVE" &&
+          r.from_objective_id === objectiveId) {
+        out.add(String(r.to_objective_id));
+      }
+    }
+    return [...out].sort();
   }
 
   /** ACTIVE CONFLICTS partners — the parallel seam's exclusion set. */

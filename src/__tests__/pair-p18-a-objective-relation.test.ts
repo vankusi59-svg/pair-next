@@ -21,6 +21,17 @@
  *   R7  re-proof — digest-recomputed state flip, event-less forge,
  *       foreign-business pairing → never served (reads AND control).
  *   R8  actor shape — non operator:<ref> actors rejected.
+ *   R9  closed action vocabulary — out-of-set actions fail before the
+ *       transition map (never persist/journal an undefined state).
+ *   R10 atomicity — a failing event write rolls the row write back
+ *       (immediate tx, no orphan).
+ *   R11 anchor borrowing — a clone under a foreign storage key with
+ *       a self-consistent payload never borrows the victim's events.
+ *   R12 resurrection — terminal-flip payload rewrite + forged chain
+ *       break → unproven.
+ *   R13 owner amend post-mint — created_by must equal CURRENT
+ *       bilateral owner; an amended endpoint drops the relation.
+ *   R14 cross-connection mint — the immediate tx serializes dedup.
  */
 
 import { describe, expect, it } from "vitest";
@@ -330,6 +341,160 @@ describe("P18-A — objective_relation canonical entity", () => {
         from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: bad }),
         `actor=${JSON.stringify(bad)}`).toThrowError(IntegrityError);
     }
+    s.store.close();
+  });
+
+  it("R9 closed action vocabulary — DESTROY fails before the transition map", () => {
+    const s = fresh("r9");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    // Out-of-vocabulary action: must fail typed, never write.
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "DESTROY" as never, actor: OWNER }))
+      .toThrowError(IntegrityError);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "" as never, actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // Row untouched, no events journaled.
+    const stored = s.store.tryGet("objective_relation", r.relation_id) as Row;
+    expect(String(stored.state)).toBe("ACTIVE");
+    expect(s.store.listEvents("objective_relation", r.relation_id)).toHaveLength(1);
+    s.store.close();
+  });
+
+  it("R10 atomicity — a failing event write rolls the row write back", () => {
+    const s = fresh("r10");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const mutable = s.store as unknown as {
+      event: (p: Record<string, unknown>) => unknown };
+    const orig = mutable.event.bind(s.store);
+    mutable.event = () => { throw new IntegrityError("FORCED", "event fail"); };
+    expect(() => s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // No orphan row — the immediate tx rolled the put back.
+    expect(s.store.list("objective_relation")).toHaveLength(0);
+    mutable.event = orig;
+    // Control path atomicity: SUSPEND whose event write fails leaves
+    // the row ACTIVE and uncontaminated.
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    mutable.event = () => { throw new IntegrityError("FORCED", "event fail"); };
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    const stored = s.store.tryGet("objective_relation", r.relation_id) as Row;
+    expect(String(stored.state)).toBe("ACTIVE");
+    mutable.event = orig;
+    // The service still works after the seam is restored.
+    const sus = s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER });
+    expect(sus.state).toBe("SUSPENDED");
+    s.store.close();
+  });
+
+  it("R11 anchor borrowing — clones under foreign keys never prove", () => {
+    const s = fresh("r11");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const victimPayload = JSON.parse(
+      (db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(r.relation_id) as { payload: string }).payload);
+    // Clone the victim byte-for-byte under a different storage key.
+    // Payload entity_id says victim (self-consistent internally) but
+    // the storage key does not — entityPage rejects it at the page.
+    db.prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run("objective_relation", "REL_CLONE", 1,
+        JSON.stringify(victimPayload), digest(victimPayload), "2026-01-01T00:00:00.000Z");
+    expect(s.relations.relationsFor(a)).toHaveLength(1); // victim only
+    // Control on the clone key: tryGet returns the borrowed payload —
+    // the explicit key check must reject before anchors are read.
+    expect(() => s.relations.control({
+      relation_id: "REL_CLONE", action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    // The victim is still fully controllable.
+    const sus = s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER });
+    expect(sus.state).toBe("SUSPENDED");
+    s.store.close();
+  });
+
+  it("R12 resurrection + chain break — forged rewrites never revive a terminal row", () => {
+    const s = fresh("r12");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    s.relations.control({ relation_id: r.relation_id, action: "REVOKE", actor: OWNER });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const p = JSON.parse(
+      (db.prepare("SELECT payload FROM entities WHERE entity_type='objective_relation' AND entity_id=?")
+        .get(r.relation_id) as { payload: string }).payload);
+    // Digest-recomputed REVOKED→ACTIVE rewrite: the event tail still
+    // ends at REVOKED — unproven on read AND control.
+    p.state = "ACTIVE";
+    p.relation_digest = relationDigest(p);
+    db.prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type='objective_relation' AND entity_id=?")
+      .run(JSON.stringify(p), digest(p), r.relation_id);
+    expect(s.relations.relationsFor(a)).toHaveLength(0);
+    expect(s.relations.upstreamOf(a)).toEqual([]);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    s.store.close();
+  });
+
+  it("R13 owner amend post-mint — relation re-proves against CURRENT owners", () => {
+    const s = fresh("r13");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    expect(s.relations.relationsFor(a)).toHaveLength(1);
+    // Re-own one endpoint — the consenting owner no longer holds both.
+    s.biz.objectives.amend(b, {
+      business_id: bid,
+      patch: { owner_authority_id: "operator:successor" },
+      actor: OWNER,
+    });
+    // The relation silently drops out of the proven set — reads AND
+    // control fail closed (re-mint under the new owner is the remedy).
+    expect(s.relations.relationsFor(a)).toHaveLength(0);
+    expect(s.relations.relationsForBusiness(bid)).toHaveLength(0);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: OWNER }))
+      .toThrowError(IntegrityError);
+    expect(() => s.relations.control({
+      relation_id: r.relation_id, action: "SUSPEND", actor: "operator:successor" }))
+      .toThrowError(IntegrityError);
+    s.store.close();
+  });
+
+  it("R14 cross-connection mint — immediate tx serializes the dedup check", () => {
+    const s = fresh("r14");
+    const bid = mkBusiness(s);
+    const a = objId(mkObjective(s, bid));
+    const b = objId(mkObjective(s, bid));
+    const r1 = s.relations.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    // A second connection sees the committed row — dedup converges.
+    const s2 = new ObjectiveRelationService(
+      new PairEvidenceStore(path.join(s.dir, "pair.db")));
+    const r2 = s2.create({
+      from_objective_id: a, to_objective_id: b, kind: "DEPENDS_ON", actor: OWNER });
+    expect(r2.relation_id).toBe(r1.relation_id);
+    expect(s.store.list("objective_relation")).toHaveLength(1);
     s.store.close();
   });
 });
