@@ -35,7 +35,6 @@ import type { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import type { ArtifactAuthority } from "./artifact-authority.js";
 import {
-  OBJECTIVE_ENTITY,
   TERMINAL_OBJECTIVE_STATUSES,
   type ObjectiveStatus,
 } from "./objective-authority.js";
@@ -481,47 +480,14 @@ export class ObjectiveCockpitService {
   businessCompany(businessId: string, actor: string): Record<string, unknown> {
     const biz = this.store.get("business", businessId) as Row;
     // F2 — objectives.list() is an explicitly TOLERANT display-path
-    // read ("never used for authority decisions"). Re-validate every
-    // candidate through the strict read before projecting: a tampered
-    // or legacy row fails the whole company read closed rather than
-    // silently entering the response.
-    // F2/R3 — raw-claim filtering would silently omit a tampered
-    // objective (owner rewritten → filtered before validation;
-    // business_id rewritten → never enumerated under this business at
-    // all; objective_id rewritten → get() fetches the VICTIM row
-    // twice and the forged row is never validated). Enumerate by
-    // PERSISTED entity key instead: entityPage proves the stored
-    // entity_id column ↔ payload.entity_id ↔ payload_hash ↔ version
-    // are consistent, so a forged entity_id claim fails closed at
-    // enumeration. Then strict-read EVERY actual stored row by its
-    // proven key (never by the payload-claimed objective_id) and
-    // require objective_id === key — a payload identity alias fails
-    // closed even if its digest was recomputed to self-verify.
-    // Scope consequence: org-wide fail-closed — one corrupt objective
-    // anywhere fails every company read; that is the price of an
-    // honest scope proof and there is no smaller honest alternative.
-    const allStrict: Row[] = [];
-    let after = "";
-    for (;;) {
-      const page = this.store.entityPage<Row>({
-        entity_type: OBJECTIVE_ENTITY,
-        after_id: after,
-        limit: 1024,
-      });
-      if (page.length === 0) break;
-      for (const p of page) {
-        const key = String(p.entity_id); // proven === persisted key
-        const strict = this.deps.objectives.get(key) as Row;
-        if (String(strict.objective_id) !== key) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_COCKPIT_IDENTITY",
-            `${key}: payload objective_id=${String(strict.objective_id)}`,
-          );
-        }
-        allStrict.push(strict);
-      }
-      after = String(page[page.length - 1]!.entity_id);
-    }
+    // read ("never used for authority decisions").
+    // F2/R3 — scope is proven by strictEnumerate(): enumeration runs
+    // over PERSISTED entity keys (a forged business_id/owner/
+    // objective_id payload claim can never evade validation or alias
+    // another row's identity), every stored row is strict-read, and
+    // any tampered objective ANYWHERE fails this read closed. That is
+    // the price of an honest scope proof — no smaller alternative.
+    const allStrict = this.deps.objectives.strictEnumerate();
     const ownedStrict = allStrict
       .filter(
         (o) => String(o.business_id) === businessId &&

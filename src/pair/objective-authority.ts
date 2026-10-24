@@ -468,6 +468,43 @@ export class ObjectiveAuthorityService {
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   }
 
+  /** Strict org-wide enumeration for scope-proven read projections
+   *  (company cockpit, business portfolio). Enumerates by PERSISTED
+   *  entity key — entityPage proves stored entity_id ↔ payload.entity_id
+   *  ↔ payload_hash ↔ version consistent — then strict-reads EVERY
+   *  actual stored row by its proven key and requires the canonical
+   *  payload objective_id to equal that key. A tampered or forged
+   *  objective ANYWHERE fails the whole enumeration closed: an honest
+   *  scope proof cannot silently omit a corrupt row (filtering by
+   *  payload claims first would let forged business_id/owner rows
+   *  evade validation entirely). Callers filter the returned rows by
+   *  their scope — the enumeration itself proves the org-wide set. */
+  strictEnumerate(): Row[] {
+    const out: Row[] = [];
+    let after = "";
+    for (;;) {
+      const page = this.store.entityPage<Row>({
+        entity_type: OBJECTIVE_ENTITY,
+        after_id: after,
+        limit: 1024,
+      });
+      if (page.length === 0) break;
+      for (const p of page) {
+        const key = String(p.entity_id); // proven === persisted key
+        const strict = this.get(key) as Row;
+        if (String(strict.objective_id) !== key) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_IDENTITY",
+            `${key}: payload objective_id=${String(strict.objective_id)}`,
+          );
+        }
+        out.push(strict);
+      }
+      after = String(page[page.length - 1]!.entity_id);
+    }
+    return out;
+  }
+
   /** Canonical row contract — recomputed digest must self-verify AND
    *  mutable runtime state outside the digest must still satisfy every
    *  authority invariant (R2.C + R2.E):

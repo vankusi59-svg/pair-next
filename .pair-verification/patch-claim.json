@@ -1,16 +1,18 @@
 {
-  "claim_id": "P18_A_OBJECTIVE_RELATION",
-  "title": "P18-A canonical objective_relation — the coordination layer's atomic fact between objectives in one business",
+  "claim_id": "P18_B_PORTFOLIO_PROJECTION",
+  "title": "P18-B business portfolio — owner-scoped projection over canonical objective_relation",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-a-objective-relation.test.ts#P18-A"
+    "src/__tests__/pair-p18-b-portfolio.test.ts#P18-B"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "P18-A: canonical objective_relation + ObjectiveRelationService — substrate for portfolio/parallel/handoff/duties/recovery. Closed kind vocabulary (DEPENDS_ON, CONFLICTS, SUPERSEDES); ACTIVE→SUSPENDED⇄ACTIVE→REVOKED terminal+idempotent; closed action vocabulary. Bilateral authority: actor = operator:<ref> = owner_authority_id of BOTH endpoints at mint/control AND created_by re-checked against CURRENT owners at re-proof. business_id derived from canonical objectives; strict ObjectiveAuthorityService.get endpoints. DEPENDS_ON acyclicity at mint AND RESUME over non-REVOKED edges. Idempotent mint per (from,to,kind) — CONFLICTS symmetric; dedup after authority. create()/control() inside store.immediate — check+put+event atomic, cross-connection serialized. STRICT/LENIENT re-proof split: writes (dedup + cycle edges) enumerate strict — any corruption (entity hash/key/version, event tail, endpoint payload, store fault) propagates loudly so a corrupted-but-real row can never silently truncate the canonical set into a dup mint or cycle admission; reads enumerate lenient — corrupt rows isolate-and-skip, siblings still serve; semantic unproven-ness (fabricated rows, broken/forged chains, amended owners) returns null in both modes so fabrications can't DoS mints. Budget trips (PROOF_LIMIT) always propagate. Re-proof: digest + entityPage storage-key binding + strict endpoints + business + bilateral current-owner + FULL event tail (CREATED first, pinned new_state=ACTIVE + identity pins + old_state=null, legal chained STATE hops, ends at row state). upstreamOf/conflictsWith dedup'd, deterministic code-unit order. dedup_key+note validated/bounded. store.ts: JSON.parse wraps → IntegrityError-with-key on entityPage/get/list/verifiedEvent/listEvidence/planRevisions/listAllRaw (was bare SyntaxError). P18-A inert: no admission/scheduling/UI consumer. Codex-only.",
+  "description": "P18-B: ObjectivePortfolioService.businessPortfolio — READ-ONLY advisory projection, zero writes reachable. Same owner-scope contract as company cockpit: actor derived from x-operator-id at the edge; only objectives the actor owns in the business are projected (strict scope proof via new ObjectiveAuthorityService.strictEnumerate — persisted-key entityPage enumeration + strict get + payload-identity check, org-wide fail-closed); actor owning none → FAIL_CLOSED_PORTFOLIO_SCOPE (403, code-only). Only proven relations whose BOTH endpoints are owned enter the projection (proven edges are bilaterally owner-scoped; the filter is the honest local check). Per-objective: depends_on/dependents/conflicts/supersedes/superseded_by edge lists (all states, code-unit relation_id order, counterparty_objective_id naming) + dependency summary (ACTIVE upstream → SATISFIED iff upstream ACHIEVED, PENDING non-terminal, FAILED terminal non-ACHIEVED; blocked = pending+failed>0) + active_conflicts. Edges/counts (incl. objectives_dependency_blocked) computed over the FULL scoped set before the 200-objective page (honest totals like cockpit). Route GET /api/vnext/businesses/:id/portfolio — NO read-budget wrap, deliberately identical availability bounds to unbudgeted /company (the scheduler's {1024,512} is calibrated for per-objective reads; org-wide multiplicative charging here would trip at a fraction of bound with no safety gain — every loop is progression-bounded, corrupt rows fail closed loudly). objective-cockpit.businessCompany refactored onto strictEnumerate (same proof, code → FAIL_CLOSED_OBJECTIVE_IDENTITY; UI gloss updated + PORTFOLIO_DISABLED entry). Documented bounds: non-transactional mixed-snapshot (stale-owned render, edges can never leak); advisory only — no admission/scheduling/execution consumer (P18-C consumes upstreamOf/conflictsWith). Codex-only.",
   "risk_override": "HIGH"
 }
