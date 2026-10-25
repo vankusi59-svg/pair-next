@@ -575,6 +575,19 @@ export class MissionControl {
     };
   }
 
+  /** P18.4-B — per-mission liveness + recovery operations projection. */
+  missionOperations(missionId: string) {
+    return {
+      execution_health: this.deps.observability.executionHealth(missionId),
+      recovery_ops: this.deps.observability.recoveryOps(missionId),
+    };
+  }
+
+  /** P18.4-B — operator rollup over canonical rows (aggregate counts only). */
+  operationsOverview() {
+    return { operations: this.deps.observability.operationsOverview() };
+  }
+
   /** §4.2 — provider projection; credential status is a flag, never a secret. */
   providers() {
     return {

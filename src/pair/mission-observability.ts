@@ -82,6 +82,269 @@ export class MissionObservability {
     };
   }
 
+  /* ---------------- P18.4-B — liveness & recovery operations ------------- */
+
+  /**
+   * Per-execution health projection for one mission. Every field is
+   * classified by provenance — `persisted` (canonical row values),
+   * `observed` (adapter-reported, sanitized), `derived` (computed from
+   * persisted facts), or `unknown` — so an operator can never mistake a
+   * guess for a fact. No timestamps or states are synthesized: a field
+   * absent from durable state stays null and appears in `unknowns`.
+   */
+  executionHealth(missionId: string): { executions: Array<Record<string, unknown>> } {
+    const rows = this.store
+      .list("executor_execution")
+      .filter((e) => e.mission_id === missionId);
+    const executions = rows.map((e) => {
+      const obs = (e.last_observation as Record<string, unknown> | undefined) ?? {};
+      const persisted = {
+        execution_state: String(e.execution_state ?? "UNKNOWN"),
+        result_committed: e.result != null,
+        settle_complete: e.settle_complete === true,
+        settled_at: e.settled_at ?? null,
+        collection_started_at: e.collection_started_at ?? null,
+        collection_attempts: Number(e.collection_attempts ?? 0),
+        collection_committed_at: e.collection_committed_at ?? null,
+        collect_excluded: e.collect_excluded ?? null,
+        terminal_outcome: e.terminal_outcome ?? null,
+        dispatch_timestamp: e.dispatch_timestamp ?? null,
+        run_root: e.run_root ?? null,
+        orphan_unobservable: e.orphan_unobservable_final === true
+          ? {
+              final: true,
+              count: Number(e.orphan_unobservable_count ?? 0),
+            }
+          : null,
+      };
+      const observed = {
+        last_status: obs.status ?? null,
+        last_observed_at: e.last_observed_at ?? null,
+        observe_count: Number(e.observe_count ?? 0),
+        observe_faults: Number(obs.observe_faults ?? 0),
+        first_terminal_observed_at: e.first_terminal_observed_at ?? null,
+        heartbeat_at: obs.heartbeat_at ?? obs.heartbeat ?? null,
+        finished_at:
+          (e.result as Record<string, unknown> | undefined)?.completed_at ??
+          obs.finished_at ??
+          null,
+        blocking_reason: obs.blocking_reason ?? null,
+      };
+      // Derived stage — ordered by canonical strength, never by guess.
+      const terminal = ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"].includes(
+        persisted.execution_state,
+      );
+      const stage = persisted.terminal_outcome
+        ? "NEUTRALIZED"
+        : persisted.settle_complete
+          ? "SETTLED"
+          : persisted.collect_excluded
+            ? "EXCLUDED"
+            : persisted.result_committed
+              ? "RESULT_COMMITTED"
+              : terminal || observed.first_terminal_observed_at
+                ? "TERMINAL_OBSERVED"
+                : observed.last_observed_at || observed.observe_count > 0
+                  ? "OBSERVED"
+                  : "DISPATCHED";
+      // Abnormal flags — every rule keys on a durable fact, never a
+      // threshold invented at read time.
+      const abnormal: string[] = [];
+      if (observed.blocking_reason) abnormal.push(`BLOCKED:${String(observed.blocking_reason)}`);
+      if (persisted.collect_excluded) {
+        abnormal.push(
+          `COLLECTION_EXCLUDED:${String((persisted.collect_excluded as Record<string, unknown>).code ?? "")}`,
+        );
+      }
+      if (persisted.orphan_unobservable) abnormal.push("ORPHAN_UNOBSERVABLE");
+      if (observed.observe_faults > 0) abnormal.push(`OBSERVE_FAULTS:${observed.observe_faults}`);
+      if (Number(e.settle_faults ?? 0) > 0) abnormal.push(`SETTLE_FAULTS:${Number(e.settle_faults)}`);
+      if (persisted.result_committed && !persisted.settle_complete && !persisted.collect_excluded) {
+        abnormal.push("COMMITTED_UNSETTLED");
+      }
+      if (persisted.execution_state === "UNKNOWN") abnormal.push("UNKNOWN_OUTCOME");
+      if (!terminal && !observed.last_observed_at && observed.observe_count === 0) {
+        abnormal.push("NEVER_OBSERVED");
+      }
+      const ms = (a: unknown, b: unknown) => {
+        const d = Date.parse(String(b ?? "")) - Date.parse(String(a ?? ""));
+        return Number.isFinite(d) && d >= 0 ? d : null;
+      };
+      const unknowns: string[] = [];
+      if (observed.last_observed_at == null) unknowns.push("no_observation_yet");
+      if (persisted.result_committed === false && terminal) unknowns.push("result_not_collected");
+      if (!persisted.settle_complete && persisted.result_committed) {
+        unknowns.push("settlement_pending");
+      }
+      return {
+        execution_id: String(e.execution_id),
+        task_id: String(e.task_id ?? ""),
+        governed_task_id: String(e.governed_task_id ?? ""),
+        executor_id: String(e.executor_id ?? ""),
+        persisted,
+        observed,
+        derived: {
+          stage,
+          abnormal,
+          latency_ms: {
+            dispatch_to_terminal_observed: ms(
+              persisted.dispatch_timestamp,
+              observed.first_terminal_observed_at,
+            ),
+            terminal_observed_to_collect: ms(
+              observed.first_terminal_observed_at,
+              persisted.collection_committed_at,
+            ),
+            terminal_observed_to_settled: ms(
+              observed.first_terminal_observed_at,
+              persisted.settled_at,
+            ),
+          },
+        },
+        unknowns,
+      };
+    });
+    return { executions };
+  }
+
+  /**
+   * Recovery operations projection for one mission — active arm,
+   * deferred queue, barriers, backoff timers, pending approvals,
+   * reconcile receipts and the recovery decision/attempt history.
+   * Read-only; every action an operator can legitimately take is via
+   * existing canonical endpoints (approvals, reconcile, lifecycle).
+   */
+  recoveryOps(missionId: string): Record<string, unknown> {
+    const rt = this.store.tryGet("mission_runtime", `MRT_${missionId}`);
+    const barriers =
+      ((rt?.barriers as Record<string, Record<string, unknown>> | undefined) ?? {});
+    const receipts = this.store
+      .list("reconciliation_receipt")
+      .filter((r) => String((r.inputs as Record<string, unknown> | undefined)?.mission_id ?? "") === missionId);
+    return {
+      mission_id: missionId,
+      runtime_state: rt ? String(rt.state) : null,
+      pending_recovery: rt?.pending_recovery ?? null,
+      deferred_recovery:
+        (rt?.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [],
+      barriers,
+      backoff: this.store
+        .list("scheduled_action")
+        .filter(
+          (a) =>
+            a.mission_id === missionId &&
+            ["SCHEDULED", "READY", "RUNNING"].includes(String(a.status)),
+        )
+        .map((a) => ({
+          scheduled_action_id: a.scheduled_action_id,
+          task_id: a.task_id ?? null,
+          recovery_id: a.recovery_id ?? null,
+          action: a.action,
+          status: a.status,
+          due_at: a.due_at,
+        })),
+      approvals_pending: this.store
+        .list("approval_request")
+        .filter((a) => a.mission_id === missionId && a.status === "PENDING"),
+      decisions: this.store
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === missionId),
+      attempts: this.store
+        .list("recovery_attempt")
+        .filter((a) => a.mission_id === missionId),
+      reconciliation_receipts: receipts.slice(-20),
+      // Legitimate next actions — derived from canonical state only;
+      // the UI must not invent operations beyond these seams.
+      allowed_actions: {
+        decide_approval: true, // existing /api/approvals/:id/decide
+        request_reconciliation:
+          Object.values(barriers).some((b) => b.settled !== true) ||
+          this.store
+            .list("executor_execution")
+            .some(
+              (e) =>
+                e.mission_id === missionId &&
+                String(e.execution_state) === "UNKNOWN" &&
+                !e.terminal_outcome,
+            ),
+        lifecycle: true, // pause/resume/cancel/acknowledge contract
+      },
+    };
+  }
+
+  /**
+   * Business-level operations rollup — bounded aggregate counts only,
+   * all derived from canonical rows. Distinct from metrics(): these are
+   * the operator's "what needs attention" signals.
+   */
+  operationsOverview(): Record<string, unknown> {
+    const runtimes = this.store.list("mission_runtime");
+    const execs = this.store.list("executor_execution");
+    const TERMINAL_RT = new Set(["COMPLETED", "FAILED", "CANCELLED", "ABORTED"]);
+    const TERMINAL_EXEC = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
+    const awaitingCollection = execs.filter(
+      (e) =>
+        e.result == null &&
+        !e.terminal_outcome &&
+        e.collect_excluded == null,
+    );
+    const committedUnsettled = execs.filter(
+      (e) => e.result != null && e.settle_complete !== true && e.collect_excluded == null,
+    );
+    const activeRecovery = runtimes.filter((r) => r.pending_recovery != null);
+    const deferred = runtimes.reduce(
+      (n, r) =>
+        n +
+        ((r.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []).length,
+      0,
+    );
+    const barriersOpen = runtimes.reduce(
+      (n, r) =>
+        n +
+        Object.values(
+          (r.barriers as Record<string, Record<string, unknown>> | undefined) ?? {},
+        ).filter((b) => b.settled !== true).length,
+      0,
+    );
+    const exhaustion = runtimes.filter((r) => {
+      const p = r.pending_recovery as Record<string, unknown> | null;
+      const action = String(p?.action ?? "");
+      return (
+        ["HUMAN_APPROVAL_REQUIRED", "ABORT", "REPLAN"].includes(action) ||
+        String(r.state) === "WAITING_APPROVAL"
+      );
+    });
+    const workItems = this.store.list("work_item");
+    return {
+      missions_running: runtimes.filter(
+        (r) => !TERMINAL_RT.has(String(r.state)) && String(r.state) !== "PAUSED",
+      ).length,
+      missions_paused: runtimes.filter((r) => String(r.state) === "PAUSED").length,
+      executions_awaiting_collection: awaitingCollection.length,
+      executions_committed_unsettled: committedUnsettled.length,
+      recoveries_active: activeRecovery.length,
+      recoveries_deferred: deferred,
+      reconciliation_barriers_open: barriersOpen,
+      approvals_pending: this.store
+        .list("approval_request")
+        .filter((a) => a.status === "PENDING").length,
+      executions_orphan_unobservable: execs.filter(
+        (e) => e.orphan_unobservable_final === true,
+      ).length,
+      executions_never_observed: execs.filter(
+        (e) =>
+          !TERMINAL_EXEC.has(String(e.execution_state)) &&
+          !e.terminal_outcome &&
+          !e.last_observation,
+      ).length,
+      recovery_blocked_or_escalated: exhaustion.length,
+      work_items_blocked: workItems.filter(
+        (w) => String(w.status) === "BLOCKED",
+      ).length,
+      ...this.livenessLatencies(),
+    };
+  }
+
   /** Per-subsystem health — never collapses auth/quota/policy into DOWN. */
   health(): Record<string, { state: HealthState; detail: string }> {
     const h: Record<string, { state: HealthState; detail: string }> = {};

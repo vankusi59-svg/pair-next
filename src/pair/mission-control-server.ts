@@ -208,6 +208,7 @@ table{border-collapse:collapse;font-size:12px}td,th{border:1px solid #26303f;pad
 const VIEWS={
  "Missions":"/api/missions","Health":"/api/health","Metrics":"/api/metrics",
  "Routing":"/api/routing","Recovery":"/api/recovery","Approvals":"/api/approvals",
+ "Operations":"/api/operations",
  "Experience":"/api/experience","Self-Improvement":"/api/selfmod",
  "Business":"/api/businesses"};
 const nav=document.getElementById("tabs"),view=document.getElementById("view"),op=document.getElementById("op");
@@ -874,6 +875,15 @@ export function createMissionControlServer(
         return void json(res, 200, c.executors(deps.executorBoundIds?.() ?? []));
       }
       if (method === "GET" && p === "/api/recovery") return void json(res, 200, c.recovery());
+      // P18.4-B — per-mission liveness + recovery operations projection
+      // (persisted/observed/derived/unknown classification; read-only).
+      m = p.match(/^\/api\/missions\/([^/]+)\/operations$/);
+      if (method === "GET" && m) return void json(res, 200, c.missionOperations(m[1]));
+      // P18.4-B — operator rollup: bounded aggregate counts over
+      // canonical rows (nothing inferred, nothing synthesized).
+      if (method === "GET" && p === "/api/operations") {
+        return void json(res, 200, c.operationsOverview());
+      }
       if (method === "GET" && p === "/api/approvals") return void json(res, 200, c.approvals());
       if (method === "GET" && p === "/api/experience") return void json(res, 200, c.experience());
       if (method === "GET" && p === "/api/selfmod") return void json(res, 200, c.selfImprovement());
