@@ -88,6 +88,13 @@ export const BRAIN_CONTEXT_READ_BUDGET = {
   events: 8192,
 } as const;
 
+/* Planner-feedback bounds: the newest validation rejections surfaced to
+   the CEO brief — recency-bounded (never wall-clock filtered, so the
+   section value stays clock-independent and digest-stable). */
+export const BRAIN_PLANNER_RECENT_REJECTIONS = 3;
+export const BRAIN_PLANNER_MAX_CODES = 4;
+export const BRAIN_PLANNER_MAX_HINTS = 8;
+
 export interface BrainContextOpts {
   /** Optional caller-asserted business scope: when supplied, an
    *  objective outside it fails closed (belt on top of owner scope). */
@@ -163,6 +170,116 @@ export interface ScopedMemoryDep {
 export interface BrainContextDeps extends ObjectiveCockpitDeps {
   experience?: ScopedExperienceReader;
   scopedMemory?: ScopedMemoryDep;
+}
+
+/** Bounded canonical projection of plan-validation rejections for one
+ *  objective: planner runs are attributed to the objective through the
+ *  `cost_reservation` lineage seam (admitPlannerInvocation); settled
+ *  attempt rows carry `outcome`/`failure_class`/`warnings` — the
+ *  VALIDATION_CODE:/REASK:/DROP_/DEP_/REPAIRED_ markers are
+ *  PAIR-sanitized strings, never raw model output. Pure reads only. */
+export interface PlannerRejectionEntry {
+  planner_attempt_id: string;
+  planner_run_id: string;
+  work_item_id: string | null;
+  attempt_no: number;
+  run_state: string | null;
+  run_attempt_count: number;
+  failure_class: string | null;
+  validation_codes: string[];
+  reask_attempted: boolean;
+  task_hints: string[];
+  completed_at: string | null;
+}
+
+export interface PlannerEvidenceValue {
+  recent_rejections: PlannerRejectionEntry[];
+  rejected_attempt_count: number;
+  planner_run_count: number;
+}
+
+export function plannerEvidenceForObjective(
+  store: PairEvidenceStore,
+  objectiveId: string,
+): PlannerEvidenceValue {
+  const lineage = new Map<string, string | null>();
+  for (const r of store.list("cost_reservation") as Array<Record<string, unknown>>) {
+    if (String(r.attribution ?? "") !== "planner") continue;
+    const rid = String(r.planner_run_id ?? "");
+    if (!rid || String(r.objective_id ?? "") !== objectiveId) continue;
+    lineage.set(rid, r.work_item_id != null ? String(r.work_item_id) : null);
+  }
+  const attempts = (store.list("planner_attempt") as Array<Record<string, unknown>>).filter(
+    (a) => String(a.planner_run_id ?? "") !== "" && lineage.has(String(a.planner_run_id)),
+  );
+  const attemptCountByRun = new Map<string, number>();
+  for (const a of attempts) {
+    const run = String(a.planner_run_id);
+    attemptCountByRun.set(run, (attemptCountByRun.get(run) ?? 0) + 1);
+  }
+  const isValidationRejected = (a: Record<string, unknown>): boolean => {
+    if (String(a.outcome ?? "") !== "FAILED") return false;
+    const warns = Array.isArray(a.warnings) ? (a.warnings as string[]) : [];
+    return (
+      String(a.failure_class ?? "") === "PLAN_INVALID" ||
+      warns.some((w) => w.startsWith("VALIDATION_CODE:") || w.startsWith("REASK:"))
+    );
+  };
+  const rejectedRows = attempts.filter(isValidationRejected);
+  /* Sort + bound on cheap persisted fields BEFORE enrichment — one
+     tryGet per survivor only (run lookups cached per planner_run_id). */
+  rejectedRows.sort((x, y) =>
+    String(y.completed_at ?? "").localeCompare(String(x.completed_at ?? "")) ||
+    String(y.entity_id ?? "").localeCompare(String(x.entity_id ?? "")),
+  );
+  const runCache = new Map<string, Record<string, unknown> | null>();
+  const runOf = (rid: string) => {
+    if (!runCache.has(rid)) {
+      runCache.set(rid, store.tryGet("planner_run", rid) as Record<string, unknown> | null);
+    }
+    return runCache.get(rid)!;
+  };
+  const toEntry = (a: Record<string, unknown>): PlannerRejectionEntry => {
+    const warns = Array.isArray(a.warnings) ? (a.warnings as string[]) : [];
+    const codes = [...new Set(
+      warns
+        .filter((w) => w.startsWith("VALIDATION_CODE:") || w.startsWith("REASK:"))
+        .map((w) => w.slice(w.indexOf(":") + 1)),
+    )].slice(0, BRAIN_PLANNER_MAX_CODES);
+    /* AUDIT F1 — task-keyed markers can embed a model-supplied
+       task_key verbatim (DROP_INVALID_TASK_KEY:<key> interpolates the
+       unvalidated key). This content flows into the CEO user prompt via
+       facts → observation.brain_brief — apply the same charset+length
+       bound the reask lane uses (planner-pool SAFE_CODE_RE) so no raw
+       model text can ride this channel. */
+    const taskHints = [...new Set(
+      warns.filter((w) =>
+        /^(DROP_|DEP_|REPAIRED_)/.test(w) &&
+        w.length <= 160 && /^[A-Z0-9_:.\-]+$/.test(w)),
+    )].slice(0, BRAIN_PLANNER_MAX_HINTS);
+    const runId = String(a.planner_run_id);
+    const run = runOf(runId);
+    return {
+      planner_attempt_id: String(a.entity_id ?? ""),
+      planner_run_id: runId,
+      work_item_id: lineage.get(runId) ?? null,
+      attempt_no: Number(a.attempt_no ?? 0),
+      run_state: run?.state != null ? String(run.state) : null,
+      run_attempt_count: attemptCountByRun.get(runId) ?? 1,
+      failure_class: a.failure_class != null ? String(a.failure_class) : null,
+      validation_codes: codes,
+      reask_attempted: warns.some((w) => w.startsWith("REASK:")),
+      task_hints: taskHints,
+      completed_at: a.completed_at != null ? String(a.completed_at) : null,
+    };
+  };
+  return {
+    recent_rejections: rejectedRows
+      .slice(0, BRAIN_PLANNER_RECENT_REJECTIONS)
+      .map(toEntry),
+    rejected_attempt_count: rejectedRows.length,
+    planner_run_count: lineage.size,
+  };
 }
 
 function section(
@@ -380,6 +497,13 @@ export class BrainContextService {
         latest_review: c.latest_review,
         review_count: c.review_count,
       },
+      [],
+      [],
+    );
+
+    sections.planner = section(
+      ["cost_reservation.list", "planner_attempt.list", "planner_run.tryGet"],
+      plannerEvidenceForObjective(this.store, objectiveId),
       [],
       [],
     );

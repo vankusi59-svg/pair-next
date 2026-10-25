@@ -607,12 +607,16 @@ export function assertCanonicalMissionLifecycle(
   // No live execution may remain for a claimed terminal state UNLESS
   // the canonical writer marked it (`cancel_requested`) or the pairing
   // is ABORTED — abortMission is the one writer that legitimately
-  // leaves in-flight side effects unresolved.
+  // leaves in-flight side effects unresolved. `terminal_outcome`
+  // exclusions mirror MissionRuntime's in-flight sweep: an UNKNOWN
+  // execution the operator acknowledged through the governed
+  // reconcile→approve path is neutralized, not live.
   if (claimed !== "PAUSED" && rtState !== "ABORTED") {
     const live = store.list("executor_execution").filter((e) =>
       String(e.mission_id ?? "") === mid &&
       !TERMINAL_EXECUTION.has(String(e.execution_state ?? "")) &&
-      e.cancel_requested !== true);
+      e.cancel_requested !== true &&
+      !e.terminal_outcome);
     if (live.length > 0) {
       fail(`mission ${mid}: ${live.length} live executions contradict ${claimed}`);
     }
