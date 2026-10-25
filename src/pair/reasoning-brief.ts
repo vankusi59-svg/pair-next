@@ -533,6 +533,7 @@ export class ReasoningBriefService {
             validation_codes: r.validation_codes,
             reask_attempted: r.reask_attempted,
             task_hints: r.task_hints,
+            feedback_informed: r.feedback_informed,
             completed_at: r.completed_at,
           },
           provenance: "CANONICAL",

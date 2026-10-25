@@ -233,6 +233,12 @@ export function classifyReplanGenerationFailure(
   if (code === "FAIL_CLOSED_PLANNER_EXHAUSTED") {
     return { kind: "EXHAUSTED", code };
   }
+  if (code === "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED") {
+    // P18.2 — adaptive repair budget spent: the generation settles
+    // FAILED with the typed code; the work item's durable event
+    // already carries the canonical evidence.
+    return { kind: "EXHAUSTED", code };
+  }
   if (code.startsWith("FAIL_CLOSED_COST_")) {
     return { kind: "ADMISSION_REJECTED", code };
   }

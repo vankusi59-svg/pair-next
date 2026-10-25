@@ -516,6 +516,12 @@ export interface PlannerRejectionContext {
    *  itself as fallback. Never raw exception text, instructions, plan JSON,
    *  requirement text, or secrets. */
   detail?: string;
+  /** P18.2 — absent = same-run REASK (this candidate's own plan was just
+   *  rejected). "PRIOR_RUN" = cross-run feedback: a DIFFERENT, earlier
+   *  planner run for the same work item was rejected — possibly a
+   *  different candidate/model. Prompt phrasing differs; everything else
+   *  (sanitize bounds, minimal-repair tail) is identical. */
+  origin?: "PRIOR_RUN";
 }
 
 export interface LlmPlannerConfig {
@@ -1107,7 +1113,9 @@ export function buildPlannerUserPrompt(
         `Preserve every unrelated constraint (capabilities allowed, DAG rules, telegram rules) and request no wider permissions than the failed plan.\n`
       : "") +
     (cfg.rejectionContext
-      ? `\nPLAN REJECTION — your previous plan from this same planner candidate was rejected by PAIR for the following canonical validation defect:\n` +
+      ? (cfg.rejectionContext.origin === "PRIOR_RUN"
+          ? `\nPLAN REJECTION — a previous planning run for this same work item was rejected by PAIR for the following canonical validation defect:\n`
+          : `\nPLAN REJECTION — your previous plan from this same planner candidate was rejected by PAIR for the following canonical validation defect:\n`) +
         `validation_code: ${cfg.rejectionContext.validation_code}\n` +
         `rejection_detail: ${typeof cfg.rejectionContext.detail === "string" && /^[\x20-\x7E]{1,200}$/.test(cfg.rejectionContext.detail) ? cfg.rejectionContext.detail : cfg.rejectionContext.validation_code}\n` +
         `task warnings: ${cfg.rejectionContext.task_warnings.filter((w) => /^[A-Z0-9_:.\-]+$/.test(String(w))).slice(0, 10).join(", ") || "none"}\n` +

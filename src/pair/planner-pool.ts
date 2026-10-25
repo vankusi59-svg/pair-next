@@ -53,7 +53,9 @@ export interface PlannerInvocation {
    *  including partial counts when an invocation threw mid-flight. An
    *  attempt that never reached a provider-touching seam settles 0. */
   providerCounter?: { requests: number };
-  /** Bounded deterministic rejection feedback — present iff kind=REASK. */
+  /** Bounded deterministic rejection feedback — present on REASK
+   *  (same-run) and on INITIAL when a PRIOR planner run for this work
+   *  item was validation-rejected (origin "PRIOR_RUN"). */
   rejectionContext?: PlannerRejectionContext;
 }
 
@@ -101,6 +103,7 @@ export function boundedReaskTaskWarnings(warnings: string[]): string[] {
   for (const w of warnings) {
     if (
       out.length < 10 &&
+      w.length <= 160 &&
       SAFE_CODE_RE.test(w) &&
       (w.startsWith("DROP_") || w.startsWith("DEP_") || w.startsWith("REPAIRED_")) &&
       !out.includes(w)
@@ -239,7 +242,8 @@ export function boundedAttemptWarnings(warnings: string[]): string[] {
   const isProtected = (w: string) =>
     w.startsWith("REPAIRED_") ||
     w.startsWith("REASK:") ||
-    w.startsWith("REASK_SUCCEEDED:");
+    w.startsWith("REASK_SUCCEEDED:") ||
+    w.startsWith("PRIOR_REJECTION:");
   const nonProtectedBudget = Math.max(
     0,
     10 - warnings.filter(isProtected).length,
@@ -465,10 +469,33 @@ export async function runPlannerFailover(opts: {
    *  caller settles the run FAILED — never EXHAUSTED, since untried
    *  candidates were denied by the deadline rather than by failure. */
   deadlineMs?: number;
+  /** P18.2 — cross-run rejection feedback for the INITIAL invocation of
+   *  every candidate in this run (a PRIOR planner run's terminal
+   *  validation rejection, sanitized+bounded by the caller). Absent or
+   *  failing the defensive re-validation = plain INITIAL, unchanged. */
+  priorRejectionContext?: PlannerRejectionContext;
   onExhausted?: (attempts: PlannerAttemptRecord[]) => void;
   now?: () => string;
 }): Promise<PlannerFailoverResult> {
   const now = opts.now ?? (() => new Date().toISOString());
+  // P18.2 — defensive re-validation of the advisory feedback: advisory
+  // input must never fault the run, but a malformed code can never
+  // reach the model either. Also drives the durable PRIOR_REJECTION:
+  // provenance marker merged into every settle.
+  const priorCtx = (() => {
+    const p = opts.priorRejectionContext;
+    if (!p) return null;
+    const code = String(p.validation_code ?? "");
+    if (!code || code.length > 80 || !/^[A-Z0-9_:.\-]+$/.test(code)) return null;
+    return {
+      validation_code: code,
+      task_warnings: boundedReaskTaskWarnings(
+        Array.isArray(p.task_warnings) ? p.task_warnings.map(String) : [],
+      ),
+      origin: "PRIOR_RUN" as const,
+    };
+  })();
+  const feedbackWarnings = priorCtx ? [`PRIOR_REJECTION:${priorCtx.validation_code}`] : [];
   if (!opts.candidates.length) {
     throw new IntegrityError(
       "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
@@ -522,7 +549,7 @@ export async function runPlannerFailover(opts: {
       started_at: started,
       completed_at: "",
       latency_ms: 0,
-      warnings: [],
+      warnings: [...feedbackWarnings],
     };
     // §4 — durable STARTED evidence before ANY gate runs: even an
     // eligibility-rejected or authority-aborted invocation is auditable.
@@ -535,7 +562,11 @@ export async function runPlannerFailover(opts: {
     // "provider provably invoked".
     const providerCalls = { requests: 0 };
     const settle = (rec: PlannerAttemptRecord) => {
-      const stamped = { ...rec, provider_requests: providerCalls.requests };
+      const stamped = {
+        ...rec,
+        warnings: boundedAttemptWarnings([...feedbackWarnings, ...(rec.warnings ?? [])]),
+        provider_requests: providerCalls.requests,
+      };
       attempts.push(stamped);
       opts.onAttemptEnd?.(token, stamped);
     };
@@ -584,6 +615,7 @@ export async function runPlannerFailover(opts: {
       const res = await opts.planFn(c, {
         kind: "INITIAL",
         providerCounter: providerCalls,
+        ...(priorCtx ? { rejectionContext: priorCtx } : {}),
         ...(deadlineAt != null
           ? {
               timeoutMs: Math.min(
@@ -857,6 +889,13 @@ export async function runPlannerFailover(opts: {
         });
         throw e;
       }
+      // Audit R2 — a raw thrown string beginning with a marker family
+      // (VALIDATION_CODE:/REASK:/PRIOR_REJECTION:/...) would forge a
+      // canonical marker onto a transport death: it would be counted
+      // as a validation rejection and could ride back into the next
+      // prompt as fabricated feedback. Only charset-safe non-marker
+      // text is ever persisted as error evidence here.
+      const caught = String(e instanceof Error ? e.name : e).slice(0, 80);
       settle({
         ...base,
         completed_at: now(),
@@ -864,7 +903,11 @@ export async function runPlannerFailover(opts: {
         outcome: "FAILED",
         failure_class: PLANNER_FAILURE_CLASS.NETWORK_ERROR,
         warnings: boundedAttemptWarnings([
-          String(e instanceof Error ? e.name : e).slice(0, 80),
+          ...(/^(VALIDATION_CODE:|REASK:|PRIOR_REJECTION:|DROP_|DEP_|REPAIRED_|CANONICAL_)/.test(
+            caught,
+          )
+            ? []
+            : [caught]),
           ...reaskMarker,
         ]),
       });

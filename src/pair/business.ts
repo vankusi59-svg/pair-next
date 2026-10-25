@@ -97,6 +97,8 @@ import {
   proveWorkItemComplete,
   rejectedCompletionBases,
 } from "./work-completion.js";
+import { plannerAdaptiveRetryForWorkItem } from "./planner-adaptive-retry.js";
+import type { PlannerRejectionContext } from "./llm-planner.js";
 
 export const WORK_ITEM_STATUSES = [
   "BACKLOG",
@@ -187,6 +189,10 @@ export type DelegatedPlanExpander = (
      *  run deadline so a planner invocation can never outlive the
      *  authority that invoked it (auto-driver lease bound). */
     deadlineMs?: number;
+    /** P18.2 — sanitized cross-run rejection feedback derived from
+     *  canonical planner evidence by the caller; the expander forwards
+     *  it to the planner pool's INITIAL invocations (origin PRIOR_RUN). */
+    prior_rejection?: PlannerRejectionContext;
   },
 ) => Promise<{
   input: Record<string, unknown>;
@@ -1687,6 +1693,30 @@ export class BusinessLayer {
       String(elig.row.department ?? ""),
       elig.agentId,
     );
+    /* P18.2 — bounded adaptive retry: derive the newest terminal
+       validation rejection for THIS work item from durable canonical
+       evidence. Exhausted (repair runs spent) → durable marker + typed
+       fail-closed BEFORE minting a planner_run — zero provider calls,
+       zero reservations. Not exhausted → feedback rides the INITIAL
+       invocation via the same rejectionContext seam as REASK. */
+    const adaptive = plannerAdaptiveRetryForWorkItem(this.store, workItemId);
+    if (adaptive.exhausted) {
+      this.store.event({
+        entity_type: "work_item",
+        entity_id: workItemId,
+        event_type: "PLANNER_VALIDATION_RETRY_EXHAUSTED",
+        new_state: null,
+        actor: "PAIR_PLANNER",
+        metadata: {
+          rejected_run_count: adaptive.rejected_run_count,
+          last_planner_run_id: adaptive.source?.planner_run_id ?? null,
+        },
+      });
+      throw new PolicyError(
+        "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
+        `work_item ${workItemId}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,
+      );
+    }
     const ctx = this.delegatedGoalContext(workItemId);
     const expanded = await expander(
       {
@@ -1709,6 +1739,7 @@ export class BusinessLayer {
       },
       {
         work_item_id: workItemId,
+        ...(adaptive.context ? { prior_rejection: adaptive.context } : {}),
         // AUDIT R1 F5 — a caller-pinned absolute bound becomes the
         // remaining-duration pin; the expander min()'s it against the
         // configured run deadline (tighten-only). A lapsed pin yields a

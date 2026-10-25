@@ -124,7 +124,14 @@ export function persistPlannerAttemptStart(
       latency_ms: null,
       outcome: "STARTED",
       failure_class: null,
-      warnings: [],
+      /* P18.2 — bounded record warnings persist on the STARTED row so
+         a feedback-informed attempt (PRIOR_REJECTION:<code>) leaves
+         durable provenance even when it crashes mid-call — same
+         discipline as the REASK: marker. Charset-bound, PAIR markers
+         only. */
+      warnings: (a.warnings ?? [])
+        .filter((w) => /^[A-Z0-9_:.\-]+$/.test(String(w)))
+        .slice(0, 10),
       plan_digest: null,
       winner: false,
       created_at: now,

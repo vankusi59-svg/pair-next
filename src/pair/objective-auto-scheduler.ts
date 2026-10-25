@@ -112,6 +112,7 @@ const SAFE_FAULT_CODES = new Set<string>([
   "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT",
   "FAIL_CLOSED_READ_BUDGET_SCHEMA",
   "FAIL_CLOSED_ASYNC_READ_BUDGET",
+  "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
 ]);
 
 /** Fixed classification labels — the complete durable fault vocabulary.
