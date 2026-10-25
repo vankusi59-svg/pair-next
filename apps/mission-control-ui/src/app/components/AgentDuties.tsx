@@ -51,8 +51,9 @@ const OBJ_TONE: Record<string, Tone> = {
 const ERR_HINT: Record<string, string> = {
   FAIL_CLOSED_DUTY_AUTHORITY: "you must own every covered objective",
   FAIL_CLOSED_DUTY_BUSINESS: "duties cannot span businesses or foreign agents",
-  FAIL_CLOSED_AGENT_MISSING: "the agent does not exist in this business",
-  DUTY_EXISTS: "an equivalent duty already exists",
+  FAIL_CLOSED_DUTY_AGENT: "the agent does not exist in this business",
+  FAIL_CLOSED_DUTY_OBJECTIVE: "a covered objective is not canonical here",
+  FAIL_CLOSED_DUTY_STATE: "state changed — refresh and retry",
 };
 
 function describeErr(e: unknown): string {
@@ -187,6 +188,9 @@ export function AgentDuties(props: {
         if (seq !== opSeq.current) return;
         setMutBusy(false);
         setMutNote(`Duty ${action} failed: ${describeErr(e)}`);
+        // A committed-but-lost lifecycle lands as FAIL_CLOSED_*_STATE —
+        // re-tick the poll so the canonical row repaints immediately.
+        if (e instanceof ApiError && e.code.endsWith("_STATE")) setTick((n) => n + 1);
       });
   };
 
@@ -199,7 +203,7 @@ export function AgentDuties(props: {
     const objs = [...aObjs].sort();
     const note = aNote.trim();
     const seq = ++opSeq.current;
-    const sig = JSON.stringify(["duty", businessId, agent, objs, note]);
+    const sig = JSON.stringify(["duty", businessId, agent, objs]);
     let key = dedupKeys.current[sig];
     if (!key) {
       key = `ui-duty-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;

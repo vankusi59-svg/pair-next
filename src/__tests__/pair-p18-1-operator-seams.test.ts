@@ -265,6 +265,9 @@ describe("P18.1 relation seams", () => {
     const bid = mkBusiness(s);
     const up = mkObjective(s, bid);
     const dep = mkObjective(s, bid);
+    // Foreign-owned target in the SAME business/store — minted before
+    // the write-count snapshot so the preview-only assertion holds.
+    const foreignObj = mkObjective(s, bid, FOREIGN);
     const base = await serve(s);
     const before = (dbOf(s.store)
       .prepare("SELECT COUNT(*) n FROM entities").get() as { n: number }).n;
@@ -290,6 +293,21 @@ describe("P18.1 relation seams", () => {
     const badBody = await bad.json() as { valid: boolean; errors: string[] };
     expect(badBody.valid).toBe(false);
     expect(badBody.errors.some((e) => e.includes("not found"))).toBe(true);
+
+    // Foreign-owned target — the error fires AND the advisory never
+    // leaks the foreign objective's status into implications.
+    const pvForeign = await post(base,
+      `/api/vnext/objectives/${dep}/relations/preview`,
+      { to_objective_id: foreignObj, kind: "DEPENDS_ON" }, OP);
+    const pvFB = await pvForeign.json() as {
+      valid: boolean; errors: string[];
+      implications: Record<string, unknown>;
+      current: { admission?: unknown };
+    };
+    expect(pvFB.valid).toBe(false);
+    expect(pvFB.errors.some((e) => e.includes("different owner"))).toBe(true);
+    expect(pvFB.implications).toEqual({});
+    expect(pvFB.current.admission).toBeUndefined();
 
     // A preview writes nothing.
     expect((dbOf(s.store)
@@ -409,6 +427,12 @@ describe("P18.1 transitions + operations + integrity", () => {
     expect((await post(base, `/api/vnext/objectives/${a}/transition`,
       { business_id: bid, to: "ACTIVE" }, OP)).status).toBe(409);
     const b = mkObjective(s, bid);
+    // Operator seam is deliberately narrower than the service table:
+    // ACHIEVED/INFEASIBLE/EXPIRED stay behind the review-signoff gate.
+    for (const to of ["ACHIEVED", "INFEASIBLE", "EXPIRED", "BLOCKED"]) {
+      expect((await post(base, `/api/vnext/objectives/${b}/transition`,
+        { business_id: bid, to }, OP)).status).toBe(400);
+    }
     // ACTIVE→ACTIVE is not in the transition table (no self-edge).
     expect((await post(base, `/api/vnext/objectives/${b}/transition`,
       { business_id: bid, to: "ACTIVE" }, OP)).status).toBe(409);

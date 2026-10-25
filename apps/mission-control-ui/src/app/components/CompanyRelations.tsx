@@ -318,6 +318,10 @@ export function CompanyRelations(props: {
         if (seq !== opSeq.current) return;
         setMutBusy(false);
         setMutNote(`Relation ${action} failed: ${describeErr(e)}`);
+        // A committed-but-lost lifecycle lands as FAIL_CLOSED_*_STATE —
+        // re-tick the poll so the canonical row repaints immediately
+        // instead of waiting out the 8s interval.
+        if (e instanceof ApiError && e.code.endsWith("_STATE")) setTick((n) => n + 1);
       });
   };
 

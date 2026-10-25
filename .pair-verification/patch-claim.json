@@ -1,16 +1,18 @@
 {
-  "claim_id": "E2E_V1_CEO_MODEL_ENV",
-  "title": "Bounded remediation: PAIR_CEO_MODEL operator seam (CEO model configurable like every other route)",
+  "claim_id": "P18_1_OPERATOR_CONTROL_CENTER",
+  "title": "P18.1 Operator Control Center — owner-facing HTTP seams + Mission Control UI over canonical P18 substrate",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-3w-ceo-runtime-wiring.test.ts#PAIR_CEO_MODEL"
+    "src/__tests__/pair-p18-1-operator-seams.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001"
   ],
-  "description": "E2E-V1 remediation: (1) resolveDefaultCeoModelEntry previously resolved a hardcoded gpt-6.1-sol — the only reasoning model in the stack with no operator override. PAIR_CEO_MODEL adds the missing seam: model-id only (provider stays codex-cli — subscription-only transport preserved), malformed value fails closed FAIL_CLOSED_CEO_MODEL_CONFIG before any catalog read, unset/empty keeps the default. No seeding, no qualification bypass — pure resolution seam, mirrors PAIR_CONVERSATION_MODEL. (2) C10 test-harness flake: the dangling-pointer assertion pinned a single wedge code (FAIL_CLOSED_RELATION_INDEX) while the scan's wedge priority is ULID-order-dependent — a corrupt sibling pointer traversed first fires FAIL_CLOSED_ENTITY_HASH_MISMATCH on the identical contract (loud fail-closed wedge, never silent clearing). The assertion now accepts either wedge code; reproduced flaky under parallel workers, stable 3/3 after.",
+  "description": "Owner-facing management of the canonical P18 substrate through Mission Control: (1) P18.1-A owner-scoped HTTP seams — objective relations (list/create/advisory-preview/suspend/resume/revoke), org-agent duties (objective/agent/business reads + create + lifecycle), objective transitions (operator-narrowed to PAUSE/RESUME/CANCEL — ACHIEVED stays behind the review-signoff gate), per-objective + business operations observability (driver readiness via the driver's own readiness() proof, P15.10-C convention), canonical integrity probe. Every mutation delegates to ObjectiveRelationService / OrgAgentDutyService / ObjectiveAuthorityService.transitionStatus — zero direct store writes; actor derives only from x-operator-id via canonicalOperatorActor. (2) P18.1-B..F UI: ObjectiveRelations (admission strip + edge list + advisory preview + lifecycle + confirm dialogs + per-op dedup keys replayed on ambiguous failure), AgentDuties (exact-set coverage + lifecycle), CompanyRelations (SVG graph from canonical rows only, edge inspector, revoked toggle), ObjectiveOpsMonitor + operations overview (queue/lease/reasons/NOT_OBSERVED honesty). Foreign-owned preview targets never leak status. IntegrityError is surfaced as UNPROVEN:<code>, never masked as NOT_OBSERVED. (3) docs/e2e-v181/p181-live.mjs — real-browser E2E on the live stack: 39/39 PASS (UI objective create, advisory preview, DEPENDS_ON/SUPERSEDES via UI, UPSTREAM_UNMET live gate, canonical recovery via real CEO pass + review + work-item cancel + sign-off, duty assign/lifecycle via UI, policy disable, ops/integrity panels, UI Inbox sign-off → ACHIEVED, reload persistence, forged-header/cross-business/idempotency adversarial). Audit remediation: transition seam narrowed to PAUSE/RESUME/CANCEL, truthful driver readiness, integrity wedges unmasked, foreign-preview status leak suppressed, agent-existence oracle folded.",
   "risk_override": "HIGH"
 }

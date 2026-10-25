@@ -1796,8 +1796,13 @@ export function createMissionControlServer(
           }
           if (wouldCycle) errors.push("would create a DEPENDS_ON cycle");
         }
-        const toStatus = toRow ? String(toRow.status ?? "") : null;
-        const implications = ({
+        // Scope hygiene: when the target is cross-business or
+        // foreign-owned, its status never leaks into the advisory —
+        // the operator only learns "not yours to touch".
+        const scopeLeak = errors.some(
+          (e) => e.includes("different owner") || e.includes("cross-business"));
+        const toStatus = !scopeLeak && toRow ? String(toRow.status ?? "") : null;
+        const implications = scopeLeak ? {} : ({
           DEPENDS_ON: {
             effect: `${fromId} will not be admitted until ${toId} is ACHIEVED or superseded`,
             current_target_status: toStatus,
@@ -1826,6 +1831,7 @@ export function createMissionControlServer(
           },
         });
       }
+
       m = p.match(/^\/api\/vnext\/relations\/([^/]+)\/(suspend|resume|revoke)$/);
       if (m && method === "POST") {
         if (!biz || !deps.store) {
@@ -1876,7 +1882,15 @@ export function createMissionControlServer(
         const agentId = m[1]!;
         const agent = biz.listOrgAgents().find(
           (a) => String(a.agent_id) === agentId);
-        if (!agent) return void json(res, 404, { error: "ORG_AGENT_NOT_FOUND" });
+        // No existence oracle: an unknown agent and a foreign-owned
+        // agent get the same authority failure — 404-vs-403 must never
+        // disclose that the agent exists outside the caller's scope.
+        if (!agent) {
+          return void json(res, 403, {
+            error: "FAIL_CLOSED_BUSINESS_SCOPE",
+            detail: "actor does not own this agent's business scope",
+          });
+        }
         const owned = assertBusinessScope(String(agent.business_id ?? ""), actor);
         const ownedIds = new Set(owned.map((o) => String(o.objective_id)));
         // Scoped-honest read: only duties whose covered objectives are
@@ -1950,7 +1964,11 @@ export function createMissionControlServer(
       // ----- P18.1-D — objective status transitions -----------------
       // PAUSE/RESUME/CANCEL via the canonical transitionStatus — the
       // service owns the legal-transition table, terminal guards and
-      // owner proof; the route only types the request.
+      // owner proof; the route only types the request. The operator
+      // surface is deliberately narrower than the service table:
+      // ACHIEVED/INFEASIBLE stay behind the review-signoff gate (P15.10
+      // A2) — an unevidenced owner-declared completion is not allowed
+      // through this seam.
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/transition$/);
       if (m && method === "POST") {
         if (!biz) {
@@ -1962,6 +1980,15 @@ export function createMissionControlServer(
           return void json(res, 400, {
             error: "FAIL_CLOSED_OBJECTIVE_TRANSITION_REQUEST",
             detail: "to + business_id required strings; reason optional string",
+          });
+        }
+        const trTo = String(body.to);
+        if (trTo !== "ACTIVE" && trTo !== "PAUSED" && trTo !== "CANCELLED") {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_OBJECTIVE_TRANSITION_REQUEST",
+            detail: `to ${trTo} not allowed on this seam — ` +
+              "operator controls are PAUSE/RESUME/CANCEL only; " +
+              "ACHIEVED requires the canonical review sign-off",
           });
         }
         return void json(res, 200, {
@@ -1986,14 +2013,17 @@ export function createMissionControlServer(
         const opsActor = canonicalOperatorActor(req.headers["x-operator-id"], p);
         const objectiveId = m[1]!;
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
-        // policy.statusReadOnly performs the owner proof without any
-        // lazy-expiry write — safe for a pure observability GET.
         const policy = autoPolicySvc.statusReadOnly(objectiveId, opsActor);
         const rels = relationSvc();
         const admission = rels.admissionView(objectiveId);
         const driver = deps.autoDriver
           ? deps.autoDriver.statusReadOnly(objectiveId, opsActor)
           : null;
+        // Truthful readiness (P15.10-C R3 F3): the driver's own
+        // objective-level proof — same convention as /auto-scheduler.
+        // readiness() may commit the canonical lazy EXPIRED transition
+        // (same behavior as the existing policy GET — not a pure read).
+        const r = deps.autoDriver?.readiness(objectiveId, opsActor);
         return void json(res, 200, {
           operations: {
             objective_id: objectiveId,
@@ -2001,11 +2031,10 @@ export function createMissionControlServer(
             auto_policy: policy,
             auto_scheduler: deps.autoScheduler
               ? deps.autoScheduler.status(objectiveId, opsActor,
-                  driver
+                  deps.autoDriver
                     ? { enabled: true, driver_missing: [],
-                        runnable: (driver as Record<string, unknown>)
-                          .objective_runnable === true,
-                        reasons: [] }
+                        runnable: r?.objective_runnable === true,
+                        reasons: (r?.reasons as string[] | undefined) ?? [] }
                     : undefined)
               : null,
             auto_driver: driver,
@@ -2034,11 +2063,16 @@ export function createMissionControlServer(
             title: o.title ?? o.statement ?? null,
             updated_at: o.updated_at,
           };
+          // Absent component → NOT_OBSERVED. IntegrityError is NEVER
+          // masked as absence — a wedged/corrupt row surfaces its typed
+          // code so the operator sees the fail-closed truth.
+          const obsOrWedge = (e: unknown) =>
+            e instanceof IntegrityError ? `UNPROVEN:${e.code}` : "NOT_OBSERVED";
           try {
             rec.auto_policy_effective =
               autoPolicySvc!.statusReadOnly(oid, actor).effective;
-          } catch {
-            rec.auto_policy_effective = "NOT_OBSERVED";
+          } catch (e) {
+            rec.auto_policy_effective = obsOrWedge(e);
           }
           if (deps.autoScheduler) {
             try {
@@ -2051,8 +2085,8 @@ export function createMissionControlServer(
               rec.next_due = s.next_due;
               rec.lease = s.lease;
               rec.owner_action_required = s.owner_action_required;
-            } catch {
-              rec.queue_state = "NOT_OBSERVED";
+            } catch (e) {
+              rec.queue_state = obsOrWedge(e);
             }
           } else {
             rec.queue_state = "NOT_OBSERVED";
@@ -2063,8 +2097,8 @@ export function createMissionControlServer(
                 Record<string, unknown>;
               rec.driver_last_outcome = d.last_outcome;
               rec.capability_gap = d.capability_gap;
-            } catch {
-              rec.driver_last_outcome = "NOT_OBSERVED";
+            } catch (e) {
+              rec.driver_last_outcome = obsOrWedge(e);
             }
           } else {
             rec.driver_last_outcome = "NOT_OBSERVED";

@@ -59,10 +59,10 @@ const KIND_HUMAN: Record<RelKind, string> = {
 const ERR_HINT: Record<string, string> = {
   FAIL_CLOSED_RELATION_AUTHORITY: "you must own both objectives",
   FAIL_CLOSED_RELATION_BUSINESS: "relations cannot span businesses",
-  FAIL_CLOSED_RELATION_SCOPE: "relations cannot span businesses",
-  FAIL_CLOSED_OBJECTIVE_IDENTITY: "the target is not a canonical objective of this business",
-  RELATION_CYCLE: "a dependency edge cannot create a cycle",
-  RELATION_EXISTS: "an equivalent relation already exists",
+  FAIL_CLOSED_RELATION_OBJECTIVE: "the target is not a canonical objective of this business",
+  FAIL_CLOSED_RELATION_CYCLE: "a dependency edge cannot create a cycle",
+  FAIL_CLOSED_RELATION_STATE: "state changed — refresh and retry",
+  FAIL_CLOSED_RELATION_KIND: "unsupported relation kind",
 };
 
 function describeErr(e: unknown): string {
@@ -258,6 +258,10 @@ export function ObjectiveRelations(props: {
         if (seq !== opSeq.current) return;
         setMutBusy(false);
         setMutNote(`Relation ${action} failed: ${describeErr(e)}`);
+        // A committed-but-lost lifecycle lands as FAIL_CLOSED_*_STATE —
+        // re-tick the poll so the canonical row repaints immediately
+        // instead of waiting out the 8s interval.
+        if (e instanceof ApiError && e.code.endsWith("_STATE")) setTick((n) => n + 1);
       });
   };
 
@@ -271,7 +275,7 @@ export function ObjectiveRelations(props: {
        the SAME operation replays the stored dedup_key verbatim; the
        ledger dedups so a committed-but-lost response cannot double-mint.
        Different inputs are a different operation → fresh key. */
-    const sig = JSON.stringify(["rel", objectiveId, target, kind, note]);
+    const sig = JSON.stringify(["rel", objectiveId, target, kind]);
     let key = dedupKeys.current[sig];
     if (!key) {
       key = `ui-rel-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
