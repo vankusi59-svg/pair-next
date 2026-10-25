@@ -30,6 +30,14 @@ the wake hint is never required for settlement).
 - Post-fix, every live runtime state collects: the starvation-shape sibling
   settles at the next tick (measured median 21 ms at a 100 ms cadence —
   i.e., bounded by the sweep period, not by minutes).
+- The measured starvation scenario covers a *completing* sibling during an
+  armed pending recovery. Two adjacent shapes — a deferred/deduped failure
+  signal ordering ahead of the completing row, and a persistently faulting
+  row ordering ahead — were disproven for the first implementation by the
+  independent audit (R1 findings 1–2) and are now pinned by `LV-9`/`LV-10`/
+  `LV-11` in `pair-p18-3-supervisor-liveness.test.ts`: deferred signals
+  `continue` the sweep, deterministic faults exit eligibility via
+  `collect_excluded` after one routed recovery.
 - Liveness stamps (`observe_count`, `first_terminal_observed_at`,
   `collection_started_at`, `collection_committed_at`, `collection_attempts`,
   `settled_at`) are null on the base build — they are the new P18.3 evidence

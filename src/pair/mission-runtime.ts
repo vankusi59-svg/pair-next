@@ -1636,6 +1636,13 @@ export class MissionRuntime {
           // recovery/operator path settles it.
           e.result == null &&
           !e.terminal_outcome && // Phase D §5 — operator-neutralized
+          // P18.3 audit R1 — a row handed to governed recovery for a
+          // deterministic collect fault leaves eligibility permanently:
+          // re-faulting each tick re-minted fresh recovery every
+          // pending-free window and burned the task's retry budget.
+          // Recovery (RETRY_SAME_ROUTE mints a NEW execution row) and
+          // operator reconcile remain the release paths.
+          e.collect_excluded == null &&
           !barrieredExecs.has(String(e.execution_id)),
       );
     for (const e of inFlight) {
@@ -1668,22 +1675,44 @@ export class MissionRuntime {
       try {
         observed = this.deps.gate.observe_execution(adapter, String(e.execution_id));
       } catch {
-        continue; // observe fault → retried next tick; never starve siblings
+        // Observe fault — retry next tick, but a deterministically-
+        // faulting observe must not spin silently forever: count
+        // consecutive faults on the row's last_observation (a later
+        // successful observe overwrites it) and at the bound hand the
+        // execution to governed UNKNOWN_SIDE_EFFECT recovery.
+        const fresh = (this.store.tryGet("executor_execution", String(e.execution_id)) ?? e) as Record<string, unknown>;
+        const prior = (fresh.last_observation as Record<string, unknown> | undefined) ?? {};
+        const faults = Number(prior.observe_faults ?? 0) + 1;
+        try {
+          fresh.last_observation = { ...prior, observe_faults: faults };
+          this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
+        } catch { /* liveness hint is best-effort */ }
+        if (faults >= COLLECT_FAULT_BOUND) {
+          this.markCollectExcluded(fresh, "OBSERVE_FAULT_BOUND", "observe_execution threw");
+          if (this.queueOrStartRecovery(
+            missionId, String(e.task_id), String(e.execution_id),
+            "UNKNOWN_SIDE_EFFECT_STATE", now,
+          )) return;
+        }
+        continue;
       }
       const observedState = String(observed.execution_state);
       if (observedState === "UNKNOWN" || String(e.execution_state) === "UNKNOWN") {
         // Phase D §5 — UNKNOWN is not terminal but can never be
         // auto-settled: drive it through governed recovery (reconcile →
         // operator no-replay acknowledgment) instead of leaving the task
-        // in-flight forever.
-        this.queueOrStartRecovery(
+        // in-flight forever. Bail ONLY when a fresh recovery armed —
+        // a deferred/deduped signal owns nothing yet, and abandoning
+        // the sweep here starves every later-listed sibling for the
+        // whole pending window (audit R1 finding 1).
+        if (this.queueOrStartRecovery(
           missionId,
           String(e.task_id),
           String(e.execution_id),
           "UNKNOWN_SIDE_EFFECT_STATE",
           now,
-        );
-        return;
+        )) return;
+        continue;
       }
       if (!TERMINAL_EXECUTION.has(observedState)) continue;
       try {
@@ -1694,38 +1723,61 @@ export class MissionRuntime {
         // bounded: deterministic governed failures (IntegrityError /
         // PolicyError carrying a FAIL_CLOSED code — malformed envelope,
         // identity mismatch, forged evidence) can never succeed on
-        // replay, so they route into RESULT_SCHEMA recovery immediately;
-        // transient faults (IO, process races) get a bounded number of
-        // collect attempts before UNKNOWN_SIDE_EFFECT — never an
-        // unbounded silent spin.
+        // replay, so they route into RESULT_SCHEMA recovery immediately
+        // AND leave sweep eligibility (collect_excluded) — re-faulting
+        // would re-mint recovery every pending-free window. Transient
+        // faults (IO, process races) get a bounded number of collect
+        // attempts before the same exclusion + UNKNOWN_SIDE_EFFECT —
+        // never an unbounded silent spin.
         const code = String((err as { code?: string }).code ?? "COLLECT_FAULT");
-        const attempts = Number(
-          ((this.store.tryGet("executor_execution", String(e.execution_id)) ?? {}) as
-            Record<string, unknown>).collection_attempts ?? 0,
-        );
+        const fresh = (this.store.tryGet("executor_execution", String(e.execution_id)) ?? e) as Record<string, unknown>;
+        const attempts = Number(fresh.collection_attempts ?? 0);
+        const deterministic =
+          err instanceof IntegrityError || err instanceof PolicyError;
         try {
-          const prior = (e.last_observation as Record<string, unknown> | undefined) ?? {};
-          e.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
-          this.store.put("executor_execution", String(e.execution_id), e, Number(e.version));
+          const prior = (fresh.last_observation as Record<string, unknown> | undefined) ?? {};
+          fresh.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
+          this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
         } catch { /* liveness hint is best-effort */ }
-        if (err instanceof IntegrityError || err instanceof PolicyError) {
-          this.queueOrStartRecovery(
+        if (deterministic || attempts >= COLLECT_FAULT_BOUND) {
+          this.markCollectExcluded(fresh, code, deterministic ? "deterministic" : "attempt_bound");
+          if (this.queueOrStartRecovery(
             missionId, String(e.task_id), String(e.execution_id),
-            "RESULT_SCHEMA_FAILURE", now,
-          );
-          return;
-        }
-        if (attempts >= COLLECT_FAULT_BOUND) {
-          this.queueOrStartRecovery(
-            missionId, String(e.task_id), String(e.execution_id),
-            "UNKNOWN_SIDE_EFFECT_STATE", now,
-          );
-          return;
+            deterministic ? "RESULT_SCHEMA_FAILURE" : "UNKNOWN_SIDE_EFFECT_STATE",
+            now,
+          )) return;
         }
         continue;
       }
       const rtNow = String(this.runtimeEntity(missionId).state);
       if (rtNow !== entryState) return; // recovery/approval/reconcile took over
+    }
+  }
+
+  /**
+   * Permanently removes an execution from the collection sweep after a
+   * bounded/deterministic fault: durable marker + evidence event on the
+   * mission log. The row keeps all attempt evidence; governed recovery
+   * owns the task outcome from here (a retry mints a NEW execution —
+   * this row can never double-settle).
+   */
+  private markCollectExcluded(
+    execution: Record<string, unknown>,
+    code: string,
+    reason: string,
+  ): void {
+    try {
+      const fresh = (this.store.tryGet("executor_execution", String(execution.execution_id)) ?? execution) as Record<string, unknown>;
+      fresh.collect_excluded = { code, reason, at: utcnow() };
+      this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
+      this.store.appendEvidence(String(fresh.mission_id), "EXECUTION_COLLECTION_EXCLUDED", {
+        execution_id: String(fresh.execution_id),
+        task_id: String(fresh.task_id ?? ""),
+        code,
+        reason,
+      });
+    } catch {
+      /* exclusion marker is best-effort; the filter also guards */
     }
   }
 
@@ -1745,9 +1797,13 @@ export class MissionRuntime {
     failureClass: ReturnType<typeof classifyFailure>,
     now?: string,
     extra?: Parameters<MissionRuntime["startRecovery"]>[7],
-  ): void {
+  ): boolean {
     const rt = this.runtimeEntity(missionId);
     if (rt.pending_recovery) {
+      // A second signal for the SAME task whose recovery is already
+      // armed carries no new authority — drop it rather than queue a
+      // self-duplicate the drain would replay.
+      if (String((rt.pending_recovery as Record<string, unknown>).task_id ?? "") === taskId) return false;
       const deferred =
         (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
       if (!deferred.some((d) => String(d.task_id) === taskId)) {
@@ -1768,7 +1824,7 @@ export class MissionRuntime {
           Number(rt.version),
         );
       }
-      return;
+      return false;
     }
     this.startRecovery(
       missionId,
@@ -1780,6 +1836,7 @@ export class MissionRuntime {
       undefined,
       extra,
     );
+    return true;
   }
 
   /**
@@ -1791,9 +1848,34 @@ export class MissionRuntime {
   private drainDeferredRecovery(missionId: string, now?: string): void {
     const rt = this.runtimeEntity(missionId);
     if (rt.pending_recovery) return;
-    const deferred =
+    let deferred =
       (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
     if (deferred.length === 0) return;
+    // Staleness re-validation (audit R1): entries queued during the
+    // pending window may describe tasks that have since reached a
+    // terminal state or executions that settled — replaying them mints
+    // spurious recovery chains / human gates on a healthy mission.
+    const TASK_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+    const alive = deferred.filter((d) => {
+      const t = this.store.tryGet("task", String(d.task_id));
+      if (!t || TASK_TERMINAL.has(String(t.status))) return false;
+      if (d.execution_id != null) {
+        const ex = this.store.tryGet("executor_execution", String(d.execution_id));
+        if (ex && ex.result != null) return false; // already settled
+      }
+      return true;
+    });
+    if (alive.length !== deferred.length) {
+      deferred = alive;
+      rt.deferred_recovery = deferred;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      if (deferred.length === 0) return;
+    }
     const barriers =
       (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
     const idx = deferred.findIndex((d) => {
@@ -1809,17 +1891,40 @@ export class MissionRuntime {
       rt,
       Number(rt.version),
     );
-    this.startRecovery(
-      missionId,
-      String(entry.task_id),
-      entry.execution_id != null ? String(entry.execution_id) : null,
-      entry.failure_class as ReturnType<typeof classifyFailure>,
-      now,
-      undefined,
-      undefined,
-      (entry.extra as Parameters<MissionRuntime["startRecovery"]>[7]) ??
+    try {
+      this.startRecovery(
+        missionId,
+        String(entry.task_id),
+        entry.execution_id != null ? String(entry.execution_id) : null,
+        entry.failure_class as ReturnType<typeof classifyFailure>,
+        now,
         undefined,
-    );
+        undefined,
+        (entry.extra as Parameters<MissionRuntime["startRecovery"]>[7]) ??
+          undefined,
+      );
+    } catch (err) {
+      // A thrown arm must not silently lose the failure signal — requeue
+      // with a bounded drain counter; at the bound the entry drops with
+      // durable evidence instead of an unbounded retry cycle.
+      const attempts = Number(entry.drain_attempts ?? 0) + 1;
+      const rt2 = this.runtimeEntity(missionId);
+      if (attempts < 5 && !rt2.pending_recovery) {
+        rt2.deferred_recovery = [
+          ...((rt2.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []),
+          { ...entry, drain_attempts: attempts },
+        ];
+        this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
+      } else {
+        this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+          task_id: String(entry.task_id),
+          execution_id: entry.execution_id ?? null,
+          failure_class: String(entry.failure_class),
+          drain_attempts: attempts,
+          error: String((err as Error)?.message ?? err).slice(0, 200),
+        });
+      }
+    }
   }
 
   /* ---------------- settle + recovery entry ------------------------------- */
@@ -1836,11 +1941,14 @@ export class MissionRuntime {
     }
     const collected = this.store.get("executor_execution", executionId);
     const state = String(collected.execution_state);
-    // P18.3 — canonical settlement timestamp: the executor_execution row
-    // records when its result finished canonical settlement (collect +
-    // validate + task mark), completing the liveness chain
+    // P18.3 — canonical settlement timestamp: stamped ONLY after the
+    // terminal disposition is decided (validation PASS → success mark,
+    // or terminal non-success → failure mark). A validation-REJECTED
+    // result never carries settled_at — it was rejected evidence, not a
+    // settled outcome. Completes the liveness chain
     // dispatch → first_terminal_observed → collected → settled.
-    if (!collected.settled_at) {
+    const stampSettled = () => {
+      if (collected.settled_at) return;
       collected.settled_at = utcnow();
       this.store.put(
         "executor_execution",
@@ -1848,7 +1956,7 @@ export class MissionRuntime {
         collected,
         Number(collected.version),
       );
-    }
+    };
     if (state === "COMPLETED") {
       const validation = this.deps.gate.validate_execution_result(executionId);
       if (String(validation.status) === "PASS") {
@@ -1912,6 +2020,7 @@ export class MissionRuntime {
           status: "COMPLETED",
           completed_at: utcnow(),
         });
+        stampSettled();
         this.store.event({
           entity_type: "task",
           entity_id: taskId,
@@ -1991,6 +2100,7 @@ export class MissionRuntime {
     }
     // Terminal non-success → recovery decision.
     this.deps.service.updateTask(taskId, { status: "FAILED" });
+    stampSettled();
     const errorObj =
       (collected.result as Record<string, unknown> | undefined)?.error as
         | Record<string, unknown>

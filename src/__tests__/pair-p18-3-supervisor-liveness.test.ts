@@ -90,6 +90,13 @@ class ScriptedAdapter implements ExecutorAdapter {
       workspace: task.workspace,
     };
   }
+  /** Pin a non-terminal/ambiguous observed status without writing a
+   *  result — the supervisor must route it through governed recovery,
+   *  never auto-settle. */
+  markStatus(eid: string, status: string) {
+    const prior = this.states.get(eid);
+    this.states.set(eid, { status, result: prior?.result });
+  }
   finish(eid: string, status = "COMPLETED", output?: Record<string, unknown>) {
     const task = this.dispatched.find((d) => d.execution_id === eid)?.task ?? {};
     this.states.set(eid, {
@@ -145,7 +152,10 @@ interface Ctx {
   projectId: string;
 }
 
-function makeCtx(name: string, opts: { adapterId?: string } = {}): Ctx {
+function makeCtx(
+  name: string,
+  opts: { adapterId?: string; taskCount?: number; taskConcurrency?: number } = {},
+): Ctx {
   const dir = freshDir(name);
   const store = new PairEvidenceStore(path.join(dir, "pair.db"));
   const service = new PairControlPlane(store);
@@ -157,7 +167,9 @@ function makeCtx(name: string, opts: { adapterId?: string } = {}): Ctx {
   const adapter = new ScriptedAdapter(opts.adapterId ?? "EX_A");
   const recon = new ReconciliationService(service, adapters);
   const approvals = new ApprovalQueue(service);
-  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const scheduler = new MissionScheduler(service, {
+    mission_concurrency: opts.taskConcurrency ?? 2,
+  });
   registry.register({
     executor_id: adapter.executor_id,
     executor_type: "EXTERNAL",
@@ -194,11 +206,14 @@ function makeCtx(name: string, opts: { adapterId?: string } = {}): Ctx {
     capabilities: ["FILE_OPERATIONS"],
   });
   adapters.set(adapter.executor_id, adapter);
+  const nTasks = Math.max(1, Math.min(6, opts.taskCount ?? 2));
   const planner = () => ({
-    tasks: [
-      { task_key: "T1", title: "t1", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
-      { task_key: "T2", title: "t2", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
-    ],
+    tasks: Array.from({ length: nTasks }, (_, i) => ({
+      task_key: `T${i + 1}`,
+      title: `t${i + 1}`,
+      required_capabilities: ["FILE_OPERATIONS"],
+      depends_on: [],
+    })),
   });
   const runtime = new MissionRuntime({
     service, gate, router, adapters, scheduler, approvals,
@@ -215,7 +230,7 @@ function makeCtx(name: string, opts: { adapterId?: string } = {}): Ctx {
   return { dir, store, service, runtime, supervisor, control, adapters, adapter, recon, projectId: String(project.project_id) };
 }
 
-function startMission(ctx: Ctx): string {
+function startMission(ctx: Ctx, expectExecs = 1): string {
   const m = ctx.control.startMission({
     project_id: ctx.projectId,
     goal: "liveness",
@@ -225,7 +240,7 @@ function startMission(ctx: Ctx): string {
   });
   const mid = String((m as Record<string, unknown>).mission_id);
   // Drive ticks until the mission dispatches (PLANNING→READY→RUNNING→dispatch).
-  for (let i = 0; i < 12 && execs(ctx, mid).length === 0; i++) ctx.runtime.tick(mid);
+  for (let i = 0; i < 30 && execs(ctx, mid).length < expectExecs; i++) ctx.runtime.tick(mid);
   return mid;
 }
 
@@ -405,5 +420,97 @@ describe("P18.3 — collection liveness", () => {
       entity_id: wi, after_seq: 0, limit: 10, descending: true,
     });
     expect(evs.length).toBe(2);
+  });
+
+  it("LV-9 deferred signal must not starve a completing sibling (audit R1-1)", () => {
+    // Reproduced shape: e1 FAILED arms pending_recovery; e2 UNKNOWN
+    // defers; e3 COMPLETED must STILL settle on the same tick — the
+    // pre-fix unconditional `return` parked e3 for the whole pending
+    // window (the incident signature, inside the new loop).
+    const ctx = makeCtx("lv9", { taskCount: 3, taskConcurrency: 3 });
+    const mid = startMission(ctx, 3);
+    const [e1, e2, e3] = execs(ctx, mid);
+    ctx.adapter.finish(String(e1!.execution_id), "FAILED");
+    ctx.runtime.tick(mid);
+    const armed = rt(ctx, mid).pending_recovery as Record<string, unknown>;
+    expect(armed).toBeTruthy();
+    expect(String(armed.task_id)).toBe(String(e1!.task_id));
+    // e2 ambiguous while pending armed; e3 terminal-completed.
+    ctx.adapter.markStatus(String(e2!.execution_id), "UNKNOWN");
+    ctx.adapter.finish(String(e3!.execution_id), "COMPLETED");
+    ctx.runtime.tick(mid);
+    // e3 settled through the defer — the sweep continued past it.
+    const e3row = ctx.store.get("executor_execution", String(e3!.execution_id));
+    expect(e3row.result).toBeTruthy();
+    expect(e3row.settled_at).toBeTruthy();
+    expect(String(ctx.store.get("task", String(e3row.task_id)).status)).toBe("COMPLETED");
+    // e2's signal was deferred, not dropped, and pending is untouched.
+    const rtNow = rt(ctx, mid);
+    expect(String((rtNow.pending_recovery as Record<string, unknown>).recovery_id))
+      .toBe(String(armed.recovery_id));
+    const deferred = (rtNow.deferred_recovery as Array<Record<string, unknown>>) ?? [];
+    expect(deferred.some((d) => String(d.task_id) === String(e2!.task_id))).toBe(true);
+  });
+
+  it("LV-10 deterministic collect fault: row exits sweep once; sibling settles; no recovery churn (audit R1-2)", () => {
+    // e1 finishes but collect returns a result with a forged
+    // execution_id → gate IntegrityError (deterministic — can never
+    // heal on replay). Pre-fix: the row re-faulted every tick AND
+    // minted fresh recovery each pending-free window.
+    const ctx = makeCtx("lv10", { taskCount: 3, taskConcurrency: 3 });
+    const mid = startMission(ctx, 3);
+    const [e1, e2, e3] = execs(ctx, mid);
+    ctx.adapter.finish(String(e1!.execution_id), "COMPLETED", { execution_id: "FORGED" });
+    ctx.adapter.finish(String(e2!.execution_id), "COMPLETED");
+    ctx.adapter.finish(String(e3!.execution_id), "COMPLETED");
+    ctx.runtime.tick(mid); // e1 fault → excluded + RESULT_SCHEMA armed → return
+    const bad = ctx.store.get("executor_execution", String(e1!.execution_id));
+    expect(bad.result).toBeFalsy();
+    expect(bad.collect_excluded).toBeTruthy();
+    const rtNow = rt(ctx, mid);
+    expect(String((rtNow.pending_recovery as Record<string, unknown>).task_id))
+      .toBe(String(e1!.task_id));
+    // Siblings settle while T1's recovery is armed — no starvation.
+    ctx.runtime.tick(mid);
+    for (const e of [e2, e3]) {
+      const row = ctx.store.get("executor_execution", String(e!.execution_id));
+      expect(row.result).toBeTruthy();
+      expect(row.settled_at).toBeTruthy();
+    }
+    // Drive through the whole recovery chain — the excluded row must
+    // never re-fault, never re-mint a second RESULT_SCHEMA chain.
+    for (let i = 0; i < 30; i++) ctx.runtime.tick(mid);
+    const excluded = ctx.store.listEvidence(mid).filter(
+      (ev) => String(ev.kind) === "EXECUTION_COLLECTION_EXCLUDED",
+    );
+    expect(excluded.length).toBe(1);
+    const badAfter = ctx.store.get("executor_execution", String(e1!.execution_id));
+    expect(badAfter.result).toBeFalsy(); // forged evidence can never settle
+    // Exactly one RESULT_SCHEMA chain for T1 — a retry may mint a new
+    // execution, but the wedged row must not churn recovery.
+    const decisions = ctx.store
+      .list("recovery_decision")
+      .filter((d) => String(d.task_id) === String(e1!.task_id));
+    expect(decisions.length).toBeLessThanOrEqual(3);
+  });
+
+  it("LV-11 observe-fault bound: persistent observe throw is bounded + excluded", () => {
+    const ctx = makeCtx("lv11");
+    const mid = startMission(ctx);
+    const [e1, e2] = execs(ctx, mid);
+    const orig = ctx.adapter.observe.bind(ctx.adapter);
+    ctx.adapter.observe = (eid: string) => {
+      if (eid === String(e1!.execution_id)) throw new Error("observe blew up");
+      return orig(eid);
+    };
+    ctx.adapter.finish(String(e2!.execution_id), "COMPLETED");
+    for (let i = 0; i < 26; i++) ctx.runtime.tick(mid);
+    const row = ctx.store.get("executor_execution", String(e1!.execution_id));
+    expect(row.collect_excluded).toBeTruthy();
+    expect(Number((row.last_observation as Record<string, unknown>).observe_faults))
+      .toBeGreaterThanOrEqual(24);
+    // The faulting row never starved its sibling.
+    const e2row = ctx.store.get("executor_execution", String(e2!.execution_id));
+    expect(e2row.result).toBeTruthy();
   });
 });

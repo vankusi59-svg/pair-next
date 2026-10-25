@@ -43,8 +43,11 @@ export class ReconciliationService {
    *  the 30 s re-probe is pure churn. Unobservable re-probes are bounded:
    *  after this many tries the row gets one durable
    *  EXECUTION_ORPHAN_UNOBSERVABLE event and stops being swept — the
-   *  capacity slot stays RESERVED (fail-closed); operator acknowledgment
-   *  or a restart with the executor bound remains the release path.
+   *  capacity slot stays RESERVED (fail-closed) and the
+   *  `orphan_unobservable_final` flag is durable across restarts. The
+   *  release paths are operator `requestReconciliation` (reconcile() is
+   *  not flag-gated) or a live-mission barrier reconcile — a restart
+   *  alone does NOT resume auto-sweeping a capped row.
    *  Observable orphans (adapter present, reporting RUNNING/UNKNOWN)
    *  are NOT capped — a live remote execution must keep being probed. */
   static readonly ORPHAN_UNOBSERVABLE_RECHECK_MAX = 40;

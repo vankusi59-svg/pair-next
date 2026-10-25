@@ -90,3 +90,20 @@ observe section is reached" — unbounded under RC-A/RC-B.
 | C | `CodexCliExecutorAdapter` registered unconditionally (same pattern as DEVIN): dispatch stays fail-closed via `qualify()` without `CODEX_HOME`; observe/collect/rehydrate work env-free. Orphan sweeps get a bounded unobservable-recheck cap + single durable `EXECUTION_ORPHAN_UNOBSERVABLE` event instead of infinite 30 s churn. |
 | D | Adapters emit an `onFinished` callback → `supervisor.wake(mission, "EXECUTOR_COMPLETION")` durable wake record; collection no longer depends on wake delivery (bounded sweep remains the authority). |
 | obs | Canonical liveness stamps on `executor_execution`: `observe_count`, `last_observed_at`, `first_terminal_observed_at`, `collection_started_at`, `collection_committed_at`, `collection_attempts`, `settled_at`, `adapter_finished_at` — all persisted through the existing `gate` seam, surfaced via existing execution payloads. |
+
+## 6. Audit R1 remediation (independent review, reproduced findings)
+
+The first implementation re-created starvation *inside* the new sweep — two reproduced defects and their fixes:
+
+- **Deferred-signal starvation** (`LV-9`): the collect loop `return`ed unconditionally after `queueOrStartRecovery`, including when the signal was merely *deferred/deduped* behind an occupied `pending_recovery`. A third sibling's completed result then waited out the entire pending window (up to unbounded `WAITING_APPROVAL`). **Fix:** `queueOrStartRecovery` returns whether a fresh recovery armed; the sweep bails only then, and `continue`s on defer/dedup.
+- **Wedged-fault churn** (`LV-10`): a deterministic collect fault (malformed envelope / identity mismatch — exactly the evidence `gate.collect_execution_result` exists to reject) kept sweep eligibility forever, re-faulting every tick and re-minting a fresh `RESULT_SCHEMA` recovery every pending-free window — burning the task's retry budget while later siblings starved behind each `return`. **Fix:** deterministic (`IntegrityError`/`PolicyError`) faults now mark `collect_excluded` on the row (one durable `EXECUTION_COLLECTION_EXCLUDED` evidence entry) and route to `RESULT_SCHEMA` recovery once; the governed retry mints a **new** execution row, so the wedged row can never double-settle.
+- **Deferred-queue staleness**: `drainDeferredRecovery` prunes entries whose task reached a terminal state or whose execution already carries a committed `result` before replaying, dedups against the armed pending's `task_id`, and requeues a thrown `startRecovery` with a bounded drain counter + `DEFERRED_RECOVERY_DROPPED` evidence instead of silently losing the signal.
+- **Silent observe spins** (`LV-11`): a persistently throwing `observe` is counted on `last_observation.observe_faults` and excluded + escalated to `UNKNOWN_SIDE_EFFECT` at the same bound — no unbounded silent spin.
+- **`settled_at` semantics**: the stamp is written only after the terminal disposition is decided (validation PASS → success, terminal non-success → failure mark). A validation-rejected result never carries `settled_at` — rejected evidence is not a settled outcome.
+- **Blocking-reason write**: the `COLLECT_FAULT:<code>` hint now writes on the version-fresh row (the pre-fix write used the stale pre-observe snapshot and CAS-failed silently).
+
+Liveness guarantee as corrected: on every live runtime state, each
+unsettled, non-excluded, non-barriered execution is observed exactly
+once per tick; completing executions settle at the next tick boundary
+regardless of armed/deferred recovery, interposing failure signals, or
+persistently faulting sibling rows.
