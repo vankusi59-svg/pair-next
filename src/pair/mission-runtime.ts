@@ -1738,8 +1738,18 @@ export class MissionRuntime {
           fresh.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
           this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
         } catch { /* liveness hint is best-effort */ }
-        if (deterministic || attempts >= COLLECT_FAULT_BOUND) {
-          this.markCollectExcluded(fresh, code, deterministic ? "deterministic" : "attempt_bound");
+        // P18.3 audit R4 — a fault AFTER the canonical result committed
+        // can never re-enter the sweep: the in-flight filter keys on
+        // result==null and collection_attempts stops advancing, so the
+        // retry bound would never engage and the task would stay
+        // un-dispositioned while the row is permanently filtered out.
+        // Treat post-commit settle faults as immediately bounded.
+        if (deterministic || attempts >= COLLECT_FAULT_BOUND || fresh.result != null) {
+          this.markCollectExcluded(
+            fresh,
+            code,
+            deterministic ? "deterministic" : fresh.result != null ? "post_commit" : "attempt_bound",
+          );
           if (this.queueOrStartRecovery(
             missionId, String(e.task_id), String(e.execution_id),
             deterministic ? "RESULT_SCHEMA_FAILURE" : "UNKNOWN_SIDE_EFFECT_STATE",
@@ -1944,13 +1954,15 @@ export class MissionRuntime {
         (rt2.pending_recovery as Record<string, unknown> | null)?.task_id ?? "",
       );
       if (armedTask === String(entry.task_id)) {
-        this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
-          task_id: String(entry.task_id),
-          execution_id: entry.execution_id ?? null,
-          failure_class: String(entry.failure_class),
-          reason: "ARMED_THEN_THROW",
-          error: String((err as Error)?.message ?? err).slice(0, 200),
-        });
+        try {
+          this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+            task_id: String(entry.task_id),
+            execution_id: entry.execution_id ?? null,
+            failure_class: String(entry.failure_class),
+            reason: "ARMED_THEN_THROW",
+            error: String((err as Error)?.message ?? err).slice(0, 200),
+          });
+        } catch { /* drop evidence is best-effort; the splice is durable */ }
       } else if (attempts < 5) {
         rt2.deferred_recovery = [
           ...((rt2.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []),
@@ -1958,13 +1970,15 @@ export class MissionRuntime {
         ];
         this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
       } else {
-        this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
-          task_id: String(entry.task_id),
-          execution_id: entry.execution_id ?? null,
-          failure_class: String(entry.failure_class),
-          drain_attempts: attempts,
-          error: String((err as Error)?.message ?? err).slice(0, 200),
-        });
+        try {
+          this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+            task_id: String(entry.task_id),
+            execution_id: entry.execution_id ?? null,
+            failure_class: String(entry.failure_class),
+            drain_attempts: attempts,
+            error: String((err as Error)?.message ?? err).slice(0, 200),
+          });
+        } catch { /* drop evidence is best-effort; the splice is durable */ }
       }
     }
   }

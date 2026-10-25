@@ -592,4 +592,48 @@ describe("P18.3 — collection liveness", () => {
     // governed decision until the escalation ceiling.
     expect(decisions().length).toBeGreaterThanOrEqual(2);
   });
+
+  it("LV-14 post-commit settle fault exits sweep once AND hands the task to recovery (audit R4)", async () => {
+    const ctx = makeCtx("lv14", { taskCount: 1 });
+    const mid = startMission(ctx);
+    const e1 = execs(ctx, mid)[0]!;
+    // Fault AFTER the canonical result commits: collect succeeds, then
+    // the first updateTask(COMPLETED) throws. The row can never re-enter
+    // the sweep (result!=null filter) — without the post-commit bound
+    // the task would sit un-dispositioned forever.
+    const origUpdate = ctx.service.updateTask.bind(ctx.service);
+    let threw = false;
+    ctx.service.updateTask = ((taskId: string, patch: Record<string, unknown>) => {
+      if (!threw && patch.status === "COMPLETED") {
+        threw = true;
+        throw new Error("injected post-commit settle fault");
+      }
+      return origUpdate(taskId, patch);
+    }) as typeof ctx.service.updateTask;
+    ctx.adapter.finish(String(e1.execution_id), "COMPLETED");
+    ctx.runtime.tick(mid); // collect commits result → settle throws
+    const row = ctx.store.get("executor_execution", String(e1.execution_id));
+    expect(row.result).toBeTruthy(); // committed BEFORE the fault
+    expect(row.collect_excluded).toBeTruthy();
+    expect(String((row.collect_excluded as Record<string, unknown>).reason)).toBe("post_commit");
+    // The failure is a governed signal, not a silent strand — recovery
+    // armed, deferred, or already decided for the task.
+    const r = rt(ctx, mid);
+    const signalled =
+      r.pending_recovery != null ||
+      ((r.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []).some(
+        (d) => String(d.task_id) === String(e1.task_id),
+      ) ||
+      ctx.store
+        .list("recovery_decision")
+        .some((d) => String(d.task_id) === String(e1.task_id));
+    expect(signalled).toBe(true);
+    expect(threw).toBe(true);
+    // And the mission is not parked RUNNING with nothing armed.
+    const parkedDead =
+      String(r.state) === "RUNNING" &&
+      !r.pending_recovery &&
+      !signalled;
+    expect(parkedDead).toBe(false);
+  });
 });
