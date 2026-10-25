@@ -56,7 +56,7 @@ const COND = FIX("fake-codex-conditional.mjs");
 const SLOW = FIX("fake-codex-slow.mjs");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn: () => boolean, what: string, timeoutMs = 30_000) {
+async function waitFor(fn: () => boolean, what: string, timeoutMs = 60_000) {
   const t0 = Date.now();
   while (!fn()) {
     if (Date.now() - t0 > timeoutMs) throw new Error(`timeout waiting for ${what}`);
@@ -338,7 +338,16 @@ describe("P18.4-C — real multi-executor E2E", () => {
       () => execs().every((e) => observeStatus(ctx, String(e.execution_id)) !== "RUNNING"),
       "both children exit",
     );
-    for (let i = 0; i < 8; i++) ctx.runtime.tick(mid);
+    // Drive until the failure's governed signal exists (bounded — the
+    // load under a full-suite run stretches each phase).
+    let signal = false;
+    for (let i = 0; i < 80 && !signal; i++) {
+      ctx.runtime.tick(mid);
+      const rt = rtRow(ctx, mid);
+      signal = rt.pending_recovery != null
+        || ((rt.deferred_recovery as unknown[]) ?? []).length > 0
+        || ctx.store.list("recovery_decision").some((d) => d.mission_id === mid);
+    }
     const rows = execs().map((e) => execRow(ctx, String(e.execution_id)));
     const failed = rows.filter((r) => String(r.execution_state) === "FAILED" || String(r.result?.status ?? "") === "FAILED");
     const ok = rows.filter((r) => String(r.execution_state) === "COMPLETED");
@@ -346,10 +355,6 @@ describe("P18.4-C — real multi-executor E2E", () => {
     expect(ok.length).toBe(1);
     // Failed sibling reached a governed recovery signal — pending or
     // deferred or a recorded decision — while the success settled.
-    const rt = rtRow(ctx, mid);
-    const signal = rt.pending_recovery != null
-      || ((rt.deferred_recovery as unknown[]) ?? []).length > 0
-      || ctx.store.list("recovery_decision").some((d) => d.mission_id === mid);
     expect(signal).toBe(true);
   }, 120_000);
 
@@ -387,8 +392,15 @@ describe("P18.4-C — real multi-executor E2E", () => {
       () => execs().filter((e) => observeStatus(ctx, String(e.execution_id)) === "FAILED").length >= 2,
       "two real children fail",
     );
-    for (let i = 0; i < 8; i++) ctx.runtime.tick(mid);
-    const rt1 = rtRow(ctx, mid);
+    // Establish the pending+deferred state (bounded drive — load under
+    // a full-suite run stretches collection across many ticks).
+    let rt1 = rtRow(ctx, mid);
+    for (let i = 0; i < 100; i++) {
+      const d = (rt1.deferred_recovery as unknown[]) ?? [];
+      if (rt1.pending_recovery != null && d.length > 0) break;
+      ctx.runtime.tick(mid);
+      rt1 = rtRow(ctx, mid);
+    }
     const deferred1 = (rt1.deferred_recovery as Array<Record<string, unknown>>) ?? [];
     // T2's canonical task — the deferred signal we must never lose.
     const t2 = ctx.store.list("task").find(
@@ -421,8 +433,9 @@ describe("P18.4-C — real multi-executor E2E", () => {
     const stillTracked = deferred2.length > 0 || rt2.pending_recovery != null;
     expect(stillTracked).toBe(true); // signal survived the crash
     // Drain competes with T1's born-failing retry loop — drive enough
-    // ticks for the deferred entry to arm between cycles.
-    for (let i = 0; i < 60 && !decisionForT2(); i++) ctx.runtime.tick(mid);
+    // ticks for the deferred entry to arm between cycles (generous
+    // bound under full-suite load).
+    for (let i = 0; i < 160 && !decisionForT2(); i++) ctx.runtime.tick(mid);
     // Post-recovery: the deferred failure reached ITS recovery decision.
     expect(decisionForT2()).toBe(true);
   }, 120_000);

@@ -517,7 +517,9 @@ export interface ExecutionHealthRow {
     collection_attempts: number;
     collection_committed_at: string | null;
     collect_excluded: Record<string, unknown> | null;
-    terminal_outcome: Record<string, unknown> | null;
+    // Writers store strings ("RECONCILED_*", "OPERATOR_ACCEPTED_*"),
+    // not objects — kept as unknown so the UI never assumes a shape.
+    terminal_outcome: unknown;
     dispatch_timestamp: string | null;
     run_root: string | null;
     orphan_unobservable: { final: boolean; count: number } | null;
@@ -587,7 +589,7 @@ export interface MissionOperations {
 /* GET /api/operations — bounded aggregate rollup over canonical rows. */
 export interface OperationsOverview {
   operations: {
-    missions_running: number;
+    missions_active: number;
     missions_paused: number;
     executions_awaiting_collection: number;
     executions_committed_unsettled: number;

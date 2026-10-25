@@ -227,6 +227,7 @@ export function MissionDetailPage() {
               && e.derived !== null && typeof e.derived === "object"
               && typeof e.derived.stage === "string"
               && Array.isArray(e.derived.abnormal)
+              && e.derived.latency_ms !== null && typeof e.derived.latency_ms === "object" && !Array.isArray(e.derived.latency_ms)
               && Array.isArray(e.unknowns));
           return ok ? { kind: "ready" as const, data: mo } : { kind: "unavailable" as const, code: "MALFORMED" };
         }

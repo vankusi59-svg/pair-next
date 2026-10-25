@@ -95,7 +95,12 @@ export class MissionObservability {
   executionHealth(missionId: string): { executions: Array<Record<string, unknown>> } {
     const rows = this.store
       .list("executor_execution")
-      .filter((e) => e.mission_id === missionId);
+      .filter((e) => e.mission_id === missionId)
+      .sort((a, b) =>
+        String(a.dispatch_timestamp ?? "").localeCompare(
+          String(b.dispatch_timestamp ?? ""),
+        ),
+      );
     const executions = rows.map((e) => {
       const obs = (e.last_observation as Record<string, unknown> | undefined) ?? {};
       const persisted = {
@@ -118,6 +123,9 @@ export class MissionObservability {
           : null,
       };
       const observed = {
+        // Facts ABOUT observation — canonical row stamps describing the
+        // observe lifecycle plus sanitized adapter-reported fields. The
+        // bucket is "what the system saw", never a canonical verdict.
         last_status: obs.status ?? null,
         last_observed_at: e.last_observed_at ?? null,
         observe_count: Number(e.observe_count ?? 0),
@@ -220,9 +228,18 @@ export class MissionObservability {
       ((rt?.barriers as Record<string, Record<string, unknown>> | undefined) ?? {});
     const receipts = this.store
       .list("reconciliation_receipt")
-      .filter((r) => String((r.inputs as Record<string, unknown> | undefined)?.mission_id ?? "") === missionId);
+      .filter((r) => String((r.inputs as Record<string, unknown> | undefined)?.mission_id ?? "") === missionId)
+      .sort((a, b) =>
+        String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")),
+      );
+    const pendingApprovals = this.store
+      .list("approval_request")
+      .filter((a) => a.mission_id === missionId && a.status === "PENDING");
     return {
+      // Request-echo scope marker (the UI validates it against the URL)
+      // — NOT a canonical fact; mission_exists is the evidenced claim.
       mission_id: missionId,
+      mission_exists: this.store.tryGet("mission", missionId) != null,
       runtime_state: rt ? String(rt.state) : null,
       pending_recovery: rt?.pending_recovery ?? null,
       deferred_recovery:
@@ -243,9 +260,7 @@ export class MissionObservability {
           status: a.status,
           due_at: a.due_at,
         })),
-      approvals_pending: this.store
-        .list("approval_request")
-        .filter((a) => a.mission_id === missionId && a.status === "PENDING"),
+      approvals_pending: pendingApprovals,
       decisions: this.store
         .list("recovery_decision")
         .filter((d) => d.mission_id === missionId),
@@ -256,7 +271,7 @@ export class MissionObservability {
       // Legitimate next actions — derived from canonical state only;
       // the UI must not invent operations beyond these seams.
       allowed_actions: {
-        decide_approval: true, // existing /api/approvals/:id/decide
+        decide_approval: pendingApprovals.length > 0, // existing approval endpoints
         request_reconciliation:
           Object.values(barriers).some((b) => b.settled !== true) ||
           this.store
@@ -282,11 +297,16 @@ export class MissionObservability {
     const execs = this.store.list("executor_execution");
     const TERMINAL_RT = new Set(["COMPLETED", "FAILED", "CANCELLED", "ABORTED"]);
     const TERMINAL_EXEC = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
+    // "Awaiting collection" = terminal-evidenced but result not yet
+    // committed — collection DEBT, not healthy in-flight work (audit
+    // R1-B M1: the sweep-eligibility set is wider than the debt set).
     const awaitingCollection = execs.filter(
       (e) =>
         e.result == null &&
         !e.terminal_outcome &&
-        e.collect_excluded == null,
+        e.collect_excluded == null &&
+        (TERMINAL_EXEC.has(String(e.execution_state)) ||
+          e.first_terminal_observed_at != null),
     );
     const committedUnsettled = execs.filter(
       (e) => e.result != null && e.settle_complete !== true && e.collect_excluded == null,
@@ -316,7 +336,10 @@ export class MissionObservability {
     });
     const workItems = this.store.list("work_item");
     return {
-      missions_running: runtimes.filter(
+      // Runtime-row count in ANY supervised live state — deliberately
+      // named differently from metrics().missions_running (which counts
+      // mission.status) so the two surfaces can never be conflated.
+      missions_active: runtimes.filter(
         (r) => !TERMINAL_RT.has(String(r.state)) && String(r.state) !== "PAUSED",
       ).length,
       missions_paused: runtimes.filter((r) => String(r.state) === "PAUSED").length,
@@ -331,11 +354,14 @@ export class MissionObservability {
       executions_orphan_unobservable: execs.filter(
         (e) => e.orphan_unobservable_final === true,
       ).length,
+      // "Never observed" = zero SUCCESSFUL observes — the canonical
+      // observe_count, matching the per-row NEVER_OBSERVED flag. A row
+      // whose only observations faulted counts here too (audit R1-B M2).
       executions_never_observed: execs.filter(
         (e) =>
           !TERMINAL_EXEC.has(String(e.execution_state)) &&
           !e.terminal_outcome &&
-          !e.last_observation,
+          Number(e.observe_count ?? 0) === 0,
       ).length,
       recovery_blocked_or_escalated: exhaustion.length,
       work_items_blocked: workItems.filter(

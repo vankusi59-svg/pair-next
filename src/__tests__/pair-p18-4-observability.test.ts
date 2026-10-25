@@ -332,8 +332,19 @@ describe("P18.4-B — recovery operations projection", () => {
     const rtRow = ctx.store.get("mission_runtime", `MRT_${mid}`) as Record<string, unknown>;
     expect(deferred.length).toBe((rtRow.deferred_recovery as unknown[]).length);
     const allowed = ops.allowed_actions as Record<string, unknown>;
-    expect(allowed.decide_approval).toBe(true);
+    // decide_approval is evidence-gated: no pending approvals → false.
+    expect(allowed.decide_approval).toBe(false);
     expect(allowed.lifecycle).toBe(true);
+    // Minting a pending approval flips the seam to true.
+    ctx.store.put("approval_request", "APR_OPS1", {
+      approval_id: "APR_OPS1",
+      mission_id: mid,
+      status: "PENDING",
+      kind: "RECOVERY",
+    });
+    const ops2 = ctx.observability.recoveryOps(mid) as Record<string, unknown>;
+    expect((ops2.allowed_actions as Record<string, unknown>).decide_approval).toBe(true);
+    expect((ops2.approvals_pending as unknown[]).length).toBe(1);
     // decisions + attempts are canonical rows for THIS mission.
     const decisions = ops.decisions as Array<Record<string, unknown>>;
     expect(decisions.every((d) => d.mission_id === mid)).toBe(true);
@@ -357,7 +368,7 @@ describe("P18.4-B — operations overview rollup", () => {
     const mid = startMission(ctx);
     const es = execs(ctx, mid);
     const before = ctx.observability.operationsOverview() as Record<string, unknown>;
-    expect(Number(before.missions_running)).toBeGreaterThanOrEqual(0);
+    expect(Number(before.missions_active)).toBeGreaterThanOrEqual(0);
     ctx.adapter.finish(String(es[0]!.execution_id), "FAILED");
     ctx.adapter.finish(String(es[1]!.execution_id), "FAILED");
     ctx.runtime.tick(mid);

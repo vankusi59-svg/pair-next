@@ -222,9 +222,9 @@ function RecoveryExplorer() {
    reading — mission pressure, collection/settlement debt, recovery
    backlog, open barriers, approvals, liveness incident classes. */
 const OPS_COUNTS: Array<[string, string]> = [
-  ["missions_running", "missions running"],
+  ["missions_active", "active supervised missions"],
   ["missions_paused", "missions paused"],
-  ["executions_awaiting_collection", "executions awaiting collection"],
+  ["executions_awaiting_collection", "terminal-observed, unsettled"],
   ["executions_committed_unsettled", "executions committed unsettled"],
   ["recoveries_active", "recoveries active"],
   ["recoveries_deferred", "recoveries deferred"],
