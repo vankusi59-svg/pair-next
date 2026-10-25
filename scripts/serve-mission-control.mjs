@@ -104,6 +104,7 @@ import {
   makeReplanGenerationDriver,
   replanWorkItemId,
   makeServePlanner,
+  plannerAdaptiveRetryForWorkItem,
   plannerExecutorCapSets,
   assertCodexOnlyPlannerRoute,
   assertCodexCliPlannerTransport,
@@ -1001,9 +1002,11 @@ const invokePlannerPool = ({
   deadlineAt,
   replanContext,
   externalInputArtifacts,
+  priorRejectionContext,
 }) =>
   runPlannerFailover({
     candidates,
+    ...(priorRejectionContext ? { priorRejectionContext } : {}),
     // §9 — full canonical eligibility re-proved before EVERY invocation
     // (role still held, model usable, provider still eligible, never a
     // DSH_EXECUTION model/alias borrowed into planning).
@@ -1220,6 +1223,7 @@ const planExpander = async (input, expandCtx) => {
       projectId: input.project_id != null ? String(input.project_id) : undefined,
       deadlineAt,
       externalInputArtifacts,
+      priorRejectionContext: expandCtx?.prior_rejection ?? undefined,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
@@ -1302,6 +1306,34 @@ const runReplanPoolGeneration = async (gen) => {
   const externalInputs =
     service.artifactResolver.listEligibleExternalInputSources(mission);
   const candidates = dedupePlannerCandidates(plannerCandidates);
+  /* P18.2 — a replan run attributes to the SAME delegated work item
+     (bound_open_id → work_open_binding), so its rejection history
+     counts toward the same adaptive episode. Enforce the identical
+     contract as the delegated open edge BEFORE minting planner_run or
+     reservation: exhausted → durable marker + typed fail-closed with
+     zero spend; otherwise the newest terminal rejection rides the
+     INITIAL invocations as PRIOR_RUN feedback. */
+  const replanWi = replanWorkItemId(store, mission);
+  const adaptive = replanWi
+    ? plannerAdaptiveRetryForWorkItem(store, replanWi)
+    : null;
+  if (adaptive?.exhausted) {
+    store.event({
+      entity_type: "work_item",
+      entity_id: replanWi,
+      event_type: "PLANNER_VALIDATION_RETRY_EXHAUSTED",
+      new_state: null,
+      actor: "PAIR_REPLAN_GENERATION",
+      metadata: {
+        rejected_run_count: adaptive.rejected_run_count,
+        last_planner_run_id: adaptive.source?.planner_run_id ?? null,
+      },
+    });
+    throw new PolicyError(
+      "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
+      `work_item ${replanWi}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,
+    );
+  }
   const run = beginPlannerRun(store, {
     project_id: mission.project_id != null ? String(mission.project_id) : undefined,
     operator_id: mission.operator_id,
@@ -1330,7 +1362,7 @@ const runReplanPoolGeneration = async (gen) => {
     // broken lineage or a cap breach fails closed BEFORE any model call.
     admission = service.cost.admitPlannerInvocation({
       planner_run_id: String(run.planner_run_id),
-      work_item_id: replanWorkItemId(store, mission),
+      work_item_id: replanWi,
       est_microusd: candidates.reduce((sum, c) => {
         const bound = service.cost.plannerRequestBoundMicrousd(c);
         return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
@@ -1350,6 +1382,7 @@ const runReplanPoolGeneration = async (gen) => {
       deadlineAt,
       replanContext: gen.replan_context,
       externalInputArtifacts: externalInputs,
+      priorRejectionContext: adaptive?.context ?? undefined,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),

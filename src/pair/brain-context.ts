@@ -56,6 +56,7 @@
  */
 import { IntegrityError } from "./errors.js";
 import { digest, utcnow } from "./canonical.js";
+import { isValidationRejectedAttempt } from "./planner-adaptive-retry.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { Row } from "./routine-mirror.js";
 import {
@@ -189,6 +190,11 @@ export interface PlannerRejectionEntry {
   validation_codes: string[];
   reask_attempted: boolean;
   task_hints: string[];
+  /** P18.2 — this attempt's run consumed PRIOR-run rejection feedback
+   *  (PRIOR_REJECTION: marker durable on the settled row). Lets ops
+   *  compare fed-back code vs resulting validation_codes — adaptation
+   *  tracking without a new table. */
+  feedback_informed: boolean;
   completed_at: string | null;
 }
 
@@ -217,15 +223,9 @@ export function plannerEvidenceForObjective(
     const run = String(a.planner_run_id);
     attemptCountByRun.set(run, (attemptCountByRun.get(run) ?? 0) + 1);
   }
-  const isValidationRejected = (a: Record<string, unknown>): boolean => {
-    if (String(a.outcome ?? "") !== "FAILED") return false;
-    const warns = Array.isArray(a.warnings) ? (a.warnings as string[]) : [];
-    return (
-      String(a.failure_class ?? "") === "PLAN_INVALID" ||
-      warns.some((w) => w.startsWith("VALIDATION_CODE:") || w.startsWith("REASK:"))
-    );
-  };
-  const rejectedRows = attempts.filter(isValidationRejected);
+  /* Shared canonical predicate (planner-adaptive-retry) — CEO evidence
+     and adaptive-retry cap accounting can never drift apart. */
+  const rejectedRows = attempts.filter(isValidationRejectedAttempt);
   /* Sort + bound on cheap persisted fields BEFORE enrichment — one
      tryGet per survivor only (run lookups cached per planner_run_id). */
   rejectedRows.sort((x, y) =>
@@ -270,6 +270,7 @@ export function plannerEvidenceForObjective(
       validation_codes: codes,
       reask_attempted: warns.some((w) => w.startsWith("REASK:")),
       task_hints: taskHints,
+      feedback_informed: warns.some((w) => w.startsWith("PRIOR_REJECTION:")),
       completed_at: a.completed_at != null ? String(a.completed_at) : null,
     };
   };

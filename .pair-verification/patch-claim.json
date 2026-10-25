@@ -1,20 +1,19 @@
 {
-  "claim_id": "P18_1_OPERATOR_CONTROL_CENTER",
-  "title": "P18.1 Operator Control Center — owner-facing HTTP seams + Mission Control UI over canonical P18 substrate",
+  "claim_id": "P18_2_PLANNER_ADAPTIVE_RETRY",
+  "title": "P18.2 Planner Adaptive Retry — cross-run canonical rejection feedback into the next delegated planFn INITIAL",
   "affected_surfaces": [
+    "PLANNER",
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "UI",
-    "DEV_INFRA",
-    "RECOVERY_REPLAY"
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-1-operator-seams.test.ts",
+    "src/__tests__/pair-p18-2-planner-adaptive-retry.test.ts",
     "src/__tests__/pair-p18-1-planner-feedback-brief.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001"
   ],
-  "description": "Owner-facing management of the canonical P18 substrate through Mission Control: (1) P18.1-A owner-scoped HTTP seams — objective relations (list/create/advisory-preview/lifecycle), org-agent duties, objective transitions narrowed to PAUSE/RESUME/CANCEL (ACHIEVED stays behind review-signoff), per-objective + business ops observability, canonical integrity probe. All mutations delegate to canonical services; actor derives only from x-operator-id. (2) P18.1-B..F UI — ObjectiveRelations, AgentDuties, CompanyRelations graph, ObjectiveOpsMonitor (queue/lease/reasons/NOT_OBSERVED honesty); IntegrityError surfaced as UNPROVEN:<code>, never masked. (3) docs/e2e-v181/p181-live.mjs real-browser E2E: 39/39 PASS. (4) Planner validation-feedback into the CEO ReasoningBrief: bounded `planner` BrainContext section (cost_reservation lineage -> settled planner_attempt rows; VALIDATION_CODE/REASK/DROP_/DEP_/REPAIRED_ sanitized markers only; <=3 newest-first, <=4 codes, <=8 hints, honest all-time counts) feeding PLANNER_RUN_SUMMARY + PLAN_VALIDATION_REJECTION CANONICAL facts + PLANNER_VALIDATION_REPEATING hypothesis. Advisory enrichment only — rides brief_digest -> observation_digest; zero new authority. (5) work-completion wedge fix: live-executions check excludes terminal_outcome rows (e.g. OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY), aligning with mission-runtime — owner-neutralized UNKNOWN executions no longer wedge objectives as WORK_PROVENANCE_CORRUPT.",
+  "description": "A plan rejected by canonical validation previously parked the work item with zero learning. This adds cross-run adaptive retry: (1) planner-adaptive-retry.ts — pure-read plannerAdaptiveRetryForWorkItem deriving the newest terminal validation rejection for a work item from cost_reservation lineage + settled planner_attempt rows (VALIDATION_CODE/REASK/DROP_/DEP_/REPAIRED_ sanitized markers only, charset+length bounded; WINNER_SELECTED ends the episode; RUNNING residue skipped; transport/eligibility failures never count); cap PLANNER_VALIDATION_REPAIR_MAX=2 repair runs. (2) planner-pool.ts — priorRejectionContext opt re-validated defensively, fed to every candidate's INITIAL invocation (origin PRIOR_RUN), PRIOR_REJECTION:<code> marker protected and merged into all settles. (3) plan-preview.ts — bounded record warnings persist on STARTED rows. (4) business.ts — prepareDelegatedPlan throws FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED (typed PolicyError + durable work_item event) before minting a run when exhausted; forwards prior_rejection in expandCtx. (5) serve-mission-control.mjs threads expandCtx.prior_rejection into runPlannerFailover. (6) llm-planner.ts — PlannerRejectionContext.origin + PRIOR_RUN prompt phrasing (same sanitize bounds). (7) brain-context/reasoning-brief — feedback_informed telemetry on existing planner section/facts. Zero new authority; corrected plans pass the identical canonicalize+validation path; no executor dispatch before validation.",
   "risk_override": "HIGH"
 }
