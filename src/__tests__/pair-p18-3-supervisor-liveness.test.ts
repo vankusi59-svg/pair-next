@@ -64,6 +64,10 @@ class ScriptedAdapter implements ExecutorAdapter {
   dispatched: Array<{ execution_id: string; task: Record<string, unknown> }> = [];
   private states = new Map<string, { status: string; result?: Record<string, unknown> }>();
   observeCalls = new Map<string, number>();
+  /** When set, every dispatch is born terminal with this status and a
+   *  committed-style result — exercises the settle-inside-apply path
+   *  (recovery retry/reroute dispatch that is already terminal). */
+  bornStatus: string | null = null;
   constructor(id: string) {
     this.executor_id = id;
   }
@@ -82,6 +86,15 @@ class ScriptedAdapter implements ExecutorAdapter {
   dispatch(task: Record<string, unknown>) {
     const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
     this.dispatched.push({ execution_id: eid, task });
+    if (this.bornStatus) {
+      this.finish(eid, this.bornStatus);
+      return {
+        execution_id: eid,
+        status: this.bornStatus,
+        run_root: `/runs/${eid}`,
+        workspace: task.workspace,
+      };
+    }
     this.states.set(eid, { status: "RUNNING" });
     return {
       execution_id: eid,
@@ -548,5 +561,35 @@ describe("P18.3 — collection liveness", () => {
     // The faulting row never starved its sibling.
     const e2row = ctx.store.get("executor_execution", String(e2!.execution_id));
     expect(e2row.result).toBeTruthy();
+  });
+
+  it("LV-13 apply-path settle continues the chain — terminal retry dispatch arms successor (audit R3)", async () => {
+    const ctx = makeCtx("lv13", { taskCount: 1 });
+    // Every dispatch is born terminal-FAILED: the RETRY apply's inline
+    // settle lands while the chain's own pending is still armed. The
+    // successor decision must replace the spent arm — a dedup-drop
+    // leaves task FAILED + pending null + RUNNING forever (the 4017d53
+    // regression the phase-d suite caught).
+    ctx.adapter.bornStatus = "FAILED";
+    const mid = startMission(ctx);
+    const decisions = () =>
+      ctx.store
+        .list("recovery_decision")
+        .filter((d) => String(d.mission_id) === mid);
+    const stalled = () =>
+      String(rt(ctx, mid).state) === "RUNNING" &&
+      !rt(ctx, mid).pending_recovery &&
+      String(ctx.store.get("task", String(execs(ctx, mid)[0]!.task_id)).status) === "FAILED";
+    // RETRY arms carry real-clock backoff (~1s) — poll with real sleep
+    // so scheduled actions can fire, as in LV-12.
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline && decisions().length < 2 && !stalled()) {
+      ctx.runtime.tick(mid);
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    expect(stalled()).toBe(false);
+    // The chain kept deciding: each retry-minted failure produced a new
+    // governed decision until the escalation ceiling.
+    expect(decisions().length).toBeGreaterThanOrEqual(2);
   });
 });

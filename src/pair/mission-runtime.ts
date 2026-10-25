@@ -1486,14 +1486,15 @@ export class MissionRuntime {
         request = this.requestFor(mission, task);
       } catch (err) {
         if (err instanceof DependencyResolutionError) {
-          this.startRecovery(
+          // Routed through queueOrStartRecovery: a pending armed for
+          // ANOTHER task owns the recovery slot — this failure defers
+          // instead of clobbering it (audit R2 follow-up).
+          this.queueOrStartRecovery(
             missionId,
             String(task.task_id),
             null,
             "DEPENDENCY_FAILURE",
             now,
-            undefined,
-            undefined,
             {
               dependency_resolution_error: `${err.code}:${err.message}`,
               dependency_reason: err.dependency_reason,
@@ -1517,14 +1518,12 @@ export class MissionRuntime {
         ),
       );
       if (missing) {
-        this.startRecovery(
+        this.queueOrStartRecovery(
           missionId,
           String(task.task_id),
           null,
           "DEPENDENCY_FAILURE",
           now,
-          undefined,
-          undefined,
           {
             missing_artifact: missing,
             dependency_reason: "LOCAL_PREREQUISITE_MISSING",
@@ -1563,14 +1562,14 @@ export class MissionRuntime {
         // Dispatch-time routing failures carry no execution row — the executor
         // the route selection failed on still becomes bounded re-route
         // evidence so RE_ROUTE excludes it instead of re-selecting it.
-        this.startRecovery(
+        // queueOrStartRecovery: a pending armed for another task owns the
+        // recovery slot — defer rather than clobber (audit R2 follow-up).
+        this.queueOrStartRecovery(
           missionId,
           String(task.task_id),
           null,
           failureClass,
           now,
-          undefined,
-          undefined,
           {
             failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
           },
@@ -1797,34 +1796,54 @@ export class MissionRuntime {
     failureClass: ReturnType<typeof classifyFailure>,
     now?: string,
     extra?: Parameters<MissionRuntime["startRecovery"]>[7],
+    /** The armed pending for THIS task is the chain's consumed arm —
+     *  the apply currently dispatching it (RETRY/RE_ROUTE minted this
+     *  execution; a reconcile-barrier outcome is settling its own
+     *  execution) already spent it. A terminal settle here is the
+     *  chain's NEXT link, not a duplicate signal: the fresh decision
+     *  must replace the spent arm (pre-P18.3 semantics — the post-apply
+     *  close-out checks recovery_id precisely so a successor arm
+     *  survives). Only settles inside an apply pass true. */
+    sameChainContinuation = false,
   ): boolean {
     const rt = this.runtimeEntity(missionId);
     if (rt.pending_recovery) {
+      const sameTask =
+        String(
+          (rt.pending_recovery as Record<string, unknown>).task_id ?? "",
+        ) === taskId;
       // A second signal for the SAME task whose recovery is already
       // armed carries no new authority — drop it rather than queue a
-      // self-duplicate the drain would replay.
-      if (String((rt.pending_recovery as Record<string, unknown>).task_id ?? "") === taskId) return false;
-      const deferred =
-        (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
-      if (!deferred.some((d) => String(d.task_id) === taskId)) {
-        rt.deferred_recovery = [
-          ...deferred,
-          {
-            task_id: taskId,
-            execution_id: executionId,
-            failure_class: failureClass,
-            extra: extra ?? null,
-            queued_at: utcnow(),
-          },
-        ];
-        this.store.put(
-          "mission_runtime",
-          String(rt.mission_runtime_id),
-          rt,
-          Number(rt.version),
-        );
+      // self-duplicate the drain would replay. A same-task settle from
+      // INSIDE the apply that consumed the arm is exempt.
+      if (sameTask && !sameChainContinuation) return false;
+      if (sameTask) {
+        // Fall through to startRecovery: it overwrites the spent arm
+        // with the fresh decision (new recovery_id), which the
+        // post-apply close-out deliberately leaves in place.
+      } else {
+        const deferred =
+          (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+        if (!deferred.some((d) => String(d.task_id) === taskId)) {
+          rt.deferred_recovery = [
+            ...deferred,
+            {
+              task_id: taskId,
+              execution_id: executionId,
+              failure_class: failureClass,
+              extra: extra ?? null,
+              queued_at: utcnow(),
+            },
+          ];
+          this.store.put(
+            "mission_runtime",
+            String(rt.mission_runtime_id),
+            rt,
+            Number(rt.version),
+          );
+        }
+        return false;
       }
-      return false;
     }
     this.startRecovery(
       missionId,
@@ -1952,7 +1971,15 @@ export class MissionRuntime {
 
   /* ---------------- settle + recovery entry ------------------------------- */
 
-  private settleExecution(missionId: string, executionId: string): void {
+  private settleExecution(
+    missionId: string,
+    executionId: string,
+    /** Forwarded to queueOrStartRecovery — true ONLY for settles inside a
+     *  recovery apply (retry/reroute dispatch born terminal; reconcile
+     *  barrier outcome settling its own execution), where the armed
+     *  same-task pending is the spent arm the fresh decision replaces. */
+    sameChainContinuation = false,
+  ): void {
     const execution = this.store.get("executor_execution", executionId);
     const adapter = this.deps.adapters.get(String(execution.executor_id));
     if (!adapter) {
@@ -2030,6 +2057,7 @@ export class MissionRuntime {
                     ? check.violation.code
                     : null,
               },
+              sameChainContinuation,
             );
             return;
           }
@@ -2110,6 +2138,7 @@ export class MissionRuntime {
             consumer_task_id: taskId,
             source_code: "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE",
           },
+          sameChainContinuation,
         );
         return;
       }
@@ -2118,6 +2147,9 @@ export class MissionRuntime {
         taskId,
         executionId,
         "ARTIFACT_VALIDATION_FAILURE",
+        undefined,
+        undefined,
+        sameChainContinuation,
       );
       return;
     }
@@ -2134,7 +2166,15 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.queueOrStartRecovery(missionId, taskId, executionId, failureClass);
+    this.queueOrStartRecovery(
+      missionId,
+      taskId,
+      executionId,
+      failureClass,
+      undefined,
+      undefined,
+      sameChainContinuation,
+    );
   }
 
   /**
@@ -2670,7 +2710,10 @@ export class MissionRuntime {
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
-          this.settleExecution(missionId, String(execution.execution_id));
+          // Settle INSIDE the apply: the armed same-task pending is this
+          // chain's spent arm — a terminal retry dispatch must arm the
+          // NEXT decision, not be deduped away (audit R3).
+          this.settleExecution(missionId, String(execution.execution_id), true);
         }
         // Only close the apply when THIS chain's pending is still the
         // active one. A terminal settle inside the arm may have spawned a
@@ -2708,7 +2751,7 @@ export class MissionRuntime {
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
-          this.settleExecution(missionId, String(execution.execution_id));
+          this.settleExecution(missionId, String(execution.execution_id), true);
         }
         const rtAfterReroute = this.runtimeEntity(missionId);
         const pendingAfterReroute = rtAfterReroute.pending_recovery as
@@ -3799,7 +3842,10 @@ export class MissionRuntime {
           barrier.settled = true;
           this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
           const execId = String(barrier.execution_id ?? "");
-          if (execId) this.settleExecution(missionId, execId);
+          // Barrier outcome settling its own execution inside the
+          // RECONCILIATION_REQUIRED arm — same chain-continuation rule
+          // as retry/reroute apply settles (audit R3).
+          if (execId) this.settleExecution(missionId, execId, true);
           this.transitionRuntime(missionId, "RUNNING", "reconcile_completed");
           return;
         }
@@ -3807,7 +3853,7 @@ export class MissionRuntime {
           barrier.settled = true;
           this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
           const execId = String(barrier.execution_id ?? "");
-          if (execId) this.settleExecution(missionId, execId);
+          if (execId) this.settleExecution(missionId, execId, true);
           this.transitionRuntime(missionId, "RECOVERING", "reconcile_failed");
           return;
         }
