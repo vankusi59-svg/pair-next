@@ -66,7 +66,19 @@ export class PairNativeExecutorAdapter implements ExecutorAdapter {
   readonly worker_kind = AUTOMATON_HARNESS_WORKER_KIND;
   private readonly executions = new Map<string, Record<string, unknown>>();
 
-  constructor(private readonly runner: PairNativeWorkerRunner) {}
+  constructor(
+    private readonly runner: PairNativeWorkerRunner,
+    /** P18.3 — best-effort completion notification fired when the worker
+     *  exit callback first settles a terminal status. Collection never
+     *  depends on it; the bounded sweep remains the authority. */
+    private readonly onFinished?: (info: {
+      execution_id: string;
+      mission_id: string | null;
+      task_id: string | null;
+      status: string;
+      finished_at: string | null;
+    }) => void,
+  ) {}
 
   probe(): Record<string, unknown> {
     const ok = this.runner.journalRootAvailable();
@@ -311,6 +323,17 @@ export class PairNativeExecutorAdapter implements ExecutorAdapter {
         if (rec && rec.status === "RUNNING") {
           rec.status = status;
           rec.finished_at = utcnow();
+          try {
+            this.onFinished?.({
+              execution_id: executionId,
+              mission_id: rec.mission_id != null ? String(rec.mission_id) : null,
+              task_id: rec.task_id != null ? String(rec.task_id) : null,
+              status,
+              finished_at: String(rec.finished_at),
+            });
+          } catch {
+            /* wake hint is best-effort */
+          }
         }
       },
     });

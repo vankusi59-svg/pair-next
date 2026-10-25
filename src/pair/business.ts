@@ -97,7 +97,10 @@ import {
   proveWorkItemComplete,
   rejectedCompletionBases,
 } from "./work-completion.js";
-import { plannerAdaptiveRetryForWorkItem } from "./planner-adaptive-retry.js";
+import {
+  emitPlannerValidationRetryExhausted,
+  plannerAdaptiveRetryForWorkItem,
+} from "./planner-adaptive-retry.js";
 import type { PlannerRejectionContext } from "./llm-planner.js";
 
 export const WORK_ITEM_STATUSES = [
@@ -1701,17 +1704,12 @@ export class BusinessLayer {
        invocation via the same rejectionContext seam as REASK. */
     const adaptive = plannerAdaptiveRetryForWorkItem(this.store, workItemId);
     if (adaptive.exhausted) {
-      this.store.event({
-        entity_type: "work_item",
-        entity_id: workItemId,
-        event_type: "PLANNER_VALIDATION_RETRY_EXHAUSTED",
-        new_state: null,
-        actor: "PAIR_PLANNER",
-        metadata: {
-          rejected_run_count: adaptive.rejected_run_count,
-          last_planner_run_id: adaptive.source?.planner_run_id ?? null,
-        },
-      });
+      emitPlannerValidationRetryExhausted(
+        this.store,
+        workItemId,
+        adaptive,
+        "PAIR_PLANNER",
+      );
       throw new PolicyError(
         "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
         `work_item ${workItemId}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,

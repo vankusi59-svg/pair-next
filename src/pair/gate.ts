@@ -1098,8 +1098,21 @@ export class GovernedTaskGate {
       unknown
     >;
     execution.last_observation = observed;
+    // P18.3 — canonical liveness stamps: every observation is counted
+    // and timestamped; the FIRST terminal observation closes the
+    // detection-latency window (dispatch → first_terminal_observed).
+    execution.observe_count = Number(execution.observe_count ?? 0) + 1;
+    execution.last_observed_at = utcnow();
     if (observed.status && String(observed.status) !== String(execution.execution_state)) {
       execution.execution_state = String(observed.status);
+    }
+    if (
+      !execution.first_terminal_observed_at &&
+      ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"].includes(
+        String(observed.status ?? ""),
+      )
+    ) {
+      execution.first_terminal_observed_at = execution.last_observed_at;
     }
     return this.store.put("executor_execution", executionId, execution, execution.version);
   }
@@ -1109,6 +1122,21 @@ export class GovernedTaskGate {
     executionId: string,
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
+    // P18.3 — collection liveness: every attempt is counted; the started
+    // stamp separates "result observable" from "canonical evidence
+    // committed" below. Persisted BEFORE the collect call so a thrown
+    // collect still leaves an honest attempt record; retried attempts
+    // increment the same counter (idempotent — `result` set makes the
+    // caller a no-op).
+    execution.collection_started_at ??= utcnow();
+    execution.collection_attempts = Number(execution.collection_attempts ?? 0) + 1;
+    const bumped = this.store.put(
+      "executor_execution",
+      executionId,
+      execution,
+      execution.version,
+    );
+    execution.version = bumped.version;
     let result = adapter.collect_result(executionId);
     // R5.1/R6.1 — strict result envelope: EVERY result entering canonical
     // execution state must be a non-null object carrying the common PAIR
@@ -1175,6 +1203,7 @@ export class GovernedTaskGate {
     this.service.cost.settleFromResult(String(execution.governed_task_id), result);
     execution.result_state = result.status;
     execution.execution_state = result.status;
+    execution.collection_committed_at = utcnow();
     const saved = this.store.put("executor_execution", executionId, execution, execution.version);
     this.store.event({
       entity_type: "executor_execution",

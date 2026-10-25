@@ -95,6 +95,18 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
        *  credentials from the child env (subscription-only session
        *  auth). Absent the store the adapter keeps manual semantics. */
       store?: PairEvidenceStore;
+      /** P18.3 — completion notification: fired synchronously inside
+       *  `finish()` the moment the child exit settles terminal evidence
+       *  (result.json + journal already durable). Best-effort wake hint;
+       *  collection never depends on it — the bounded sweep remains the
+       *  authority. */
+      onFinished?: (info: {
+        execution_id: string;
+        mission_id: string | null;
+        task_id: string | null;
+        status: string;
+        finished_at: string | null;
+      }) => void;
     },
   ) {}
 
@@ -616,6 +628,17 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     } catch {
       /* noop */
     }
+    try {
+      this.deps.onFinished?.({
+        execution_id: rec.execution_id,
+        mission_id: rec.mission_id ?? null,
+        task_id: rec.task_id ?? null,
+        status,
+        finished_at: rec.finished_at,
+      });
+    } catch {
+      /* wake hint is best-effort — never break settlement evidence */
+    }
   }
 
   observe(executionId: string): Record<string, unknown> {
@@ -626,6 +649,9 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       status: rec?.status ?? "UNKNOWN",
       process_alive: rec?.child != null && rec.child.exitCode === null,
       run_root: rec?.run_root ?? null,
+      // P18.3 — adapter-side completion timestamp (journal/worker
+      // authority, not inference) feeds canonical liveness evidence.
+      finished_at: rec?.finished_at ?? null,
     };
   }
 

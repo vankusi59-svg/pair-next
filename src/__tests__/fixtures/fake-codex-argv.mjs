@@ -41,5 +41,31 @@ process.stdin.on("end", () => {
       }),
     );
   }
+  // Planner-transport support: `codex exec --output-schema <file>` asks
+  // for schema-constrained output. Answer per the schema's `required`:
+  // the ping probe wants {"ok":true}; the plan schema wants a tasks DAG.
+  const schemaPath = idx("--output-schema") >= 0 ? args[idx("--output-schema") + 1] : null;
+  if (finalPath && schemaPath) {
+    try {
+      const required = JSON.parse(fs.readFileSync(schemaPath, "utf8"))?.required ?? [];
+      // Only planner-shape schemas get a synthesized answer — the exec
+      // dispatch schema keeps the generic evidence (argv/env) written
+      // above so CNI-1-style assertions still see it.
+      const body = required.includes("ok")
+        ? { ok: true }
+        : required.includes("tasks")
+          ? {
+              tasks: [
+                { task_key: "T1", title: "reason step A", task_instruction: "analyze the mission goal", required_capabilities: ["REASONING"], depends_on: [] },
+                { task_key: "T2", title: "reason step B", task_instruction: "summarize the analysis", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+              ],
+            }
+          : null;
+      if (body !== null) {
+        fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+        fs.writeFileSync(finalPath, JSON.stringify(body));
+      }
+    } catch { /* leave prior final.json content */ }
+  }
   process.exit(0);
 });

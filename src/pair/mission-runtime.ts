@@ -127,6 +127,29 @@ const TERMINAL_RUNTIME = new Set<MissionRuntimeState>([
 export const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 const SETTLED_TASK = new Set(["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "SUPERSEDED"]);
 
+/** P18.3 — runtime states where an in-flight execution can exist and
+ *  must keep being observed/collected: every live post-dispatch state.
+ *  CREATED/PLANNING/READY precede any dispatch; PAUSED is operator-held
+ *  and excluded from supervisor ticking entirely. */
+const COLLECT_LIVE_STATES = new Set<MissionRuntimeState>([
+  "RUNNING",
+  "WAITING",
+  "WAITING_BACKOFF",
+  "RECOVERING",
+  "RECONCILING",
+  "REPLANNING",
+  "WAITING_APPROVAL",
+]);
+
+/** P18.3 — bounded transient collect-fault retries. A non-governed
+ *  collect error (IO race, transient artifact access) is retried each
+ *  tick while the row stays unsettled; at this bound the execution is
+ *  handed to governed UNKNOWN_SIDE_EFFECT recovery — fail-closed and
+ *  operator-visible, never an unbounded silent spin. Deterministic
+ *  governed errors (IntegrityError/PolicyError) never wait this long —
+ *  they route into RESULT_SCHEMA recovery on the first fault. */
+const COLLECT_FAULT_BOUND = 24;
+
 /** Bounded durable retry budget for potentially-transient planning
  *  failures before the canonical PLANNING→FAILED terminalization. */
 export const PLANNING_MAX_ATTEMPTS = 3;
@@ -984,6 +1007,23 @@ export class MissionRuntime {
     state = String(rt.state) as MissionRuntimeState;
     if (TERMINAL_RUNTIME.has(state) || state === "PAUSED") return rt;
 
+    // P18.3 — collection liveness is NOT state-gated: in-flight
+    // executions are observed, collected and settled on every live
+    // runtime state. Previously the observe loop lived only inside
+    // RUNNING/WAITING — any recovery chain (WAITING_BACKOFF, RECOVERING,
+    // RECONCILING, REPLANNING, WAITING_APPROVAL) starved every sibling
+    // execution: results sat on disk while the canonical row lied
+    // RUNNING (live evidence: 63 min, last_observation null). Failures
+    // discovered while another recovery is in flight queue onto
+    // `deferred_recovery` — `pending_recovery` is never clobbered.
+    if (COLLECT_LIVE_STATES.has(state)) {
+      this.drainDeferredRecovery(missionId, now);
+      this.collectInflightExecutions(missionId, now);
+      rt = this.runtimeEntity(missionId);
+      state = String(rt.state) as MissionRuntimeState;
+      if (TERMINAL_RUNTIME.has(state) || state === "PAUSED") return rt;
+    }
+
     switch (state) {
       case "CREATED": {
         const mission = this.deps.service.getMission(missionId);
@@ -1410,49 +1450,8 @@ export class MissionRuntime {
       }
     }
 
-    // 2. Observe in-flight executions → collect terminals.
-    // Executions already under a reconciliation barrier or carried by the
-    // active pending_recovery are NOT re-observed here — their governed
-    // path owns them (re-observing would re-decide every tick).
-    const barrieredExecs = new Set<string>();
-    for (const b of Object.values(
-      (rt.barriers as Record<string, Record<string, unknown>>) ?? {},
-    )) {
-      if (b.settled !== true && b.execution_id) barrieredExecs.add(String(b.execution_id));
-    }
-    const inFlight = this.store
-      .list("executor_execution")
-      .filter(
-        (e) =>
-          e.mission_id === missionId &&
-          !TERMINAL_EXECUTION.has(String(e.execution_state)) &&
-          !e.terminal_outcome && // Phase D §5 — operator-neutralized
-          !barrieredExecs.has(String(e.execution_id)),
-      );
-    for (const e of inFlight) {
-      const adapter = this.deps.adapters.get(String(e.executor_id));
-      if (!adapter) continue;
-      const observed = this.deps.gate.observe_execution(adapter, String(e.execution_id));
-      const observedState = String(observed.execution_state);
-      if (observedState === "UNKNOWN" || String(e.execution_state) === "UNKNOWN") {
-        // Phase D §5 — UNKNOWN is not terminal but can never be
-        // auto-settled: drive it through governed recovery (reconcile →
-        // operator no-replay acknowledgment) instead of leaving the task
-        // in-flight forever.
-        this.startRecovery(
-          missionId,
-          String(e.task_id),
-          String(e.execution_id),
-          "UNKNOWN_SIDE_EFFECT_STATE",
-          now,
-        );
-        return;
-      }
-      if (!TERMINAL_EXECUTION.has(observedState)) continue;
-      this.settleExecution(missionId, String(observed.execution_id));
-      const rtNow = String(this.runtimeEntity(missionId).state);
-      if (rtNow !== "RUNNING") return; // recovery/approval/reconcile took over
-    }
+    // (Section 2 — in-flight observe/collect/settle — is hoisted to
+    // tick() for every live state: see collectInflightExecutions.)
 
     // 3. Dispatch runnable DAG tasks.
     const mission = this.deps.service.getMission(missionId);
@@ -1602,6 +1601,227 @@ export class MissionRuntime {
     return pending ? `SCHEDULED_UNTIL:${String(pending.due_at)}` : null;
   }
 
+  /* ---------------- collection liveness (P18.3) -------------------------- */
+
+  /**
+   * State-independent observation: every in-flight execution is observed
+   * through the canonical gate and settled through `settleExecution`,
+   * regardless of which live runtime state the mission is in. Executions
+   * under a reconciliation barrier are skipped — the governed reconcile
+   * path owns them (re-observing would re-decide every tick). UNKNOWN is
+   * never auto-settled: it enters governed recovery via
+   * `queueOrStartRecovery` exactly as before. Exactly-once: a settled
+   * execution leaves the `inFlight` filter (terminal state or
+   * `terminal_outcome`), so repeat ticks are no-ops.
+   */
+  private collectInflightExecutions(missionId: string, now?: string): void {
+    const rt = this.runtimeEntity(missionId);
+    const entryState = String(rt.state);
+    const barrieredExecs = new Set<string>();
+    for (const b of Object.values(
+      (rt.barriers as Record<string, Record<string, unknown>>) ?? {},
+    )) {
+      if (b.settled !== true && b.execution_id) barrieredExecs.add(String(b.execution_id));
+    }
+    const inFlight = this.store
+      .list("executor_execution")
+      .filter(
+        (e) =>
+          e.mission_id === missionId &&
+          // Settlement authority is the committed canonical RESULT —
+          // not the mirrored execution_state. observe_execution stamps
+          // terminal status at detection time, so a collect fault must
+          // NOT drop the row from the sweep: it stays eligible until a
+          // validated result is committed (exactly-once) or a governed
+          // recovery/operator path settles it.
+          e.result == null &&
+          !e.terminal_outcome && // Phase D §5 — operator-neutralized
+          !barrieredExecs.has(String(e.execution_id)),
+      );
+    for (const e of inFlight) {
+      const adapter = this.deps.adapters.get(String(e.executor_id));
+      if (!adapter) {
+        // An unbound adapter is a liveness-blocking fact, not a crash:
+        // record it once on the row and let reconciliation/orphan paths
+        // own the outcome — throwing would starve every sibling.
+        const prior = e.last_observation as Record<string, unknown> | undefined;
+        if (String(prior?.blocking_reason ?? "") !== "ADAPTER_NOT_BOUND") {
+          try {
+            e.last_observation = {
+              ...(prior ?? {}),
+              blocking_reason: "ADAPTER_NOT_BOUND",
+              blocked_at: utcnow(),
+            };
+            this.store.put(
+              "executor_execution",
+              String(e.execution_id),
+              e,
+              Number(e.version),
+            );
+          } catch {
+            /* liveness hint is best-effort */
+          }
+        }
+        continue;
+      }
+      let observed: Record<string, unknown>;
+      try {
+        observed = this.deps.gate.observe_execution(adapter, String(e.execution_id));
+      } catch {
+        continue; // observe fault → retried next tick; never starve siblings
+      }
+      const observedState = String(observed.execution_state);
+      if (observedState === "UNKNOWN" || String(e.execution_state) === "UNKNOWN") {
+        // Phase D §5 — UNKNOWN is not terminal but can never be
+        // auto-settled: drive it through governed recovery (reconcile →
+        // operator no-replay acknowledgment) instead of leaving the task
+        // in-flight forever.
+        this.queueOrStartRecovery(
+          missionId,
+          String(e.task_id),
+          String(e.execution_id),
+          "UNKNOWN_SIDE_EFFECT_STATE",
+          now,
+        );
+        return;
+      }
+      if (!TERMINAL_EXECUTION.has(observedState)) continue;
+      try {
+        this.settleExecution(missionId, String(observed.execution_id));
+      } catch (err) {
+        // Settlement fault — the row stays in-flight (unsettled filter
+        // above) and is retried on the next tick, but a collect fault is
+        // bounded: deterministic governed failures (IntegrityError /
+        // PolicyError carrying a FAIL_CLOSED code — malformed envelope,
+        // identity mismatch, forged evidence) can never succeed on
+        // replay, so they route into RESULT_SCHEMA recovery immediately;
+        // transient faults (IO, process races) get a bounded number of
+        // collect attempts before UNKNOWN_SIDE_EFFECT — never an
+        // unbounded silent spin.
+        const code = String((err as { code?: string }).code ?? "COLLECT_FAULT");
+        const attempts = Number(
+          ((this.store.tryGet("executor_execution", String(e.execution_id)) ?? {}) as
+            Record<string, unknown>).collection_attempts ?? 0,
+        );
+        try {
+          const prior = (e.last_observation as Record<string, unknown> | undefined) ?? {};
+          e.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
+          this.store.put("executor_execution", String(e.execution_id), e, Number(e.version));
+        } catch { /* liveness hint is best-effort */ }
+        if (err instanceof IntegrityError || err instanceof PolicyError) {
+          this.queueOrStartRecovery(
+            missionId, String(e.task_id), String(e.execution_id),
+            "RESULT_SCHEMA_FAILURE", now,
+          );
+          return;
+        }
+        if (attempts >= COLLECT_FAULT_BOUND) {
+          this.queueOrStartRecovery(
+            missionId, String(e.task_id), String(e.execution_id),
+            "UNKNOWN_SIDE_EFFECT_STATE", now,
+          );
+          return;
+        }
+        continue;
+      }
+      const rtNow = String(this.runtimeEntity(missionId).state);
+      if (rtNow !== entryState) return; // recovery/approval/reconcile took over
+    }
+  }
+
+  /**
+   * A failure discovered while ANOTHER recovery is already in flight
+   * must not clobber `pending_recovery` (single-slot authority): it is
+   * queued onto `deferred_recovery` — deduped by task_id, since a second
+   * signal for the same task carries no new authority. The queue is
+   * drained one entry per tick by `drainDeferredRecovery` once the
+   * pending slot frees; entries are durable so a restart cannot lose
+   * them.
+   */
+  private queueOrStartRecovery(
+    missionId: string,
+    taskId: string,
+    executionId: string | null,
+    failureClass: ReturnType<typeof classifyFailure>,
+    now?: string,
+    extra?: Parameters<MissionRuntime["startRecovery"]>[7],
+  ): void {
+    const rt = this.runtimeEntity(missionId);
+    if (rt.pending_recovery) {
+      const deferred =
+        (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+      if (!deferred.some((d) => String(d.task_id) === taskId)) {
+        rt.deferred_recovery = [
+          ...deferred,
+          {
+            task_id: taskId,
+            execution_id: executionId,
+            failure_class: failureClass,
+            extra: extra ?? null,
+            queued_at: utcnow(),
+          },
+        ];
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+      }
+      return;
+    }
+    this.startRecovery(
+      missionId,
+      taskId,
+      executionId,
+      failureClass,
+      now,
+      undefined,
+      undefined,
+      extra,
+    );
+  }
+
+  /**
+   * Pops at most one queued failure once `pending_recovery` is free.
+   * Entries whose task sits under an unsettled barrier are skipped — the
+   * governed reconciliation path owns that outcome. One-per-tick keeps
+   * recovery ordering canonical and bounded.
+   */
+  private drainDeferredRecovery(missionId: string, now?: string): void {
+    const rt = this.runtimeEntity(missionId);
+    if (rt.pending_recovery) return;
+    const deferred =
+      (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+    if (deferred.length === 0) return;
+    const barriers =
+      (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
+    const idx = deferred.findIndex((d) => {
+      const b = barriers[String(d.task_id)];
+      return !(b && b.settled !== true);
+    });
+    if (idx < 0) return;
+    const [entry] = deferred.splice(idx, 1);
+    rt.deferred_recovery = deferred;
+    this.store.put(
+      "mission_runtime",
+      String(rt.mission_runtime_id),
+      rt,
+      Number(rt.version),
+    );
+    this.startRecovery(
+      missionId,
+      String(entry.task_id),
+      entry.execution_id != null ? String(entry.execution_id) : null,
+      entry.failure_class as ReturnType<typeof classifyFailure>,
+      now,
+      undefined,
+      undefined,
+      (entry.extra as Parameters<MissionRuntime["startRecovery"]>[7]) ??
+        undefined,
+    );
+  }
+
   /* ---------------- settle + recovery entry ------------------------------- */
 
   private settleExecution(missionId: string, executionId: string): void {
@@ -1616,6 +1836,19 @@ export class MissionRuntime {
     }
     const collected = this.store.get("executor_execution", executionId);
     const state = String(collected.execution_state);
+    // P18.3 — canonical settlement timestamp: the executor_execution row
+    // records when its result finished canonical settlement (collect +
+    // validate + task mark), completing the liveness chain
+    // dispatch → first_terminal_observed → collected → settled.
+    if (!collected.settled_at) {
+      collected.settled_at = utcnow();
+      this.store.put(
+        "executor_execution",
+        executionId,
+        collected,
+        Number(collected.version),
+      );
+    }
     if (state === "COMPLETED") {
       const validation = this.deps.gate.validate_execution_result(executionId);
       if (String(validation.status) === "PASS") {
@@ -1650,13 +1883,11 @@ export class MissionRuntime {
               check.violation,
             );
             this.deps.service.updateTask(taskId, { status: "FAILED" });
-            this.startRecovery(
+            this.queueOrStartRecovery(
               missionId,
               taskId,
               executionId,
               "ARTIFACT_VALIDATION_FAILURE",
-              undefined,
-              undefined,
               undefined,
               {
                 artifact_name:
@@ -1734,13 +1965,11 @@ export class MissionRuntime {
         ? (validation.remote_produces_missing as string[])
         : [];
       if (remoteMissing.length) {
-        this.startRecovery(
+        this.queueOrStartRecovery(
           missionId,
           taskId,
           executionId,
           "DEPENDENCY_FAILURE",
-          undefined,
-          undefined,
           undefined,
           {
             dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
@@ -1752,7 +1981,7 @@ export class MissionRuntime {
         );
         return;
       }
-      this.startRecovery(
+      this.queueOrStartRecovery(
         missionId,
         taskId,
         executionId,
@@ -1772,7 +2001,7 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.startRecovery(missionId, taskId, executionId, failureClass);
+    this.queueOrStartRecovery(missionId, taskId, executionId, failureClass);
   }
 
   /**
@@ -2102,6 +2331,27 @@ export class MissionRuntime {
     }
     const action = String(pending.action);
     const taskId = String(pending.task_id);
+
+    // P18.3 RC-A — the apply arms only close out (`clearPendingRecovery`)
+    // while `state === "RECOVERING"`. The RUNNING-path compat leg used to
+    // apply without entering RECOVERING: the arm dispatched the retry but
+    // never cleared pending, so every later tick re-applied the SAME
+    // action and early-returned before the observe section — in-flight
+    // executions starved indefinitely (live evidence: task version 7507,
+    // 63 min unobserved). Entering RECOVERING first makes the close-out
+    // reachable from every caller. RUNNING/WAITING_BACKOFF/RECONCILING/
+    // WAITING_APPROVAL/REPLANNING all reach RECOVERING (directly or via
+    // RUNNING); a state that cannot legitimately apply recovery throws
+    // into the failure boundary below rather than spinning silently.
+    {
+      const st = String(rt.state);
+      if (st !== "RECOVERING") {
+        if (st !== "RUNNING") {
+          this.transitionRuntime(missionId, "RUNNING", "pending_recovery_apply");
+        }
+        this.transitionRuntime(missionId, "RECOVERING", "pending_recovery_apply");
+      }
+    }
 
     // Audit R: the WHOLE apply arm runs inside one boundary. Only the router
     // calls keep their own catch (they convert an expected PolicyError into

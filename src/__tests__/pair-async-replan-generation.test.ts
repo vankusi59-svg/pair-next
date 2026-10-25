@@ -47,7 +47,13 @@ import {
   MissionRouter,
   MissionRuntime,
   MissionScheduler,
+  MissionScheduleService,
   MissionSupervisor,
+  BusinessLayer,
+  ObjectiveWorkstreamService,
+  WorkforceAllocationService,
+  WorkforceService,
+  WORKFORCE_ALLOCATION_ENTITY,
   ModelEvidenceCatalog,
   MODEL_ROLE,
   assignModelRole,
@@ -56,7 +62,9 @@ import {
   PairNativeExecutorAdapter,
   PairNativeWorkerRunner,
   persistPlannerAttemptStart,
+  plannerAdaptiveRetryForWorkItem,
   plannerCandidateRequestBound,
+  emitPlannerValidationRetryExhausted,
   PolicyError,
   ProviderCatalog,
   ProviderValidator,
@@ -1414,6 +1422,24 @@ function makeProdCompositionGenerate(
     const externalInputs =
       ctx.service.artifactResolver.listEligibleExternalInputSources(mission);
     const candidates = dedupePlannerCandidates(plannerCandidates);
+    /* P18.2/P18.3-E2E-8 — same seam as serve-mission-control.mjs
+       runReplanPoolGeneration: bound work item's adaptive episode is
+       enforced BEFORE minting the planner run or reservation; otherwise
+       the newest terminal rejection rides INITIAL invocations as
+       PRIOR_RUN feedback. Unbound missions resolve null → unchanged. */
+    const replanWi = replanWorkItemId(ctx.store, mission);
+    const adaptive = replanWi
+      ? plannerAdaptiveRetryForWorkItem(ctx.store, replanWi)
+      : null;
+    if (adaptive?.exhausted) {
+      emitPlannerValidationRetryExhausted(
+        ctx.store, replanWi, adaptive, "PAIR_REPLAN_GENERATION",
+      );
+      throw new PolicyError(
+        "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
+        `work_item ${replanWi}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,
+      );
+    }
     const run = beginPlannerRun(ctx.store, {
       project_id: mission.project_id != null ? String(mission.project_id) : undefined,
       operator_id: mission.operator_id,
@@ -1464,6 +1490,7 @@ function makeProdCompositionGenerate(
           return canon;
         },
         planFn: stubPlanFn, // ← the ONLY stub: the model transport
+        priorRejectionContext: adaptive?.context ?? undefined,
         latencyBudget: () => ({ ceilingMs: 10_000, requestTimeoutMs: 5_000 }),
         onAttemptStart: (base) =>
           persistPlannerAttemptStart(ctx.store, {
@@ -2044,5 +2071,255 @@ describe("async replan J — audit R2-F2: canonical objective budget at replan a
       actor: "TEST",
     });
     expect(c.reservation_id).toBe("CRSV_PLN_PRN_j11c");
+  });
+});
+
+/* ============ S3 — P18.2 bound work-item PRIOR_RUN episode (P18.3) ====
+ * The previously-unproven real-runtime scenario (P18.2 audit S3 gap /
+ * P18.3 Phase A + E2E-8). The chain under test is fully canonical:
+ * real openWorkItem → real BOUND work_open_binding → real bound
+ * mission → real execution failure → real recovery REPLAN → real
+ * durable replan_generation → the REAL production composition
+ * (adaptive seam + canonical lineage cost admission + real pool with
+ * only the model transport stubbed) → validation-rejected planner run
+ * attributed to the SAME bound work item. Two findings pinned:
+ *
+ *  1) A rejected REPLAN-generation run OPENS a new rejection episode
+ *     ON THE BOUND ITEM (depth ≥1 is organically reachable — the audit
+ *     gap). The next replan generation must forward it as PRIOR_RUN.
+ *  2) Once the episode exceeds PLANNER_VALIDATION_REPAIR_MAX the
+ *     generation seam fails closed BEFORE minting a planner run or
+ *     reservation (zero spend); the exhaustion event is deduplicated.
+ */
+
+describe("async replan S3 — bound-item episode: open → PRIOR_RUN → zero-spend cap", () => {
+  const OP = "op:s3";
+
+  it("S3. bound work item opens a post-binding episode via a rejected replan run; next generation forwards PRIOR_RUN; cap fails closed with zero spend", async () => {
+    const ctx = makeAsyncCtx("s3", { generate: async () => ({ tasks: [] }) });
+    const candidate = await seedHttpPlannerCandidate(ctx.store);
+    ctx.service.cost.createCostProfile(
+      { ref_type: "executor", ref_id: "PAIR_PLANNER", billing_mode: "METERED_API", reserve_microusd: 250 },
+      "TEST",
+    );
+    /* Real delegated-open seam: business → objective → workstream →
+     * allocation → org agent → child work item → openWorkItem pins the
+     * mission_id and mints the BOUND work_open_binding. The plan
+     * expander is a stub (delegated-edge transport is not the SUT —
+     * the REPLAN edge is); binding + mission are canonical. */
+    const biz = new BusinessLayer({
+      store: ctx.store,
+      control: ctx.control,
+      schedules: new MissionScheduleService(ctx.service),
+      planExpander: async (input) => ({
+        input: {
+          ...input,
+          metadata: {
+            ...(input.metadata as Record<string, unknown> | undefined),
+            llm_plan: [
+              { task_key: "T1", title: "t1", task_instruction: "write a.txt", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+              { task_key: "T2", title: "t2", task_instruction: "remote step", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+            ],
+            plan_source: "LLM",
+            plan_model: "s3-planner",
+          },
+        },
+        planner: { planner_run_id: "PLR_S3", attempts: [], winner: { attempt_no: 1 } },
+      }),
+    });
+    const wf = new WorkforceService({ store: ctx.store, business: biz });
+    const workstreams = new ObjectiveWorkstreamService(
+      { store: ctx.store, business: biz, workforce: wf, objectives: biz.objectives });
+    const alloc = new WorkforceAllocationService(
+      { store: ctx.store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
+    const bid = String(biz.createBusiness({ name: "s3-biz", project_id: ctx.projectId, operator_id: OP }).business_id);
+    const o = biz.objectives.create({
+      business_id: bid, title: "s3-obj", statement: "produce",
+      kpis: [{ kpi_id: "K1", name: "done", unit: "count", direction: "AT_LEAST", baseline: 0, target: 1 }],
+      deadline: "2099-01-01T00:00:00Z", budget_ceiling_microusd: 50_000_000,
+      dedup_key: "dk-s3", operator_id: OP,
+    });
+    const oid = String(o.objective_id);
+    const ob = biz.objectives.get(oid);
+    workstreams.decomposeObjective({
+      objective_id: oid,
+      expected_objective_version: Number(ob.version),
+      expected_terms_version: Number(ob.terms_version),
+      expected_objective_digest: String(ob.objective_digest),
+      workstreams: [{ workstream_key: "ws1", title: "ws1", goal: "s3 goal" }] as never,
+      actor: OP,
+    });
+    biz.createOrgAgent({ business_id: bid, title: "s3-agent", department: "ops", operator_id: OP });
+    alloc.allocateWorkstream({ objective_id: oid, workstream_key: "ws1", actor: OP });
+    const binding = workstreams.getBinding(oid)!;
+    const wsWi = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.work_item_id);
+    const wal = ctx.store.list(WORKFORCE_ALLOCATION_ENTITY).find(
+      (r) => String(r.workstream_work_item_id) === wsWi)!;
+    const childWi = String(wal.delegated_child_work_item_id);
+    const prepared = await biz.prepareDelegatedPlan(childWi, OP);
+    await biz.openWorkItem(childWi, OP, undefined, { prepared_plan: prepared });
+    const mid = String(biz.boundMissionForWorkItem(
+      ctx.store.get("work_item", childWi))!.mission_id);
+    // Sanity: the mission is canonically bound.
+    const missionRow = ctx.service.getMission(mid);
+    expect(missionRow.bound_open_id).toBeTruthy();
+    expect(replanWorkItemId(ctx.store, missionRow)).toBe(childWi);
+
+    /* Executors: injected T1 bookkeeping runs on the REAL PAIR_NATIVE
+     * automaton harness (scripted adapters cannot produce its evidence);
+     * plan T2 completes on FILE_OPERATIONS; plan T3 needs REASONING and
+     * fails with RESULT_SCHEMA (retry-allowed → keeps the mission live
+     * through a real RETRY → REPLAN decision chain). */
+    ctx.registerNativeExecutor();
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }], ["FILE_OPERATIONS"]),
+      ["FILE_OPERATIONS"],
+    );
+    ctx.registerAdapter(
+      new ScriptedAdapter(
+        "EX_R",
+        [{ status: "FAILED", error_class: "DEPENDENCY_INPUT_MISSING" }],
+        ["REASONING"],
+      ),
+      ["REASONING"],
+    );
+
+    /* The production generate seam (adaptive block included). Every
+     * invocation returns a canonically-invalid plan → the pool records
+     * a VALIDATION-rejected attempt on the run attributed to childWi —
+     * an episode opens ON THE BOUND ITEM. */
+    const seenRejectionCtx: Array<Record<string, unknown> | undefined> = [];
+    let invocations = 0;
+    const gen = makeProdCompositionGenerate(ctx, [candidate], async (_c, invocation) => {
+      invocations++;
+      seenRejectionCtx.push(invocation.rejectionContext as Record<string, unknown> | undefined);
+      return {
+        tasks: [{ task_key: "T1", title: "x", task_instruction: "x", required_capabilities: [], depends_on: [] }],
+        warnings: [],
+      };
+    });
+    const sweep = makeReplanGenerationDriver({
+      service: ctx.gen, generate: gen, owner_id: "s3-driver", lease_ms: 60_000,
+    });
+    // DEPENDENCY_FAILURE's matrix row is [REPLAN, ABORT] — the first
+    // recovery decision goes straight to REPLANNING (no backoff).
+    const clock = fakeClock();
+    for (let i = 0; i < 200; i++) {
+      ctx.runtime.tick(mid, clock());
+      ctx.runtime.tick(mid);
+      await sweep();
+      const s = String(ctx.rt(mid).state);
+      if (["ABORTED", "FAILED", "COMPLETED", "WAITING_APPROVAL"].includes(s)) break;
+    }
+    const gens = ctx.generations();
+    /* Episode-opened-on-bound-item proof — the exact S3 gap: a replan
+     * generation's rejected run attributes to the bound work item and
+     * re-opens a rejection episode AFTER the winning run that bound it. */
+    expect(gens.length).toBeGreaterThanOrEqual(1);
+    const exhaustedRuns = ctx.store.list("planner_run").filter(
+      (r) => String(r.outcome) === "EXHAUSTED" || String(r.state) === "EXHAUSTED");
+    expect(exhaustedRuns.length).toBeGreaterThanOrEqual(1);
+    const adaptive1 = plannerAdaptiveRetryForWorkItem(ctx.store, childWi);
+    expect(adaptive1.rejected_run_count).toBeGreaterThanOrEqual(1);
+    expect(adaptive1.context?.origin).toBe("PRIOR_RUN");
+    expect(adaptive1.exhausted).toBe(false);
+    const organicInvocations = invocations;
+
+    /* Forwarding proof — invoke the SAME production generate seam for
+     * the next generation slot: the open episode must reach the model
+     * invocation as PRIOR_RUN rejectionContext. A real RPG row is
+     * minted for the input (PENDING → the driver-claimed shape). */
+    const input2: RuntimePlannerInput = {
+      mission: { mission_id: mid, plan_id: null },
+      reason: "replan",
+      replan_context: {
+        recovery_id: "RCV_s3_second", failure_signature: null,
+        failure_class: "EXECUTION_FAILURE", dependency_reason: null,
+        failed_task_key: "T2", failed_plan_semantic_digest: null,
+        rejected_semantic_digests: [],
+      },
+    };
+    let genRow2: ReplanGenerationRecord | null = null;
+    try {
+      ctx.gen.requestCandidate(input2);
+    } catch (e) {
+      expect(String((e as { code?: string }).code)).toBe(REPLAN_GENERATION_PENDING);
+      genRow2 = ctx.generations().find((g) => g.recovery_id === "RCV_s3_second") ?? null;
+    }
+    expect(genRow2).toBeTruthy();
+    await gen(genRow2!).catch(() => undefined); // plan still invalid — recorded rejection
+    expect(invocations).toBeGreaterThanOrEqual(organicInvocations + 1);
+    /* The INITIAL invocation of gen2's run must carry the bound item's
+     * open episode as PRIOR_RUN feedback (later REASK invocations carry
+     * the re-ask's own context shape — origin-less by design). */
+    const initialCtx = seenRejectionCtx[organicInvocations];
+    expect(initialCtx).toBeTruthy();
+    expect(String(initialCtx!.origin)).toBe("PRIOR_RUN");
+    expect(String(initialCtx!.validation_code)).toMatch(/^FAIL_CLOSED_/);
+    const adaptive2 = plannerAdaptiveRetryForWorkItem(ctx.store, childWi);
+    expect(adaptive2.rejected_run_count).toBeGreaterThanOrEqual(1);
+
+    /* Zero-spend cap — deepen the episode past
+     * PLANNER_VALIDATION_REPAIR_MAX with one more real rejected run
+     * through the SAME canonical seams (admit → begin → attempt →
+     * settle REJECTED → finish EXHAUSTED), then prove the next
+     * generation mints nothing. */
+    const runsBefore = ctx.store.list("planner_run").length;
+    const resBefore = ctx.store.list("cost_reservation").length;
+    const run3 = beginPlannerRun(ctx.store, { operator_id: missionRow.operator_id, routes: [candidate.ref], actor: "PAIR_REPLAN_GENERATION" });
+    const adm = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: String(run3.planner_run_id), work_item_id: childWi,
+      est_microusd: 250, unbounded_unknown: false, candidates: 1,
+      actor: "PAIR_REPLAN_GENERATION",
+    });
+    const paid = persistPlannerAttemptStart(ctx.store, {
+      planner_run_id: String(run3.planner_run_id),
+      record: { attempt_no: 1, candidate_ref: candidate.ref, outcome: "STARTED" },
+      actor: "PAIR_REPLAN_GENERATION",
+    }).planner_attempt_id;
+    settlePlannerAttempt(ctx.store, {
+      planner_attempt_id: String(paid),
+      record: { attempt_no: 1, outcome: "FAILED", failure_class: "PLAN_INVALID",
+        warnings: ["VALIDATION_CODE:FAIL_CLOSED_PLAN_INCOMPLETE"], completed_at: new Date().toISOString() },
+      winner: false, actor: "PAIR_REPLAN_GENERATION",
+    });
+    finishPlannerRun(ctx.store, { planner_run_id: String(run3.planner_run_id), outcome: "EXHAUSTED", actor: "PAIR_REPLAN_GENERATION" });
+    if (adm.reservation_id) ctx.service.cost.settlePlannerInvocation(String(adm.reservation_id), "CALLS_MADE", null);
+    const adaptive3 = plannerAdaptiveRetryForWorkItem(ctx.store, childWi);
+    expect(adaptive3.exhausted).toBe(true);
+    /* The same seam now fails closed before beginPlannerRun/admission. */
+    const mintFor = (rid: string) => {
+      try {
+        ctx.gen.requestCandidate({
+          mission: { mission_id: mid, plan_id: null },
+          reason: "replan",
+          replan_context: {
+            recovery_id: rid, failure_signature: null,
+            failure_class: "EXECUTION_FAILURE", dependency_reason: null,
+            failed_task_key: "T2", failed_plan_semantic_digest: null,
+            rejected_semantic_digests: [],
+          },
+        } as RuntimePlannerInput);
+      } catch { /* PENDING is the expected mint signal */ }
+      return ctx.generations().find((g) => g.recovery_id === rid)!;
+    };
+    const genRow3 = mintFor("RCV_s3_third");
+    await expect(gen(genRow3)).rejects.toMatchObject({
+      code: "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
+    });
+    expect(ctx.store.list("planner_run")).toHaveLength(runsBefore + 1); // run3 only
+    expect(ctx.store.list("cost_reservation")).toHaveLength(resBefore + 1);
+    const exhaustEvents = () => ctx.store.eventPage({
+      topics: ["PLANNER_VALIDATION_RETRY_EXHAUSTED"], entity_type: "work_item",
+      entity_id: childWi, after_seq: 0, limit: 10, descending: true });
+    expect(exhaustEvents()).toHaveLength(1);
+    /* Identical episode on a FRESH generation → deduped (no second
+     * event), still zero spend. */
+    const genRow4 = mintFor("RCV_s3_fourth");
+    await expect(gen(genRow4)).rejects.toMatchObject({
+      code: "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
+    });
+    expect(exhaustEvents()).toHaveLength(1);
+    expect(ctx.store.list("planner_run")).toHaveLength(runsBefore + 1);
   });
 });

@@ -38,6 +38,16 @@ export class ReconciliationService {
    *  work may legitimately reach a terminal adapter state later, but
    *  per-sweep evidence growth stays bounded. */
   static readonly ORPHAN_RECHECK_MS = 30_000;
+  /** P18.3 — an orphan whose executor is NOT bound in this process
+   *  (adapter:null) can never produce an authoritative observation, so
+   *  the 30 s re-probe is pure churn. Unobservable re-probes are bounded:
+   *  after this many tries the row gets one durable
+   *  EXECUTION_ORPHAN_UNOBSERVABLE event and stops being swept — the
+   *  capacity slot stays RESERVED (fail-closed); operator acknowledgment
+   *  or a restart with the executor bound remains the release path.
+   *  Observable orphans (adapter present, reporting RUNNING/UNKNOWN)
+   *  are NOT capped — a live remote execution must keep being probed. */
+  static readonly ORPHAN_UNOBSERVABLE_RECHECK_MAX = 40;
 
   constructor(
     private readonly service: PairControlPlane,
@@ -94,6 +104,7 @@ export class ReconciliationService {
       (e) =>
         !TERMINAL.has(String(e.execution_state)) &&
         !e.terminal_outcome &&
+        !e.orphan_unobservable_final && // P18.3 — capped unobservable rows stop being swept
         TERMINAL_MISSION.has(statusByMission.get(String(e.mission_id)) ?? "") &&
         (!e.orphan_recheck_after ||
           Date.parse(String(e.orphan_recheck_after)) <= nowMs),
@@ -127,6 +138,36 @@ export class ReconciliationService {
           continue;
         }
         if (!authoritative) {
+          // P18.3 — bound UNOBSERVABLE re-probes (adapter missing → the
+          // probe can never turn authoritative). Observable states keep
+          // the ordinary cadence uncapped: a live remote execution must
+          // keep reporting until it settles.
+          if (facts.adapter == null && facts.observed_status == null) {
+            const tries = Number(e.orphan_unobservable_count ?? 0) + 1;
+            e.orphan_unobservable_count = tries;
+            if (tries >= ReconciliationService.ORPHAN_UNOBSERVABLE_RECHECK_MAX) {
+              e.orphan_unobservable_final = true;
+              e.orphan_recheck_after = null;
+              this.store.put(
+                "executor_execution", executionId, e, Number(e.version),
+              );
+              this.store.event({
+                entity_type: "executor_execution",
+                entity_id: executionId,
+                event_type: "EXECUTION_ORPHAN_UNOBSERVABLE",
+                new_state: String(e.execution_state),
+                actor: "PAIR_RECONCILIATION_SERVICE",
+                metadata: {
+                  mission_id: e.mission_id,
+                  executor_id: e.executor_id,
+                  attempts: tries,
+                  rationale:
+                    "executor not bound in this process — observation impossible; slot stays RESERVED (fail-closed), operator acknowledgment required",
+                },
+              });
+              continue;
+            }
+          }
           e.orphan_recheck_after = new Date(
             nowMs + ReconciliationService.ORPHAN_RECHECK_MS,
           ).toISOString();

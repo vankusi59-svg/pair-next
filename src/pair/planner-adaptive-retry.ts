@@ -193,3 +193,50 @@ export function plannerAdaptiveRetryForWorkItem(
     source,
   };
 }
+
+/**
+ * P18.3/G — canonical dedup for `PLANNER_VALIDATION_RETRY_EXHAUSTED`
+ * events. Every driver pass that re-derives an UNCHANGED exhausted
+ * episode must not append an identical event: the signature of an
+ * episode is its newest rejected run id (`last_planner_run_id`) — a
+ * genuinely new rejection mints a new run, so a new event remains
+ * allowed for a genuinely new episode. Deterministic under
+ * restart/replay: the check reads only the canonical event log.
+ * The typed fail-closed throw is the caller's job either way.
+ */
+export function emitPlannerValidationRetryExhausted(
+  store: PairEvidenceStore,
+  workItemId: string,
+  adaptive: PlannerAdaptiveRetry,
+  actor: string,
+): boolean {
+  const lastRunId = adaptive.source?.planner_run_id ?? null;
+  const prior = store.eventPage({
+    topics: ["PLANNER_VALIDATION_RETRY_EXHAUSTED"],
+    entity_type: "work_item",
+    entity_id: workItemId,
+    after_seq: 0,
+    limit: 1,
+    descending: true,
+  });
+  const last = prior[0] as Record<string, unknown> | undefined;
+  const lastMeta = (last?.metadata ?? {}) as Record<string, unknown>;
+  if (
+    last &&
+    String(lastMeta.last_planner_run_id ?? "") === String(lastRunId ?? "")
+  ) {
+    return false; // identical episode already evidenced — suppress duplicate
+  }
+  store.event({
+    entity_type: "work_item",
+    entity_id: workItemId,
+    event_type: "PLANNER_VALIDATION_RETRY_EXHAUSTED",
+    new_state: null,
+    actor,
+    metadata: {
+      rejected_run_count: adaptive.rejected_run_count,
+      last_planner_run_id: lastRunId,
+    },
+  });
+  return true;
+}

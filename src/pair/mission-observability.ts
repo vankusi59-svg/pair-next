@@ -165,9 +165,72 @@ export class MissionObservability {
       scheduled_pending: count("scheduled_action", (a) =>
         ["SCHEDULED", "READY"].includes(String(a.status)),
       ),
+      // P18.3 — collection liveness gauges. `never_observed` is the
+      // incident class P18.3 removes (terminal evidence on disk,
+      // canonical row never observed); `in_flight` is the live sweep
+      // workload; `orphan_unobservable` is the bounded-reprobe terminal
+      // classification; `recovery_deferred` counts failures queued
+      // behind an in-flight pending_recovery.
+      executions_in_flight: count("executor_execution", (e) =>
+        !["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"].includes(
+          String(e.execution_state),
+        ) && !e.terminal_outcome,
+      ),
+      executions_never_observed: count("executor_execution", (e) =>
+        !e.terminal_outcome &&
+        !e.last_observation &&
+        !["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"].includes(
+          String(e.execution_state),
+        ),
+      ),
+      executions_orphan_unobservable: count(
+        "executor_execution",
+        (e) => e.orphan_unobservable_final === true,
+      ),
+      recovery_deferred_pending: this.store
+        .list("mission_runtime")
+        .reduce(
+          (n, r) =>
+            n +
+            ((r.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [])
+              .length,
+          0,
+        ),
+      ...this.livenessLatencies(),
       evidence_records: this.store.listEvidence().length,
       experiences_total: count("experience"),
       selfmod_candidates: count("selfmod_candidate"),
+    };
+  }
+
+  /** P18.3 — canonical latency chain, derived only from persisted
+   *  timestamps (never inferred): dispatch → first_terminal_observed
+   *  (detection), first_terminal_observed → collection_committed
+   *  (collection), first_terminal_observed → settled (end-to-end). */
+  private livenessLatencies(): Record<string, number> {
+    const rows = this.store.list("executor_execution");
+    const deltas = (a: keyof Record<string, unknown>, b: keyof Record<string, unknown>) =>
+      rows
+        .map((e) => {
+          const d = Date.parse(String(e[b] ?? "")) - Date.parse(String(e[a] ?? ""));
+          return Number.isFinite(d) && d >= 0 ? d : null;
+        })
+        .filter((x): x is number => x != null)
+        .sort((x, y) => x - y);
+    const pct = (xs: number[], q: number) =>
+      xs.length ? xs[Math.min(xs.length - 1, Math.floor(q * xs.length))]! : 0;
+    const det = deltas("dispatch_timestamp", "first_terminal_observed_at");
+    const col = deltas("first_terminal_observed_at", "collection_committed_at");
+    const end = deltas("first_terminal_observed_at", "settled_at");
+    return {
+      liveness_detect_ms_p50: pct(det, 0.5),
+      liveness_detect_ms_p95: pct(det, 0.95),
+      liveness_detect_ms_max: det.length ? det[det.length - 1]! : 0,
+      liveness_collect_ms_p50: pct(col, 0.5),
+      liveness_collect_ms_p95: pct(col, 0.95),
+      liveness_settle_ms_p50: pct(end, 0.5),
+      liveness_settle_ms_p95: pct(end, 0.95),
+      liveness_settle_ms_max: end.length ? end[end.length - 1]! : 0,
     };
   }
 }
