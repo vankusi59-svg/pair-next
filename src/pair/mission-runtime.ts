@@ -1666,27 +1666,40 @@ export class MissionRuntime {
       // canonical state. settleExecution's transaction + dedup keep the
       // re-run exactly-once.
       if (e.result != null) {
+        // Witnesses are CANONICAL row state only: e.settled_at is stamped
+        // by stampSettled inside the settle txn — never the result
+        // payload (adapter-controlled, forgeable: a result carrying a
+        // "settled_at" key must not skip disposition).
         const preHandled =
-          (e.result as Record<string, unknown>).settled_at != null ||
+          e.settled_at != null ||
           handledDecisions.has(
             `${String(e.task_id ?? "")}:${String(e.execution_id)}`,
           );
         if (preHandled) {
           // Pre-upgrade settled row — stamp the marker once instead of
           // re-settling (a REJECT row would mint a duplicate chain).
+          // Marker + audit evidence commit together (R5-N2).
           try {
             const row = this.store.tryGet(
               "executor_execution",
               String(e.execution_id),
             ) as Record<string, unknown> | undefined;
             if (row && row.result != null && row.settle_complete !== true) {
-              row.settle_complete = true;
-              this.store.put(
-                "executor_execution",
-                String(row.execution_id),
-                row,
-                Number(row.version),
-              );
+              this.store.immediate(() => {
+                row.settle_complete = true;
+                this.store.put(
+                  "executor_execution",
+                  String(row.execution_id),
+                  row,
+                  Number(row.version),
+                );
+                this.store.appendEvidence(missionId, "EXECUTION_SETTLE_BACKFILLED", {
+                  execution_id: String(row.execution_id),
+                  task_id: String(row.task_id ?? ""),
+                  witness:
+                    row.settled_at != null ? "settled_at" : "recovery_decision",
+                });
+              });
             }
           } catch {
             /* best-effort backfill — the predicate re-derives each tick */
@@ -1981,32 +1994,39 @@ export class MissionRuntime {
     // entry emits durable evidence — a dropped governed signal is never
     // silent.
     const TASK_RESOLVED = new Set(["COMPLETED", "CANCELLED"]);
-    const alive = deferred.filter((d) => {
-      const t = this.store.tryGet("task", String(d.task_id));
-      if (!t || TASK_RESOLVED.has(String(t.status))) {
-        try {
+    // Prune + drop-evidence commit in ONE transaction (audit R5-M1):
+    // evidence-before-removal meant a removal fault duplicated the drop
+    // evidence; removal-before-evidence (with a swallowed catch) could
+    // drop a governed signal silently. Both commit or neither does.
+    this.store.immediate(() => {
+      const rtTxn = this.runtimeEntity(missionId);
+      const dq =
+        (rtTxn.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+      const alive = dq.filter((d) => {
+        const t = this.store.tryGet("task", String(d.task_id));
+        if (!t || TASK_RESOLVED.has(String(t.status))) {
           this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
             task_id: String(d.task_id),
             execution_id: d.execution_id ?? null,
             failure_class: String(d.failure_class),
             reason: !t ? "TASK_MISSING" : `TASK_RESOLVED:${String(t.status)}`,
           });
-        } catch { /* drop evidence is best-effort */ }
-        return false;
+          return false;
+        }
+        return true;
+      });
+      if (alive.length !== dq.length) {
+        rtTxn.deferred_recovery = alive;
+        this.store.put(
+          "mission_runtime",
+          String(rtTxn.mission_runtime_id),
+          rtTxn,
+          Number(rtTxn.version),
+        );
       }
-      return true;
-    });
-    if (alive.length !== deferred.length) {
       deferred = alive;
-      rt.deferred_recovery = deferred;
-      this.store.put(
-        "mission_runtime",
-        String(rt.mission_runtime_id),
-        rt,
-        Number(rt.version),
-      );
-      if (deferred.length === 0) return;
-    }
+    });
+    if (deferred.length === 0) return;
     const barriers =
       (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
     const idx = deferred.findIndex((d) => {
@@ -2025,6 +2045,11 @@ export class MissionRuntime {
     try {
       this.store.immediate(() => {
         const rtTxn = this.runtimeEntity(missionId);
+        // Multi-writer guard (audit R5-M3): if a racing writer armed
+        // pending_recovery between the pre-txn check and BEGIN
+        // IMMEDIATE, arming here would silently clobber it. Keep the
+        // entry queued — the signal is preserved, not lost.
+        if (rtTxn.pending_recovery) return;
         const queue =
           (rtTxn.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
         const qIdx = queue.findIndex(
@@ -2071,28 +2096,31 @@ export class MissionRuntime {
       if (armedTask === String(entry.task_id)) {
         // Defensive: the signal landed but a copy somehow stayed queued —
         // remove it so a freed pending never re-arms a duplicate chain.
-        if (qIdx2 >= 0) {
-          queue2.splice(qIdx2, 1);
-          rt2.deferred_recovery = queue2;
-          try {
-            this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
-          } catch { /* the arm already owns the outcome */ }
-        }
+        // Removal + drop evidence commit together (R5-M1).
         try {
-          this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
-            task_id: String(entry.task_id),
-            execution_id: entry.execution_id ?? null,
-            failure_class: String(entry.failure_class),
-            reason: "ARMED_THEN_THROW",
-            error: String((err as Error)?.message ?? err).slice(0, 200),
+          this.store.immediate(() => {
+            if (qIdx2 >= 0) {
+              queue2.splice(qIdx2, 1);
+              rt2.deferred_recovery = queue2;
+              this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
+            }
+            this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+              task_id: String(entry.task_id),
+              execution_id: entry.execution_id ?? null,
+              failure_class: String(entry.failure_class),
+              reason: "ARMED_THEN_THROW",
+              error: String((err as Error)?.message ?? err).slice(0, 200),
+            });
           });
-        } catch { /* drop evidence is best-effort */ }
+        } catch { /* the arm already owns the outcome */ }
       } else if (qIdx2 >= 0) {
         if (attempts >= DRAIN_ATTEMPT_BOUND) {
-          queue2.splice(qIdx2, 1);
-          rt2.deferred_recovery = queue2;
-          this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
-          try {
+          // Bound reached — the drop and its durable evidence are ONE
+          // commit: a governed signal is never dropped silently.
+          this.store.immediate(() => {
+            queue2.splice(qIdx2, 1);
+            rt2.deferred_recovery = queue2;
+            this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
             this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
               task_id: String(entry.task_id),
               execution_id: entry.execution_id ?? null,
@@ -2101,7 +2129,7 @@ export class MissionRuntime {
               drain_attempts: attempts,
               error: String((err as Error)?.message ?? err).slice(0, 200),
             });
-          } catch { /* drop evidence is best-effort */ }
+          });
         } else {
           queue2[qIdx2] = { ...queue2[qIdx2], drain_attempts: attempts };
           rt2.deferred_recovery = queue2;
@@ -2119,6 +2147,7 @@ export class MissionRuntime {
             task_id: String(entry.task_id),
             execution_id: entry.execution_id ?? null,
             failure_class: String(entry.failure_class),
+            reason: "DRAIN_ATTEMPT_BOUND",
             drain_attempts: attempts,
             error: String((err as Error)?.message ?? err).slice(0, 200),
           });
@@ -2156,6 +2185,17 @@ export class MissionRuntime {
     // through `settle_complete !== true` and the next tick re-drives
     // settlement — no partial settlement state can exist.
     this.store.immediate(() => {
+      // Replay guard (audit R5-H2): an apply-path adoption or a second
+      // sweep pass can re-enter settleExecution on an already-settled
+      // row. Without this check a full disposition would re-run —
+      // duplicate TASK_COMPLETED events in the append-only journal, and
+      // for FAILED results a fresh decision would clobber the chain's
+      // successor arm. Re-read inside the txn: settle_complete is the
+      // single durable witness that disposition already committed.
+      const prior = this.store.tryGet("executor_execution", executionId) as
+        | Record<string, unknown>
+        | null;
+      if (prior && prior.settle_complete === true) return;
       this.settleCommitted(missionId, executionId, sameChainContinuation);
       // Marks "the canonical settle pass committed" on EVERY disposition
       // path — including validation-REJECT→recovery handoffs, which
@@ -3010,18 +3050,24 @@ export class MissionRuntime {
           barrier.settled === true &&
           barrierOutcome === "CONFIRMED_NOT_EXECUTED"
         ) {
-          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_confirmed_not_executed");
-          this.startRecovery(
-            missionId,
-            taskId,
-            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
-            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-            {
-              outcome: barrierOutcome,
-              reconciliation_id: String(barrier.last_receipt_id ?? ""),
-            },
-          );
+          // Atomic (audit R5-H3): clearing the spent pending and minting
+          // the successor decision is ONE commit — a crash between them
+          // would orphan the operator-approved CONFIRMED_NOT_EXECUTED
+          // signal (pending cleared, nothing armed → mission fails).
+          this.store.immediate(() => {
+            this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_confirmed_not_executed");
+            this.startRecovery(
+              missionId,
+              taskId,
+              pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+              pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+              now,
+              {
+                outcome: barrierOutcome,
+                reconciliation_id: String(barrier.last_receipt_id ?? ""),
+              },
+            );
+          });
         } else if (barrier && barrier.settled === true) {
           // Settled with any other verdict — the reconcile outcome was
           // already applied (settle/escalate); the stale pending action
@@ -3032,14 +3078,17 @@ export class MissionRuntime {
           // Pending reconciliation with no barrier evidence — a fresh
           // governed decision re-drives; it may legitimately select
           // RECONCILIATION_REQUIRED again and rebuild the barrier.
-          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_barrier_absent");
-          this.startRecovery(
-            missionId,
-            taskId,
-            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
-            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-          );
+          // Same atomicity requirement as the confirmed path above.
+          this.store.immediate(() => {
+            this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_barrier_absent");
+            this.startRecovery(
+              missionId,
+              taskId,
+              pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+              pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+              now,
+            );
+          });
         } else {
           // Barrier still unsettled — let the RECONCILING path settle it.
           this.transitionRuntime(missionId, "RECONCILING", "reconcile_pending");

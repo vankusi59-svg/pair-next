@@ -119,3 +119,52 @@ witness and still self-heal through `settleExecution`.
   coverage in RA-2/RA-3/RA-11.
 - `EXECUTION_COLLECTION_EXCLUDED` reason taxonomy preserved:
   `deterministic` / `post_commit` / `attempt_bound`.
+
+## Phase K round 5 — second-pass audit findings closed
+
+A second independent pass (FIX-THEN-SHIP) audited the remediated spine
+and found deeper issues; all CRITICAL/HIGH/MEDIUM closed:
+
+**R5-H1 — upgrade witness used an adapter-controllable field (closed).**
+The F14 backfill read `result.settled_at` — a key the executor result
+payload could carry (dead witness AND a forgeable skip-settlement path).
+Corrected to the canonical row-level `e.settled_at` (stamped by
+`stampSettled` inside the settle txn). The decision witness is
+unchanged. Doc corrected — `result.settled_at` is not canonical.
+
+**R5-H2 — settleExecution had no settle_complete early-return
+(closed).** An apply-path adoption replay or second sweep pass could
+re-run the full disposition on an already-settled row (duplicate
+TASK_COMPLETED events; FAILED-path re-decision clobbering the chain's
+successor arm). `settleExecution` now re-reads the row inside the txn
+and returns when `settle_complete === true`.
+
+**R5-H3 — clearPendingRecovery → re-decide was two commits (closed).**
+On the RECONCILIATION_REQUIRED apply path (CONFIRMED_NOT_EXECUTED and
+barrier-absent branches), the pending clear and the successor decide
+now commit in one `immediate()` — a crash can no longer convert an
+operator-approved outcome into silent mission failure.
+
+**R5-M1 — drop evidence not exactly-once (closed).** The stale-prune
+emitted evidence before its removal put (duplicate evidence on fault);
+the bound-drop and armed-copy paths removed before evidence with a
+swallowed catch (silent drop). All three now commit removal+evidence in
+one `immediate()`; the final-else drop gained the missing `reason`.
+
+**R5-M2 — committed-unsettled rows on terminal missions (closed).**
+`settleTerminalMissionOrphans` now also neutralizes rows with
+`result!=null && settle_complete!==true` on terminal missions —
+governed `terminal_outcome=MISSION_TERMINAL_BEFORE_SETTLE` + event,
+one transaction, idempotent.
+
+**R5-M3 — drain txn lacked an in-txn pending check (closed).** A racing
+writer arming pending between the pre-check and BEGIN IMMEDIATE would
+have been clobbered; the txn now returns early on `pending_recovery`,
+keeping the entry queued.
+
+**Residual LOWs (accepted, documented):** faultInjector is test-only by
+convention; settle txn spans bounded local file IO under the write
+lock; counter puts that themselves fault rely on the in-memory bound;
+a permanently faulting row write can under-persist counters;
+IntegrityError-classify determinism sweeps a transient CAS race into
+instant exclusion (single-writer makes this near-unreachable).
