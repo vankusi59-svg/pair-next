@@ -356,11 +356,22 @@ describe("P18.4-C — real multi-executor E2E", () => {
       failedN = rows.filter((r) => String(r.execution_state) === "FAILED" || String(r.result?.status ?? "") === "FAILED").length;
       okN = rows.filter((r) => String(r.execution_state) === "COMPLETED").length;
     }
-    expect(failedN).toBe(1);
-    expect(okN).toBe(1);
+    const dump = () => JSON.stringify({
+      signal,
+      mission: String(ctx.service.getMission(mid).status),
+      rt: { state: rtRow(ctx, mid).state, pend: rtRow(ctx, mid).pending_recovery != null, def: ((rtRow(ctx, mid).deferred_recovery as unknown[]) ?? []).length },
+      execs: execs().map((e) => {
+        const r = execRow(ctx, String(e.execution_id));
+        return { eid: String(r.execution_id).slice(-8), state: r.execution_state, rs: (r.result as Record<string, unknown> | undefined)?.status ?? null, sc: r.settle_complete ?? null, obs: (r.last_observation as Record<string, unknown> | undefined)?.status ?? null };
+      }),
+      tasks: ctx.store.list("task").filter((t) => t.mission_id === mid).map((t) => `${t.task_key}:${t.status}`),
+      decs: ctx.store.list("recovery_decision").filter((d) => d.mission_id === mid).map((d) => `${String(d.task_id).slice(-8)}:${d.selected_action}`),
+    });
+    expect(failedN, `failed sibling expected: ${dump()}`).toBe(1);
+    expect(okN, `completed sibling expected: ${dump()}`).toBe(1);
     // Failed sibling reached a governed recovery signal — pending or
     // deferred or a recorded decision — while the success settled.
-    expect(signal).toBe(true);
+    expect(signal, `recovery signal expected: ${dump()}`).toBe(true);
   }, 120_000);
 
   it("E2E-4 supervisor restart: new object graph over same durable state recovers without duplicate dispatch", async () => {
