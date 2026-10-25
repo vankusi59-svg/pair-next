@@ -492,3 +492,122 @@ export interface ExecutorRow {
   missing_prerequisites: string[];
   [k: string]: unknown;
 }
+
+/* ---- P18.4-B — canonical liveness + recovery operations projections.
+   Mirrors executionHealth() / recoveryOps() / operationsOverview() in
+   src/pair/mission-observability.ts: every field is classified
+   persisted / observed / derived / unknown — read-only, never a
+   second truth store. */
+
+export type ExecutionHealthStage =
+  | "NEUTRALIZED" | "SETTLED" | "EXCLUDED" | "RESULT_COMMITTED"
+  | "TERMINAL_OBSERVED" | "OBSERVED" | "DISPATCHED";
+
+export interface ExecutionHealthRow {
+  execution_id: string;
+  task_id: string;
+  governed_task_id: string;
+  executor_id: string;
+  persisted: {
+    execution_state: string;
+    result_committed: boolean;
+    settle_complete: boolean;
+    settled_at: string | null;
+    collection_started_at: string | null;
+    collection_attempts: number;
+    collection_committed_at: string | null;
+    collect_excluded: Record<string, unknown> | null;
+    terminal_outcome: Record<string, unknown> | null;
+    dispatch_timestamp: string | null;
+    run_root: string | null;
+    orphan_unobservable: { final: boolean; count: number } | null;
+    [k: string]: unknown;
+  };
+  observed: {
+    last_status: unknown;
+    last_observed_at: string | null;
+    observe_count: number;
+    observe_faults: number;
+    first_terminal_observed_at: string | null;
+    heartbeat_at: unknown;
+    finished_at: unknown;
+    blocking_reason: unknown;
+    [k: string]: unknown;
+  };
+  derived: {
+    stage: ExecutionHealthStage;
+    abnormal: string[];
+    latency_ms: {
+      dispatch_to_terminal_observed: number | null;
+      terminal_observed_to_collect: number | null;
+      terminal_observed_to_settled: number | null;
+      [k: string]: unknown;
+    };
+    [k: string]: unknown;
+  };
+  unknowns: string[];
+  [k: string]: unknown;
+}
+
+export interface MissionRecoveryOps {
+  mission_id: string;
+  runtime_state: string | null;
+  pending_recovery: Record<string, unknown> | null;
+  deferred_recovery: Array<Record<string, unknown>>;
+  barriers: Record<string, { settled?: boolean; reason?: string; [k: string]: unknown }>;
+  backoff: Array<{
+    scheduled_action_id: unknown;
+    task_id: unknown;
+    recovery_id: unknown;
+    action: unknown;
+    status: unknown;
+    due_at: unknown;
+    [k: string]: unknown;
+  }>;
+  approvals_pending: Array<Record<string, unknown>>;
+  decisions: Array<Record<string, unknown>>;
+  attempts: Array<Record<string, unknown>>;
+  reconciliation_receipts: Array<Record<string, unknown>>;
+  allowed_actions: {
+    decide_approval: boolean;
+    request_reconciliation: boolean;
+    lifecycle: boolean;
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}
+
+/* GET /api/missions/:id/operations — full response body. */
+export interface MissionOperations {
+  execution_health: { executions: ExecutionHealthRow[]; [k: string]: unknown };
+  recovery_ops: MissionRecoveryOps;
+  [k: string]: unknown;
+}
+
+/* GET /api/operations — bounded aggregate rollup over canonical rows. */
+export interface OperationsOverview {
+  operations: {
+    missions_running: number;
+    missions_paused: number;
+    executions_awaiting_collection: number;
+    executions_committed_unsettled: number;
+    recoveries_active: number;
+    recoveries_deferred: number;
+    reconciliation_barriers_open: number;
+    approvals_pending: number;
+    executions_orphan_unobservable: number;
+    executions_never_observed: number;
+    recovery_blocked_or_escalated: number;
+    work_items_blocked: number;
+    liveness_detect_ms_p50: number;
+    liveness_detect_ms_p95: number;
+    liveness_detect_ms_max?: number;
+    liveness_collect_ms_p50: number;
+    liveness_collect_ms_p95: number;
+    liveness_settle_ms_p50: number;
+    liveness_settle_ms_p95: number;
+    liveness_settle_ms_max?: number;
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}

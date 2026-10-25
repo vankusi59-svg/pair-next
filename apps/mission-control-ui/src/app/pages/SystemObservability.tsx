@@ -12,7 +12,7 @@ import {
    endpoints; stale responses are pinned by request identity. */
 
 type Row = Record<string, unknown>;
-type Tab = "events" | "routing" | "recovery" | "evidence";
+type Tab = "events" | "routing" | "recovery" | "evidence" | "operations";
 type Sec<T> =
   | { kind: "loading" }
   | { kind: "ready"; data: T }
@@ -217,6 +217,96 @@ function RecoveryExplorer() {
   );
 }
 
+/* P18.4-B — /api/operations rollup: bounded aggregate counts over
+   canonical rows. Order is the operator's "what needs attention"
+   reading — mission pressure, collection/settlement debt, recovery
+   backlog, open barriers, approvals, liveness incident classes. */
+const OPS_COUNTS: Array<[string, string]> = [
+  ["missions_running", "missions running"],
+  ["missions_paused", "missions paused"],
+  ["executions_awaiting_collection", "executions awaiting collection"],
+  ["executions_committed_unsettled", "executions committed unsettled"],
+  ["recoveries_active", "recoveries active"],
+  ["recoveries_deferred", "recoveries deferred"],
+  ["reconciliation_barriers_open", "reconciliation barriers open"],
+  ["approvals_pending", "approvals pending"],
+  ["executions_orphan_unobservable", "executions orphan-unobservable"],
+  ["executions_never_observed", "executions never observed"],
+  ["recovery_blocked_or_escalated", "recovery blocked/escalated"],
+  ["work_items_blocked", "work items blocked"],
+];
+/* Canonical latency chain (persisted timestamps only):
+   dispatch → terminal-observed → collect-commit → settled. */
+const OPS_LIVENESS: Array<[string, string]> = [
+  ["liveness_detect_ms_p50", "detect p50"],
+  ["liveness_detect_ms_p95", "detect p95"],
+  ["liveness_collect_ms_p50", "collect p50"],
+  ["liveness_collect_ms_p95", "collect p95"],
+  ["liveness_settle_ms_p50", "settle p50"],
+  ["liveness_settle_ms_p95", "settle p95"],
+];
+
+function OperationsExplorer() {
+  const [sec, setSec] = useState<Sec<Row>>({ kind: "loading" });
+  const [tick, setTick] = useState(0);
+  useLiveRefresh(() => setTick((t) => t + 1));
+  useEffect(() => {
+    const ctl = new AbortController();
+    setSec({ kind: "loading" });
+    apiAdmin.operationsOverview(ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        if (!isObj(r) || !isObj(r.operations)) {
+          setSec({ kind: "error", err: new ApiError(200, "MALFORMED", "GET /api/operations returned a malformed payload") });
+          return;
+        }
+        setSec({ kind: "ready", data: r.operations });
+      })
+      .catch((e) => !ctl.signal.aborted && setSec({ kind: "error", err: errOf(e) }));
+    return () => ctl.abort();
+  }, [tick]);
+  if (sec.kind === "loading") return <section className="need"><Skeleton height={120} /></section>;
+  if (sec.kind === "error") return <section className="need"><SecError sec={sec} /></section>;
+  const ops = sec.data;
+  const allZero = OPS_COUNTS.every(([k]) => Number(ops[k] ?? 0) === 0);
+  return (
+    <section className="need" aria-label="operations rollup">
+      <h2>Operational pressure</h2>
+      <p className="sub srcnote">
+        <code>GET /api/operations</code> — bounded aggregate counts over canonical rows;
+        nothing inferred, nothing synthesized.
+      </p>
+      {allZero ? (
+        <EmptyState title="No operational pressure" detail="Every aggregate pressure count is zero — no mission, collection, recovery, barrier or approval backlog." />
+      ) : (
+        <div className="tbl-wrap"><table className="tbl">
+          <thead><tr><th>signal</th><th>count</th></tr></thead>
+          <tbody>
+            {OPS_COUNTS.map(([k, label]) => (
+              <tr key={k}>
+                <td className="muted">{label}</td>
+                <td className="mono">{Number.isFinite(Number(ops[k])) ? Number(ops[k]) : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
+      <h2>Liveness latency</h2>
+      <div className="tbl-wrap"><table className="tbl">
+        <thead><tr><th>chain</th><th>latency</th></tr></thead>
+        <tbody>
+          {OPS_LIVENESS.map(([k, label]) => (
+            <tr key={k}>
+              <td className="muted">{label}</td>
+              <td className="mono">{Number.isFinite(Number(ops[k])) ? `${Number(ops[k])} ms` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table></div>
+    </section>
+  );
+}
+
 function EvidenceExplorer() {
   const [msec, setMsec] = useState<Sec<Row[]>>({ kind: "loading" });
   const [missionId, setMissionId] = useState("");
@@ -349,10 +439,10 @@ export function SystemObservability() {
         Global technical observability surface — never business-scoped company activity.
       </p>
       <div className="tabs" role="tablist">
-        {(["events", "routing", "recovery", "evidence"] as Tab[]).map((t) => (
+        {(["events", "routing", "recovery", "evidence", "operations"] as Tab[]).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "on" : ""}
             onClick={() => setTab(t)}>
-            {t === "events" ? "Event stream" : t === "routing" ? "Routing" : t === "recovery" ? "Recovery" : "Evidence"}
+            {t === "events" ? "Event stream" : t === "routing" ? "Routing" : t === "recovery" ? "Recovery" : t === "evidence" ? "Evidence" : "Operations"}
           </button>
         ))}
       </div>
@@ -360,6 +450,7 @@ export function SystemObservability() {
       {tab === "routing" && <RoutingExplorer />}
       {tab === "recovery" && <RecoveryExplorer />}
       {tab === "evidence" && <EvidenceExplorer />}
+      {tab === "operations" && <OperationsExplorer />}
     </div>
   );
 }

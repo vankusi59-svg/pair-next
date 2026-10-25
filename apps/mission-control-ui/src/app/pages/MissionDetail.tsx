@@ -5,14 +5,19 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ErrorState, Skeleton } from "../components/states";
 import { StatusBadge } from "../components/StatusBadge";
 import { DagView } from "../../components/Dag";
-import type { Dag, MissionDetail as Detail, MissionFileRow, TimelineEntry } from "../types";
+import type {
+  Dag, MissionDetail as Detail, MissionFileRow, MissionOperations, TimelineEntry,
+} from "../types";
 
 /* P15.9-B5.3 — Mission Detail. Primary read verifies the returned
    mission identity === URL id before rendering. Subordinate reads
-   (dag/timeline/evidence/files) settle independently with element
-   validation; malformed → UNAVAILABLE, never a fake empty section.
-   Lifecycle actions via pinned ConfirmDialog only — no optimistic
-   state, canonical refetch after success. */
+   (dag/timeline/evidence/files/operations) settle independently with
+   element validation; malformed → UNAVAILABLE, never a fake empty
+   section. Lifecycle actions via pinned ConfirmDialog only — no
+   optimistic state, canonical refetch after success.
+   P18.4-B — execution health + recovery operations are the server's
+   read-only persisted/observed/derived/unknown projection; the only
+   controls remain the existing lifecycle buttons and inbox links. */
 
 type Section<T> = { kind: "ready"; data: T } | { kind: "unavailable"; code: string };
 /* R2-B: lineage evidence is tri-state — a proven canonical chain yields the
@@ -43,11 +48,23 @@ type St =
       timeline: Section<TimelineEntry[]>;
       evidence: Section<Array<Record<string, unknown>>>;
       files: Section<MissionFileRow[]>;
+      ops: Section<MissionOperations>;
       lineage: Lineage | null;
     }
   | { kind: "error"; err: ApiError };
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "ABORTED"]);
+/* P18.4-B — no timestamp synthesis: null/empty renders as "—". */
+const ts = (v: unknown) =>
+  v == null || v === "" ? "—" : String(v).replace("T", " ").slice(0, 19);
+/* derived.stage tone — the badge is clearly labeled as the DERIVED
+   stage; canonical truth stays persisted.execution_state beside it. */
+const stageTone = (s: string) =>
+  s === "SETTLED" ? "ok"
+    : s === "DISPATCHED" || s === "OBSERVED" ? "info"
+      : s === "TERMINAL_OBSERVED" || s === "RESULT_COMMITTED" ? "purple"
+        : s === "EXCLUDED" || s === "NEUTRALIZED" ? "warn"
+          : "unknown";
 const rowOk = (e: unknown, idf: string) =>
   e !== null && typeof e === "object" && (e as Record<string, unknown>)[idf] != null;
 
@@ -125,12 +142,13 @@ export function MissionDetailPage() {
          without it the chain cannot be proven, so the backlink is
          omitted (never an unfiltered guess). */
       const wantLineage = openId !== "" && wiOpen === openId && wiId !== "" && bizId !== "";
-      const [dagR, tlR, evR, fR, wiR] = await Promise.allSettled([
+      const [dagR, tlR, evR, fR, wiR, opsR] = await Promise.allSettled([
         apiAdmin.missionDag(id, ctl.signal),
         apiAdmin.missionTimeline(id, ctl.signal),
         apiAdmin.missionEvidence(id, ctl.signal),
         apiAdmin.missionFiles(id, ctl.signal),
         wantLineage ? apiAdmin.workItems(bizId, ctl.signal) : Promise.resolve(null),
+        apiAdmin.missionOperations(id, ctl.signal),
       ]);
       if (ctl.signal.aborted) return;
       /* R2-B: the scoped work-items response is lineage EVIDENCE —
@@ -180,11 +198,46 @@ export function MissionDetailPage() {
         }
         return s;
       })();
+      /* P18.4-B: the operations projection must be scoped to THIS
+         mission — a payload naming another mission or missing a
+         canonical list fails closed (absent ≠ empty). */
+      const opsSec = (() => {
+        const s = sect(opsR, (v) => (v && typeof v === "object"
+          && v.execution_health !== null && typeof v.execution_health === "object"
+          && Array.isArray(v.execution_health.executions)
+          && v.recovery_ops !== null && typeof v.recovery_ops === "object"
+          ? [v] : null));
+        if (s.kind === "ready") {
+          const mo = s.data[0];
+          const ro = mo.recovery_ops;
+          const objArr = (k: string) => {
+            const a = (ro as Record<string, unknown>)[k];
+            return Array.isArray(a) && a.every((e) => e !== null && typeof e === "object");
+          };
+          const ok = String(ro.mission_id ?? "") === id
+            && (ro.pending_recovery === null || typeof ro.pending_recovery === "object")
+            && ro.barriers !== null && typeof ro.barriers === "object" && !Array.isArray(ro.barriers)
+            && ro.allowed_actions !== null && typeof ro.allowed_actions === "object"
+            && ["deferred_recovery", "backoff", "approvals_pending", "decisions",
+              "attempts", "reconciliation_receipts"].every(objArr)
+            && mo.execution_health.executions.every((e) => e !== null && typeof e === "object"
+              && e.execution_id != null
+              && e.persisted !== null && typeof e.persisted === "object"
+              && e.observed !== null && typeof e.observed === "object"
+              && e.derived !== null && typeof e.derived === "object"
+              && typeof e.derived.stage === "string"
+              && Array.isArray(e.derived.abnormal)
+              && Array.isArray(e.unknowns));
+          return ok ? { kind: "ready" as const, data: mo } : { kind: "unavailable" as const, code: "MALFORMED" };
+        }
+        return s;
+      })();
       setSt({
         kind: "ready",
         forId: id,
         detail: d,
         dag: dagSec,
+        ops: opsSec,
         timeline: sect(tlR, (v) => (Array.isArray(v) ? v : null), "at"),
         evidence: sect(evR, (v) => (Array.isArray(v) ? v : null), "kind"),
         files: sect(fR, (v) => (v && Array.isArray(v.files) ? v.files : null), "path"),
@@ -318,6 +371,115 @@ export function MissionDetailPage() {
           </div>
         </>
       )}
+
+      {st.ops.kind === "unavailable" ? unv("execution health", st.ops.code) : (
+        <>
+          <h2 className="sech">Execution health ({st.ops.data.execution_health.executions.length})</h2>
+          <div className="need">
+            {st.ops.data.execution_health.executions.length === 0 ? (
+              <div className="nrow"><span className="note">No executions in the liveness projection.</span></div>
+            ) : st.ops.data.execution_health.executions.map((h) => {
+              const lat = h.derived.latency_ms;
+              const latBits = [
+                lat.dispatch_to_terminal_observed != null ? `detect ${lat.dispatch_to_terminal_observed}ms` : null,
+                lat.terminal_observed_to_collect != null ? `collect ${lat.terminal_observed_to_collect}ms` : null,
+                lat.terminal_observed_to_settled != null ? `settle ${lat.terminal_observed_to_settled}ms` : null,
+              ].filter(Boolean).join(" · ");
+              return (
+                <div className="nrow" key={h.execution_id}>
+                  <code className="mono">{String(h.execution_id).slice(0, 24)}</code>
+                  <StatusBadge tone={stageTone(h.derived.stage)} label={h.derived.stage} />
+                  <span>{String(h.executor_id || "—")}</span>
+                  <StatusBadge tone="info" label={String(h.persisted.execution_state ?? "—")} />
+                  <span className="note">obs ×{h.observed.observe_count} · last {ts(h.observed.last_observed_at)}</span>
+                  <span className="note">collect ×{h.persisted.collection_attempts}{h.persisted.collection_committed_at ? ` ✓ ${ts(h.persisted.collection_committed_at)}` : ""}</span>
+                  <span className="note">settled {ts(h.persisted.settled_at)}</span>
+                  {latBits ? <span className="note mono">{latBits}</span> : null}
+                  {h.derived.abnormal.map((a) => <StatusBadge key={a} tone="warn" label={a} />)}
+                  {h.unknowns.length > 0 ? <span className="note">unknowns: {h.unknowns.join(", ")}</span> : null}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {st.ops.kind === "unavailable" ? unv("recovery operations", st.ops.code) : (() => {
+        const ro = st.ops.data.recovery_ops;
+        const pend = ro.pending_recovery;
+        const openBarriers = Object.entries(ro.barriers ?? {})
+          .filter(([, b]) => b == null || b.settled !== true);
+        const allowed = ro.allowed_actions;
+        const permitted = [
+          allowed.decide_approval === true ? "decide_approval → Owner Inbox" : null,
+          allowed.request_reconciliation === true ? "request_reconciliation" : null,
+          allowed.lifecycle === true ? "lifecycle (existing mission controls)" : null,
+        ].filter(Boolean).join(" · ") || "none reported";
+        return (
+          <>
+            <h2 className="sech">Recovery operations</h2>
+            <div className="need">
+              <div className="nrow"><span className="tt">Runtime</span>
+                <StatusBadge tone="info" label={String(ro.runtime_state ?? "—")} /></div>
+              {pend ? (
+                <div className="nrow">
+                  <StatusBadge tone="warn" label="PENDING RECOVERY" />
+                  <span className="mono">{String(pend.action ?? pend.decision ?? "—")}</span>
+                  <span className="note">{[
+                    pend.failure_class != null ? String(pend.failure_class) : null,
+                    pend.reason != null ? String(pend.reason) : null,
+                    pend.task_id != null ? `task ${String(pend.task_id).slice(0, 24)}` : null,
+                    pend.recovery_id != null ? `rec ${String(pend.recovery_id).slice(0, 24)}` : null,
+                  ].filter(Boolean).join(" · ") || "—"}</span>
+                </div>
+              ) : null}
+              <div className="nrow"><span className="tt">Deferred</span>
+                <span className="note">{ro.deferred_recovery.length} queued</span></div>
+              {ro.deferred_recovery.map((dfr, i) => (
+                <div className="nrow" key={i}>
+                  <StatusBadge tone="info" label="DEFERRED" />
+                  <span className="note">{[
+                    dfr.task_id != null ? `task ${String(dfr.task_id).slice(0, 24)}` : null,
+                    dfr.failure_class != null ? String(dfr.failure_class) : null,
+                    dfr.queued_at != null ? `queued ${ts(dfr.queued_at)}` : null,
+                    dfr.drain_attempts != null ? `drain ×${String(dfr.drain_attempts)}` : null,
+                  ].filter(Boolean).join(" · ") || "—"}</span>
+                </div>
+              ))}
+              {ro.backoff.map((b, i) => (
+                <div className="nrow" key={i}>
+                  <StatusBadge tone="info" label={String(b.status ?? "—")} />
+                  <span className="mono">{typeof b.action === "string" ? b.action : (JSON.stringify(b.action) ?? "—")}</span>
+                  <span className="note">due {ts(b.due_at)}{[
+                    b.task_id != null ? ` · task ${String(b.task_id).slice(0, 24)}` : null,
+                    b.recovery_id != null ? ` · rec ${String(b.recovery_id).slice(0, 24)}` : null,
+                  ].filter(Boolean).join("")}</span>
+                </div>
+              ))}
+              {openBarriers.map(([k, b]) => (
+                <div className="nrow" key={k}>
+                  <StatusBadge tone="warn" label="BARRIER OPEN" />
+                  <code className="mono">{k.slice(0, 24)}</code>
+                  <span className="note">{String(b?.reason ?? b?.kind ?? "—")}{b?.since ? ` · since ${ts(b.since)}` : ""}</span>
+                </div>
+              ))}
+              {ro.approvals_pending.map((a, i) => (
+                <div className="nrow" key={String(a.approval_id ?? a.entity_id ?? i)}>
+                  <code className="mono">{String(a.approval_id ?? a.entity_id ?? "—")}</code>
+                  <span>{String(a.reason ?? a.kind ?? "")}</span>
+                  <Link className="lnk" to="/app/inbox">decide in Owner Inbox →</Link>
+                </div>
+              ))}
+              <div className="nrow"><span className="note">history: decisions {ro.decisions.length} · attempts {ro.attempts.length} · reconciliation receipts {ro.reconciliation_receipts.length}</span></div>
+              <div className="nrow"><span className="tt">Permitted</span><span className="note">{permitted}</span></div>
+              {allowed.request_reconciliation === true ? (
+                <div className="nrow"><span className="note">reconciliation may be requested via the canonical reconcile endpoint — no inline control is offered on this read-only page.</span></div>
+              ) : null}
+              <div className="nrow"><span className="note">read-only projection — persisted/observed/derived/unknown classified server-side; observed data is never a canonical claim.</span></div>
+            </div>
+          </>
+        );
+      })()}
 
       <h2 className="sech">Workspace files</h2>
       {st.files.kind === "unavailable" ? unv("file listing", st.files.code) : st.files.data.length === 0 ? (
