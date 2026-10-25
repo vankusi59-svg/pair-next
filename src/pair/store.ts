@@ -65,6 +65,18 @@ export function isSqliteContentionError(e: unknown): boolean {
 export class PairEvidenceStore {
   readonly db: Database.Database;
   private readBudget: { entities: number; events: number } | null = null;
+  /** Test-only crash-injection seam: when set, invoked immediately BEFORE
+   *  every durable write (put/event/appendEvidence). Throwing aborts the
+   *  write — inside `immediate()` the whole transaction rolls back, which
+   *  is exactly the durable state a power-loss/SIGKILL crash leaves at
+   *  that write boundary. Never set in production paths. */
+  faultInjector?: (op: {
+    kind: "put" | "event" | "evidence";
+    entityType?: string;
+    entityId?: string;
+    eventType?: string;
+    evidenceKind?: string;
+  }) => void;
   /** Directory holding pair.db — canonical deployment root for
    *  co-located durable state (F1 artifact blob store). */
   readonly dbDir: string;
@@ -325,6 +337,7 @@ export class PairEvidenceStore {
     payload: T,
     expectedVersion?: number,
   ): T & { entity_type: string; entity_id: string; version: number } {
+    this.faultInjector?.({ kind: "put", entityType, entityId });
     PairEvidenceStore.assertSecretFree(payload);
     const version = Number(payload.version ?? 0);
     if (expectedVersion !== undefined && version !== expectedVersion) {
@@ -477,6 +490,12 @@ export class PairEvidenceStore {
   }): string {
     // R4 §1: events are canonical too — no secret material in metadata or
     // state fields.
+    this.faultInjector?.({
+      kind: "event",
+      entityType: params.entity_type,
+      entityId: params.entity_id,
+      eventType: params.event_type,
+    });
     PairEvidenceStore.assertSecretFree({
       metadata: params.metadata ?? null,
       old_state: params.old_state ?? null,
@@ -560,6 +579,7 @@ export class PairEvidenceStore {
     kind: string,
     payload: Record<string, unknown>,
   ): { evidence_id: string; payload_hash: string } {
+    this.faultInjector?.({ kind: "evidence", entityId: missionId, evidenceKind: kind });
     PairEvidenceStore.assertSecretFree(payload);
     const evidenceId = newId("EVD");
     const body = { evidence_id: evidenceId, mission_id: missionId, kind, payload };

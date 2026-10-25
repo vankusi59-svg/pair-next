@@ -149,6 +149,8 @@ const COLLECT_LIVE_STATES = new Set<MissionRuntimeState>([
  *  governed errors (IntegrityError/PolicyError) never wait this long —
  *  they route into RESULT_SCHEMA recovery on the first fault. */
 const COLLECT_FAULT_BOUND = 24;
+// Bounded retries for a deferred-entry drain whose handoff txn faults.
+const DRAIN_ATTEMPT_BOUND = 5;
 
 /** Bounded durable retry budget for potentially-transient planning
  *  failures before the canonical PLANNING→FAILED terminalization. */
@@ -1633,7 +1635,7 @@ export class MissionRuntime {
           // NOT drop the row from the sweep: it stays eligible until a
           // validated result is committed (exactly-once) or a governed
           // recovery/operator path settles it.
-          e.result == null &&
+          (e.result == null || e.settle_complete !== true) &&
           !e.terminal_outcome && // Phase D §5 — operator-neutralized
           // P18.3 audit R1 — a row handed to governed recovery for a
           // deterministic collect fault leaves eligibility permanently:
@@ -1644,7 +1646,76 @@ export class MissionRuntime {
           e.collect_excluded == null &&
           !barrieredExecs.has(String(e.execution_id)),
       );
+    // Upgrade-edge witnesses: rows settled before `settle_complete`
+    // existed carry no marker, but a PASS disposition stamps the
+    // row-level settled_at (never executor-controlled result fields)
+    // and a REJECT disposition mints a recovery_decision for
+    // (task, execution). Built once per sweep.
+    const handledDecisions = new Set(
+      this.store
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === missionId)
+        .map(
+          (d) =>
+            `${String(d.task_id ?? "")}:${String(d.execution_id ?? "")}`,
+        ),
+    );
     for (const e of inFlight) {
+      // P18.4-A — a committed-but-unsettled result (crash between result
+      // commit and the settle transaction) re-enters here and settles
+      // with NO adapter and NO fresh observe: settlement consumes only
+      // canonical state. settleExecution's transaction + dedup keep the
+      // re-run exactly-once.
+      if (e.result != null) {
+        // Witnesses are CANONICAL row state only: e.settled_at is stamped
+        // by stampSettled inside the settle txn — never the result
+        // payload (adapter-controlled, forgeable: a result carrying a
+        // "settled_at" key must not skip disposition).
+        const preHandled =
+          e.settled_at != null ||
+          handledDecisions.has(
+            `${String(e.task_id ?? "")}:${String(e.execution_id)}`,
+          );
+        if (preHandled) {
+          // Pre-upgrade settled row — stamp the marker once instead of
+          // re-settling (a REJECT row would mint a duplicate chain).
+          // Marker + audit evidence commit together (R5-N2).
+          try {
+            const row = this.store.tryGet(
+              "executor_execution",
+              String(e.execution_id),
+            ) as Record<string, unknown> | undefined;
+            if (row && row.result != null && row.settle_complete !== true) {
+              this.store.immediate(() => {
+                row.settle_complete = true;
+                this.store.put(
+                  "executor_execution",
+                  String(row.execution_id),
+                  row,
+                  Number(row.version),
+                );
+                this.store.appendEvidence(missionId, "EXECUTION_SETTLE_BACKFILLED", {
+                  execution_id: String(row.execution_id),
+                  task_id: String(row.task_id ?? ""),
+                  witness:
+                    row.settled_at != null ? "settled_at" : "recovery_decision",
+                });
+              });
+            }
+          } catch {
+            /* best-effort backfill — the predicate re-derives each tick */
+          }
+          continue;
+        }
+        try {
+          this.settleExecution(missionId, String(e.execution_id));
+        } catch (err) {
+          if (this.handleSettleFault(missionId, e, err, now)) return;
+        }
+        const rtNow = String(this.runtimeEntity(missionId).state);
+        if (rtNow !== entryState) return;
+        continue;
+      }
       const adapter = this.deps.adapters.get(String(e.executor_id));
       if (!adapter) {
         // An unbound adapter is a liveness-blocking fact, not a crash:
@@ -1687,11 +1758,18 @@ export class MissionRuntime {
           this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
         } catch { /* liveness hint is best-effort */ }
         if (faults >= COLLECT_FAULT_BOUND) {
-          this.markCollectExcluded(fresh, "OBSERVE_FAULT_BOUND", "observe_execution threw");
-          if (this.queueOrStartRecovery(
-            missionId, String(e.task_id), String(e.execution_id),
-            "UNKNOWN_SIDE_EFFECT_STATE", now,
-          )) return;
+          // P18.4 audit — exclusion and its successor signal commit in
+          // ONE transaction: a fault between an excluded row and its
+          // recovery arm would strand the task permanently (excluded
+          // from the sweep, no signal, no terminal disposition).
+          const armed = this.store.immediate(() => {
+            this.markCollectExcluded(fresh, "OBSERVE_FAULT_BOUND", "observe_execution threw");
+            return this.queueOrStartRecovery(
+              missionId, String(e.task_id), String(e.execution_id),
+              "UNKNOWN_SIDE_EFFECT_STATE", now,
+            );
+          });
+          if (armed) return;
         }
         continue;
       }
@@ -1717,47 +1795,7 @@ export class MissionRuntime {
       try {
         this.settleExecution(missionId, String(observed.execution_id));
       } catch (err) {
-        // Settlement fault — a PRE-COMMIT failure leaves the row
-        // in-flight (result==null) and is retried next tick; a
-        // POST-COMMIT fault can never re-enter the sweep and is bounded
-        // immediately below. Collect faults are always bounded:
-        // deterministic governed failures (IntegrityError /
-        // PolicyError carrying a FAIL_CLOSED code — malformed envelope,
-        // identity mismatch, forged evidence) can never succeed on
-        // replay, so they route into RESULT_SCHEMA recovery immediately
-        // AND leave sweep eligibility (collect_excluded) — re-faulting
-        // would re-mint recovery every pending-free window. Transient
-        // faults (IO, process races) get a bounded number of collect
-        // attempts before the same exclusion + UNKNOWN_SIDE_EFFECT —
-        // never an unbounded silent spin.
-        const code = String((err as { code?: string }).code ?? "COLLECT_FAULT");
-        const fresh = (this.store.tryGet("executor_execution", String(e.execution_id)) ?? e) as Record<string, unknown>;
-        const attempts = Number(fresh.collection_attempts ?? 0);
-        const deterministic =
-          err instanceof IntegrityError || err instanceof PolicyError;
-        try {
-          const prior = (fresh.last_observation as Record<string, unknown> | undefined) ?? {};
-          fresh.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
-          this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
-        } catch { /* liveness hint is best-effort */ }
-        // P18.3 audit R4 — a fault AFTER the canonical result committed
-        // can never re-enter the sweep: the in-flight filter keys on
-        // result==null and collection_attempts stops advancing, so the
-        // retry bound would never engage and the task would stay
-        // un-dispositioned while the row is permanently filtered out.
-        // Treat post-commit settle faults as immediately bounded.
-        if (deterministic || attempts >= COLLECT_FAULT_BOUND || fresh.result != null) {
-          this.markCollectExcluded(
-            fresh,
-            code,
-            deterministic ? "deterministic" : fresh.result != null ? "post_commit" : "attempt_bound",
-          );
-          if (this.queueOrStartRecovery(
-            missionId, String(e.task_id), String(e.execution_id),
-            deterministic ? "RESULT_SCHEMA_FAILURE" : "UNKNOWN_SIDE_EFFECT_STATE",
-            now,
-          )) return;
-        }
+        if (this.handleSettleFault(missionId, e, err, now)) return;
         continue;
       }
       const rtNow = String(this.runtimeEntity(missionId).state);
@@ -1766,30 +1804,96 @@ export class MissionRuntime {
   }
 
   /**
+   * Settlement-fault accounting shared by both sweep paths (fresh
+   * collect and committed-result re-settle). Returns true when a fresh
+   * pending_recovery armed — the sweep must bail and let recovery own
+   * the tick. A PRE-COMMIT failure leaves the row in-flight
+   * (result==null) and is retried next tick; a POST-COMMIT fault is
+   * bounded immediately below. Collect faults are always bounded:
+   * deterministic governed failures (IntegrityError / PolicyError —
+   * malformed envelope, identity mismatch, forged evidence) can never
+   * succeed on replay, so they route into RESULT_SCHEMA recovery
+   * immediately AND leave sweep eligibility (collect_excluded) —
+   * re-faulting would re-mint recovery every pending-free window.
+   * Transient faults (IO, process races) get a bounded number of
+   * collect attempts before the same exclusion + UNKNOWN_SIDE_EFFECT —
+   * never an unbounded silent spin.
+   */
+  private handleSettleFault(
+    missionId: string,
+    e: Record<string, unknown>,
+    err: unknown,
+    now?: string,
+  ): boolean {
+    const code = String((err as { code?: string }).code ?? "COLLECT_FAULT");
+    const fresh = (this.store.tryGet("executor_execution", String(e.execution_id)) ?? e) as Record<string, unknown>;
+    // P18.4-A — committed-result re-settles never reach
+    // collect_execution_result, so collection_attempts cannot bound
+    // them; settle_faults is the same counter for the re-settle path.
+    // `fresh` (not the stale filter copy) decides: a first-pass settle
+    // can commit result and then fault post-commit.
+    const committed = fresh.result != null;
+    if (committed) {
+      fresh.settle_faults = Number(fresh.settle_faults ?? 0) + 1;
+    }
+    const attempts = committed
+      ? Number(fresh.settle_faults ?? 0)
+      : Number(fresh.collection_attempts ?? 0);
+    const deterministic =
+      err instanceof IntegrityError || err instanceof PolicyError;
+    try {
+      const prior = (fresh.last_observation as Record<string, unknown> | undefined) ?? {};
+      fresh.last_observation = { ...prior, blocking_reason: `COLLECT_FAULT:${code}`, blocked_at: utcnow() };
+      this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
+    } catch { /* liveness hint is best-effort */ }
+    // P18.3 audit R4 — a fault AFTER the canonical result committed is
+    // bounded immediately: re-settlement of the same committed result
+    // cannot succeed when the fault is deterministic. (P18.4 note: the
+    // settle transaction now rolls back its own writes, so `result`
+    // reaching the catch is always the committed row — the marker that
+    // keeps the row sweep-eligible is settle_complete, not result.)
+    if (deterministic || attempts >= COLLECT_FAULT_BOUND) {
+      // Same atomic-boundary requirement as the observe-bound path:
+      // collect_excluded and the recovery signal land in one commit.
+      return this.store.immediate(() => {
+        this.markCollectExcluded(
+          fresh,
+          code,
+          deterministic ? "deterministic" : committed ? "post_commit" : "attempt_bound",
+        );
+        return this.queueOrStartRecovery(
+          missionId, String(e.task_id), String(e.execution_id),
+          deterministic ? "RESULT_SCHEMA_FAILURE" : "UNKNOWN_SIDE_EFFECT_STATE",
+          now,
+        );
+      });
+    }
+    return false;
+  }
+
+  /**
    * Permanently removes an execution from the collection sweep after a
    * bounded/deterministic fault: durable marker + evidence event on the
    * mission log. The row keeps all attempt evidence; governed recovery
    * owns the task outcome from here (a retry mints a NEW execution —
-   * this row can never double-settle).
+   * this row can never double-settle). Throws propagate: both callers
+   * run inside `store.immediate` so exclusion and its recovery signal
+   * commit or roll back together.
    */
   private markCollectExcluded(
     execution: Record<string, unknown>,
     code: string,
     reason: string,
   ): void {
-    try {
-      const fresh = (this.store.tryGet("executor_execution", String(execution.execution_id)) ?? execution) as Record<string, unknown>;
-      fresh.collect_excluded = { code, reason, at: utcnow() };
-      this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
-      this.store.appendEvidence(String(fresh.mission_id), "EXECUTION_COLLECTION_EXCLUDED", {
-        execution_id: String(fresh.execution_id),
-        task_id: String(fresh.task_id ?? ""),
-        code,
-        reason,
-      });
-    } catch {
-      /* exclusion marker is best-effort; the filter also guards */
-    }
+    const fresh = (this.store.tryGet("executor_execution", String(execution.execution_id)) ?? execution) as Record<string, unknown>;
+    fresh.collect_excluded = { code, reason, at: utcnow() };
+    this.store.put("executor_execution", String(fresh.execution_id), fresh, Number(fresh.version));
+    this.store.appendEvidence(String(fresh.mission_id), "EXECUTION_COLLECTION_EXCLUDED", {
+      execution_id: String(fresh.execution_id),
+      task_id: String(fresh.task_id ?? ""),
+      code,
+      reason,
+    });
   }
 
   /**
@@ -1891,32 +1995,39 @@ export class MissionRuntime {
     // entry emits durable evidence — a dropped governed signal is never
     // silent.
     const TASK_RESOLVED = new Set(["COMPLETED", "CANCELLED"]);
-    const alive = deferred.filter((d) => {
-      const t = this.store.tryGet("task", String(d.task_id));
-      if (!t || TASK_RESOLVED.has(String(t.status))) {
-        try {
+    // Prune + drop-evidence commit in ONE transaction (audit R5-M1):
+    // evidence-before-removal meant a removal fault duplicated the drop
+    // evidence; removal-before-evidence (with a swallowed catch) could
+    // drop a governed signal silently. Both commit or neither does.
+    this.store.immediate(() => {
+      const rtTxn = this.runtimeEntity(missionId);
+      const dq =
+        (rtTxn.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+      const alive = dq.filter((d) => {
+        const t = this.store.tryGet("task", String(d.task_id));
+        if (!t || TASK_RESOLVED.has(String(t.status))) {
           this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
             task_id: String(d.task_id),
             execution_id: d.execution_id ?? null,
             failure_class: String(d.failure_class),
             reason: !t ? "TASK_MISSING" : `TASK_RESOLVED:${String(t.status)}`,
           });
-        } catch { /* drop evidence is best-effort */ }
-        return false;
+          return false;
+        }
+        return true;
+      });
+      if (alive.length !== dq.length) {
+        rtTxn.deferred_recovery = alive;
+        this.store.put(
+          "mission_runtime",
+          String(rtTxn.mission_runtime_id),
+          rtTxn,
+          Number(rtTxn.version),
+        );
       }
-      return true;
-    });
-    if (alive.length !== deferred.length) {
       deferred = alive;
-      rt.deferred_recovery = deferred;
-      this.store.put(
-        "mission_runtime",
-        String(rt.mission_runtime_id),
-        rt,
-        Number(rt.version),
-      );
-      if (deferred.length === 0) return;
-    }
+    });
+    if (deferred.length === 0) return;
     const barriers =
       (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
     const idx = deferred.findIndex((d) => {
@@ -1924,52 +2035,112 @@ export class MissionRuntime {
       return !(b && b.settled !== true);
     });
     if (idx < 0) return;
-    const [entry] = deferred.splice(idx, 1);
-    rt.deferred_recovery = deferred;
-    this.store.put(
-      "mission_runtime",
-      String(rt.mission_runtime_id),
-      rt,
-      Number(rt.version),
-    );
+    // P18.4-A — atomic deferred→pending handoff. The pop-put and the
+    // entire arm chain (decision row, pending_recovery, barriers,
+    // transitions, approvals, scheduled backoff) land in ONE
+    // BEGIN IMMEDIATE transaction: a crash anywhere inside leaves either
+    // (entry queued AND no pending) or (entry gone AND pending armed) —
+    // never a vanished signal. The rt row is re-read inside the txn so a
+    // same-call stale-prune put cannot carry a stale expected version.
+    const entry = deferred[idx];
     try {
-      this.startRecovery(
-        missionId,
-        String(entry.task_id),
-        entry.execution_id != null ? String(entry.execution_id) : null,
-        entry.failure_class as ReturnType<typeof classifyFailure>,
-        now,
-        undefined,
-        undefined,
-        (entry.extra as Parameters<MissionRuntime["startRecovery"]>[7]) ??
+      this.store.immediate(() => {
+        const rtTxn = this.runtimeEntity(missionId);
+        // Multi-writer guard (audit R5-M3): if a racing writer armed
+        // pending_recovery between the pre-txn check and BEGIN
+        // IMMEDIATE, arming here would silently clobber it. Keep the
+        // entry queued — the signal is preserved, not lost.
+        if (rtTxn.pending_recovery) return;
+        const queue =
+          (rtTxn.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+        const qIdx = queue.findIndex(
+          (d) => String(d.task_id) === String(entry.task_id),
+        );
+        if (qIdx >= 0) queue.splice(qIdx, 1);
+        rtTxn.deferred_recovery = queue;
+        this.store.put(
+          "mission_runtime",
+          String(rtTxn.mission_runtime_id),
+          rtTxn,
+          Number(rtTxn.version),
+        );
+        this.startRecovery(
+          missionId,
+          String(entry.task_id),
+          entry.execution_id != null ? String(entry.execution_id) : null,
+          entry.failure_class as ReturnType<typeof classifyFailure>,
+          now,
           undefined,
-      );
+          undefined,
+          (entry.extra as Parameters<MissionRuntime["startRecovery"]>[7]) ??
+            undefined,
+        );
+      });
     } catch (err) {
-      // A thrown arm must not silently lose the failure signal — requeue
-      // with a bounded drain counter; at the bound the entry drops with
-      // durable evidence instead of an unbounded retry cycle. If the
-      // throw happened AFTER this entry's own pending_recovery armed,
-      // the signal landed — dropping is correct, not a loss.
-      const attempts = Number(entry.drain_attempts ?? 0) + 1;
+      // Rollback semantics: a throw anywhere in the handoff means NOTHING
+      // committed — the durable queue still holds the entry and no
+      // pending_recovery was armed. Bound the retry ON the surviving
+      // entry (in place — appending a copy would duplicate it); at the
+      // bound the entry drops with durable evidence. The armed-check is
+      // defensive for any future non-transactional arm path: an arm that
+      // somehow committed before the throw means the signal landed.
       const rt2 = this.runtimeEntity(missionId);
       const armedTask = String(
         (rt2.pending_recovery as Record<string, unknown> | null)?.task_id ?? "",
       );
+      const queue2 =
+        (rt2.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
+      const qIdx2 = queue2.findIndex(
+        (d) => String(d.task_id) === String(entry.task_id),
+      );
+      const attempts = Number(entry.drain_attempts ?? 0) + 1;
       if (armedTask === String(entry.task_id)) {
+        // Defensive: the signal landed but a copy somehow stayed queued —
+        // remove it so a freed pending never re-arms a duplicate chain.
+        // Removal + drop evidence commit together (R5-M1).
         try {
-          this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
-            task_id: String(entry.task_id),
-            execution_id: entry.execution_id ?? null,
-            failure_class: String(entry.failure_class),
-            reason: "ARMED_THEN_THROW",
-            error: String((err as Error)?.message ?? err).slice(0, 200),
+          this.store.immediate(() => {
+            if (qIdx2 >= 0) {
+              queue2.splice(qIdx2, 1);
+              rt2.deferred_recovery = queue2;
+              this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
+            }
+            this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+              task_id: String(entry.task_id),
+              execution_id: entry.execution_id ?? null,
+              failure_class: String(entry.failure_class),
+              reason: "ARMED_THEN_THROW",
+              error: String((err as Error)?.message ?? err).slice(0, 200),
+            });
           });
-        } catch { /* drop evidence is best-effort; the splice is durable */ }
-      } else if (attempts < 5) {
-        rt2.deferred_recovery = [
-          ...((rt2.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []),
-          { ...entry, drain_attempts: attempts },
-        ];
+        } catch { /* the arm already owns the outcome */ }
+      } else if (qIdx2 >= 0) {
+        if (attempts >= DRAIN_ATTEMPT_BOUND) {
+          // Bound reached — the drop and its durable evidence are ONE
+          // commit: a governed signal is never dropped silently.
+          this.store.immediate(() => {
+            queue2.splice(qIdx2, 1);
+            rt2.deferred_recovery = queue2;
+            this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
+            this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+              task_id: String(entry.task_id),
+              execution_id: entry.execution_id ?? null,
+              failure_class: String(entry.failure_class),
+              reason: "DRAIN_ATTEMPT_BOUND",
+              drain_attempts: attempts,
+              error: String((err as Error)?.message ?? err).slice(0, 200),
+            });
+          });
+        } else {
+          queue2[qIdx2] = { ...queue2[qIdx2], drain_attempts: attempts };
+          rt2.deferred_recovery = queue2;
+          this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
+        }
+      } else if (attempts < DRAIN_ATTEMPT_BOUND) {
+        // Defensive only — under the transaction the entry cannot vanish
+        // without an arm. Preserve signal safety for any future caller
+        // that hands an already-popped entry in.
+        rt2.deferred_recovery = [...queue2, { ...entry, drain_attempts: attempts }];
         this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
       } else {
         try {
@@ -1977,10 +2148,11 @@ export class MissionRuntime {
             task_id: String(entry.task_id),
             execution_id: entry.execution_id ?? null,
             failure_class: String(entry.failure_class),
+            reason: "DRAIN_ATTEMPT_BOUND",
             drain_attempts: attempts,
             error: String((err as Error)?.message ?? err).slice(0, 200),
           });
-        } catch { /* drop evidence is best-effort; the splice is durable */ }
+        } catch { /* drop evidence is best-effort */ }
       }
     }
   }
@@ -1997,15 +2169,68 @@ export class MissionRuntime {
     sameChainContinuation = false,
   ): void {
     const execution = this.store.get("executor_execution", executionId);
-    const adapter = this.deps.adapters.get(String(execution.executor_id));
-    if (!adapter) {
-      throw new PolicyError("FAIL_CLOSED_ADAPTER_NOT_BOUND", String(execution.executor_id));
-    }
-    const taskId = String(execution.task_id);
     if (!execution.result) {
+      // Collect stays OUTSIDE the settle transaction: the gate's honest
+      // attempt accounting commits on its own, and adapter IO never runs
+      // under the SQLite write lock.
+      const adapter = this.deps.adapters.get(String(execution.executor_id));
+      if (!adapter) {
+        throw new PolicyError("FAIL_CLOSED_ADAPTER_NOT_BOUND", String(execution.executor_id));
+      }
       this.deps.gate.collect_execution_result(adapter, executionId);
     }
+    // P18.4-A — canonical settlement is ONE durable commit: validation,
+    // task disposition, settled_at, the recovery arm and every event
+    // land atomically. A crash before commit rolls the WHOLE
+    // disposition back; the committed result then stays sweep-eligible
+    // through `settle_complete !== true` and the next tick re-drives
+    // settlement — no partial settlement state can exist.
+    this.store.immediate(() => {
+      // Replay guard (audit R5-H2): an apply-path adoption or a second
+      // sweep pass can re-enter settleExecution on an already-settled
+      // row. Without this check a full disposition would re-run —
+      // duplicate TASK_COMPLETED events in the append-only journal, and
+      // for FAILED results a fresh decision would clobber the chain's
+      // successor arm. Re-read inside the txn: settle_complete is the
+      // single durable witness that disposition already committed.
+      const prior = this.store.tryGet("executor_execution", executionId) as
+        | Record<string, unknown>
+        | null;
+      if (prior && prior.settle_complete === true) return;
+      this.settleCommitted(missionId, executionId, sameChainContinuation);
+      // Marks "the canonical settle pass committed" on EVERY disposition
+      // path — including validation-REJECT→recovery handoffs, which
+      // intentionally never stamp settled_at. It is the durable marker
+      // the sweep's re-eligibility keys on (crash-orphan repair needs no
+      // restart: the row re-enters collection next tick).
+      const row = this.store.tryGet("executor_execution", executionId) as
+        | Record<string, unknown>
+        | null;
+      if (row && row.result != null && row.settle_complete !== true) {
+        row.settle_complete = true;
+        this.store.put(
+          "executor_execution",
+          executionId,
+          row,
+          Number(row.version),
+        );
+      }
+    });
+  }
+
+  /**
+   * The atomic half of settlement — every write here joins the enclosing
+   * `immediate()` in `settleExecution`. Early returns are safe: they exit
+   * this callback, not the transaction; the caller still stamps
+   * `settle_complete` for the disposition that was reached.
+   */
+  private settleCommitted(
+    missionId: string,
+    executionId: string,
+    sameChainContinuation: boolean,
+  ): void {
     const collected = this.store.get("executor_execution", executionId);
+    const taskId = String(collected.task_id);
     const state = String(collected.execution_state);
     // P18.3 — canonical settlement timestamp: stamped ONLY after the
     // terminal disposition is decided (validation PASS → success mark,
@@ -2826,18 +3051,24 @@ export class MissionRuntime {
           barrier.settled === true &&
           barrierOutcome === "CONFIRMED_NOT_EXECUTED"
         ) {
-          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_confirmed_not_executed");
-          this.startRecovery(
-            missionId,
-            taskId,
-            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
-            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-            {
-              outcome: barrierOutcome,
-              reconciliation_id: String(barrier.last_receipt_id ?? ""),
-            },
-          );
+          // Atomic (audit R5-H3): clearing the spent pending and minting
+          // the successor decision is ONE commit — a crash between them
+          // would orphan the operator-approved CONFIRMED_NOT_EXECUTED
+          // signal (pending cleared, nothing armed → mission fails).
+          this.store.immediate(() => {
+            this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_confirmed_not_executed");
+            this.startRecovery(
+              missionId,
+              taskId,
+              pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+              pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+              now,
+              {
+                outcome: barrierOutcome,
+                reconciliation_id: String(barrier.last_receipt_id ?? ""),
+              },
+            );
+          });
         } else if (barrier && barrier.settled === true) {
           // Settled with any other verdict — the reconcile outcome was
           // already applied (settle/escalate); the stale pending action
@@ -2848,14 +3079,17 @@ export class MissionRuntime {
           // Pending reconciliation with no barrier evidence — a fresh
           // governed decision re-drives; it may legitimately select
           // RECONCILIATION_REQUIRED again and rebuild the barrier.
-          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_barrier_absent");
-          this.startRecovery(
-            missionId,
-            taskId,
-            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
-            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-          );
+          // Same atomicity requirement as the confirmed path above.
+          this.store.immediate(() => {
+            this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_barrier_absent");
+            this.startRecovery(
+              missionId,
+              taskId,
+              pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+              pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+              now,
+            );
+          });
         } else {
           // Barrier still unsettled — let the RECONCILING path settle it.
           this.transitionRuntime(missionId, "RECONCILING", "reconcile_pending");

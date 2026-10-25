@@ -765,4 +765,21 @@ export const apiAdmin = {
     req<import("./types").IntegrityProbe>(
       `/vnext/objectives/${encodeURIComponent(id)}/integrity`,
       signal ? { signal } : undefined, { noAuthPrompt: true }),
+
+  /* ---- P18.4-B — canonical liveness + recovery operations
+     projections. Read-only GETs; the server classifies every field
+     persisted/observed/derived/unknown — the UI renders the projection
+     and never upgrades observed data into a canonical claim. */
+  missionOperations: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").MissionOperations>(
+      `/missions/${encodeURIComponent(id)}/operations`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  operationsOverview: (signal?: AbortSignal) =>
+    req<import("./app/types").OperationsOverview>(
+      "/operations",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
 };

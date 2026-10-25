@@ -205,6 +205,47 @@ export class ReconciliationService {
         continue;
       }
     }
+    // P18.4 audit R5-M2 — a committed-but-unsettled row on a TERMINAL
+    // mission is unreachable by every live sweep (its execution_state is
+    // already terminal, so the orphan class above skips it; the dead
+    // mission never ticks). Close the consistency gap with the same
+    // governed neutral-outcome pattern other unreachable rows use.
+    const committedOrphans = this.store.list("executor_execution").filter(
+      (e) =>
+        e.result != null &&
+        e.settle_complete !== true &&
+        !e.terminal_outcome &&
+        TERMINAL_MISSION.has(statusByMission.get(String(e.mission_id)) ?? ""),
+    );
+    for (const e of committedOrphans) {
+      try {
+        this.store.immediate(() => {
+          const fresh = this.store.tryGet(
+            "executor_execution",
+            String(e.execution_id),
+          ) as Record<string, unknown> | undefined;
+          if (!fresh || fresh.settle_complete === true || fresh.terminal_outcome) return;
+          fresh.terminal_outcome = "MISSION_TERMINAL_BEFORE_SETTLE";
+          this.store.put(
+            "executor_execution",
+            String(fresh.execution_id),
+            fresh,
+            Number(fresh.version),
+          );
+          this.store.event({
+            entity_type: "executor_execution",
+            entity_id: String(fresh.execution_id),
+            event_type: "EXECUTION_TERMINAL_ORPHAN_NEUTRALIZED",
+            new_state: "MISSION_TERMINAL_BEFORE_SETTLE",
+            actor: "PAIR_RECONCILIATION_SERVICE",
+            metadata: { mission_id: fresh.mission_id },
+          });
+        });
+        settled.push(String(e.execution_id));
+      } catch {
+        continue;
+      }
+    }
     return { settled };
   }
 

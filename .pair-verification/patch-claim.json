@@ -1,22 +1,21 @@
 {
-  "claim_id": "P18_3_SUPERVISOR_LIVENESS",
-  "title": "P18.3 Supervisor Collection Liveness & Autonomous Recovery — state-independent collect, deferred recovery, unconditional codex adapter, executor-completion wake, liveness stamps",
+  "claim_id": "P18_4_RECOVERY_OPS",
+  "title": "P18.4 Recovery Integrity & Mission Control Operations — atomic deferred→pending handoff, atomic canonical settlement, crash-orphan re-eligibility, liveness/recovery operations projections + UI, real multi-executor E2E",
   "affected_surfaces": [
-    "MISSION_CONTROL",
     "RECOVERY_REPLAY",
+    "MISSION_CONTROL",
     "REMOTE_EXECUTION",
     "GATE_ROUTER",
-    "PLANNER",
-    "BUSINESS_OBJECTIVE",
+    "UI",
     "DEV_INFRA"
   ],
   "required_tests": [
+    "src/__tests__/pair-p18-4-recovery-atomicity.test.ts",
+    "src/__tests__/pair-p18-4-observability.test.ts",
+    "src/__tests__/pair-p18-4-real-e2e.test.ts",
     "src/__tests__/pair-p18-3-supervisor-liveness.test.ts",
     "src/__tests__/pair-p18-3-real-executor-e2e.test.ts",
-    "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-p18-2-planner-adaptive-retry.test.ts",
-    "src/__tests__/pair-runtime-hardening.test.ts",
-    "src/__tests__/pair-live-ops-recovery-closure.test.ts"
+    "src/__tests__/pair-runtime-hardening.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
@@ -24,6 +23,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "Forensic root cause (docs/p18-3/P18_3_FORENSIC_ROOT_CAUSE.md): a codex execution could sit RUNNING ~63min after result.json because (RC-A) applyPendingRecovery applied under state=RUNNING while its close-out required RECOVERING, so pending_recovery never cleared and every tick early-returned before observe (task version=7507 ≈ 2 writes/tick over the stall); (RC-B) observe/collect/settle only ran inside runRunning so RECOVERING/WAITING_BACKOFF/WAITING_APPROVAL starved sibling executions; (RC-C) CODEX_HOME-env-gated adapter registration made adapterFor null after restart -> UNKNOWN_SIDE_EFFECT_STATE re-probe every 30s forever; (RC-D) no executor->supervisor completion signal existed. Fix: tick() hoists a state-independent collect loop over COLLECT_LIVE_STATES selecting unsettled (!result) executions; pending recovery transitions runtime to RECOVERING before apply (RC-A closed) and concurrent failures defer via deferred_recovery instead of clobbering; codex adapter registers unconditionally while qualify() still gates dispatch (RC-C); adapters emit onFinished after durable terminal evidence and serve-mission-control wires it to sup.wake(EXECUTOR_COMPLETION) as a best-effort hint — the bounded 1s sweep remains the settlement authority (RC-D). Orphan/unobservable re-probes are capped (40) with one durable EXECUTION_ORPHAN_UNOBSERVABLE event. Liveness stamps on executor_execution: first_terminal_observed_at, collection_started_at/committed_at/attempts, settled_at, observe_count, finished_at (executor-side) inside last_observation; surfaced via missionSummary.executions + observability metrics. A thrown collect leaves durable attempt evidence and the row stays eligible for idempotent retry; settled rows are never re-collected (exactly-once). Also: PLANNER_VALIDATION_RETRY_EXHAUSTED dedup keyed on the episode's last planner run, and win32 test-harness fixes (fileURLToPath ESM specifier, node+tsx spawn) with zero production behavior change.",
+  "description": "P18.4-A (docs/p18-4/P18_4_RECOVERY_ATOMICITY_AUDIT.md): the deferred-recovery drain popped the queue entry and persisted the shortened queue BEFORE the successor pending_recovery was durable — a crash inside that window lost the recovery signal; canonical settlement committed result, task status, recovery arm and settle marker as independent writes so a mid-chain crash orphaned a committed result or a FAILED task with no signal. Fix: drainDeferredRecovery's pop + the entire startRecovery arm chain now commit inside ONE store.immediate() transaction (rt re-read inside for CAS correctness); canonical settlement/disposition co-commits where the store allows while adapter I/O stays outside the write lock; committed-result rows without settle_complete re-enter the bounded sweep (crash-orphan re-eligibility); fault accounting (drain_attempts/settle_faults) is explicitly bounded with durable DEFERRED_RECOVERY_DROPPED evidence. PairEvidenceStore gained a test-only faultInjector seam (never set in production). P18.4-B: MissionObservability gains executionHealth/recoveryOps/operationsOverview — provenance-classified projections (persisted/observed/derived/unknown; no synthesized timestamps); routes GET /api/missions/:id/operations + GET /api/operations; MissionControl UI adds Execution health + Recovery operations sections on Mission Detail and an Operations rollup tab in System Observability — read-only, fail-closed validation, existing governed actions only. P18.4-C: real multi-executor E2E (E2E-1..9) — real child processes via production CodexCliExecutorAdapter + a second subclassed real executor proving routing; supervisor restart over durable store; injected mid-tick power loss at the handoff; born-failing retry boundedness; UNKNOWN outcome (missing result.json) never mints success or replays side effects; MC API auth/operator gates verified against the real server.",
   "risk_override": "HIGH"
 }
