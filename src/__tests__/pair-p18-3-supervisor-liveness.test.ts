@@ -593,14 +593,17 @@ describe("P18.3 — collection liveness", () => {
     expect(decisions().length).toBeGreaterThanOrEqual(2);
   });
 
-  it("LV-14 post-commit settle fault exits sweep once AND hands the task to recovery (audit R4)", async () => {
+  it("LV-14 post-commit settle fault: transient fault self-heals via re-settle; persistent is bounded+governed (audit R4 / P18.4)", async () => {
     const ctx = makeCtx("lv14", { taskCount: 1 });
     const mid = startMission(ctx);
     const e1 = execs(ctx, mid)[0]!;
     // Fault AFTER the canonical result commits: collect succeeds, then
-    // the first updateTask(COMPLETED) throws. The row can never re-enter
-    // the sweep (result!=null filter) — without the post-commit bound
-    // the task would sit un-dispositioned forever.
+    // the first updateTask(COMPLETED) throws. P18.3-R4 could only
+    // exclude+recover here because the row could never re-enter the
+    // sweep. P18.4's settle transaction rolls the disposition back and
+    // `settle_complete` keeps the row sweep-eligible — a TRANSIENT
+    // post-commit fault now self-heals: next tick re-settles exactly
+    // once, no recovery round-trip, no strand.
     const origUpdate = ctx.service.updateTask.bind(ctx.service);
     let threw = false;
     ctx.service.updateTask = ((taskId: string, patch: Record<string, unknown>) => {
@@ -611,29 +614,31 @@ describe("P18.3 — collection liveness", () => {
       return origUpdate(taskId, patch);
     }) as typeof ctx.service.updateTask;
     ctx.adapter.finish(String(e1.execution_id), "COMPLETED");
-    ctx.runtime.tick(mid); // collect commits result → settle throws
+    ctx.runtime.tick(mid); // collect commits result → settle throws + rolls back
     const row = ctx.store.get("executor_execution", String(e1.execution_id));
     expect(row.result).toBeTruthy(); // committed BEFORE the fault
-    expect(row.collect_excluded).toBeTruthy();
-    expect(String((row.collect_excluded as Record<string, unknown>).reason)).toBe("post_commit");
-    // The failure is a governed signal, not a silent strand — recovery
-    // armed, deferred, or already decided for the task.
-    const r = rt(ctx, mid);
-    const signalled =
-      r.pending_recovery != null ||
-      ((r.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []).some(
-        (d) => String(d.task_id) === String(e1.task_id),
-      ) ||
-      ctx.store
-        .list("recovery_decision")
-        .some((d) => String(d.task_id) === String(e1.task_id));
-    expect(signalled).toBe(true);
     expect(threw).toBe(true);
+    // Not stranded, not excluded — the row re-enters the sweep.
+    expect(row.settle_complete).toBeFalsy();
+    ctx.runtime.tick(mid); // re-settle: the fault was one-shot → commits
+    const after = ctx.store.get("executor_execution", String(e1.execution_id));
+    expect(after.settle_complete).toBe(true);
+    expect(after.settled_at).toBeTruthy();
+    expect(String(ctx.store.get("task", String(e1.task_id)).status)).toBe("COMPLETED");
+    // Exactly-once: a single TASK_COMPLETED event despite the fault+replay.
+    expect(
+      ctx.store.listEvents("task", String(e1.task_id)).filter(
+        (ev) => String(ev.event_type) === "TASK_COMPLETED",
+      ).length,
+    ).toBe(1);
     // And the mission is not parked RUNNING with nothing armed.
+    const r = rt(ctx, mid);
     const parkedDead =
       String(r.state) === "RUNNING" &&
       !r.pending_recovery &&
-      !signalled;
+      !(r.pending_recovery != null ||
+        ((r.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []).length > 0 ||
+        ctx.store.list("recovery_decision").some((d) => String(d.task_id) === String(e1.task_id)));
     expect(parkedDead).toBe(false);
   });
 });
