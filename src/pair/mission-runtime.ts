@@ -1717,9 +1717,11 @@ export class MissionRuntime {
       try {
         this.settleExecution(missionId, String(observed.execution_id));
       } catch (err) {
-        // Settlement fault — the row stays in-flight (unsettled filter
-        // above) and is retried on the next tick, but a collect fault is
-        // bounded: deterministic governed failures (IntegrityError /
+        // Settlement fault — a PRE-COMMIT failure leaves the row
+        // in-flight (result==null) and is retried next tick; a
+        // POST-COMMIT fault can never re-enter the sweep and is bounded
+        // immediately below. Collect faults are always bounded:
+        // deterministic governed failures (IntegrityError /
         // PolicyError carrying a FAIL_CLOSED code — malformed envelope,
         // identity mismatch, forged evidence) can never succeed on
         // replay, so they route into RESULT_SCHEMA recovery immediately
