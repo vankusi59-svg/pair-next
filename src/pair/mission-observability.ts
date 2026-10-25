@@ -167,7 +167,8 @@ export class MissionObservability {
       if (persisted.orphan_unobservable) abnormal.push("ORPHAN_UNOBSERVABLE");
       if (observed.observe_faults > 0) abnormal.push(`OBSERVE_FAULTS:${observed.observe_faults}`);
       if (Number(e.settle_faults ?? 0) > 0) abnormal.push(`SETTLE_FAULTS:${Number(e.settle_faults)}`);
-      if (persisted.result_committed && !persisted.settle_complete && !persisted.collect_excluded) {
+      if (persisted.result_committed && !persisted.settle_complete && !persisted.collect_excluded
+        && !persisted.terminal_outcome) {
         abnormal.push("COMMITTED_UNSETTLED");
       }
       if (persisted.execution_state === "UNKNOWN") abnormal.push("UNKNOWN_OUTCOME");
@@ -309,7 +310,11 @@ export class MissionObservability {
           e.first_terminal_observed_at != null),
     );
     const committedUnsettled = execs.filter(
-      (e) => e.result != null && e.settle_complete !== true && e.collect_excluded == null,
+      (e) =>
+        e.result != null &&
+        e.settle_complete !== true &&
+        e.collect_excluded == null &&
+        !e.terminal_outcome,
     );
     const activeRecovery = runtimes.filter((r) => r.pending_recovery != null);
     const deferred = runtimes.reduce(

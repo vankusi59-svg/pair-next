@@ -256,7 +256,14 @@ function OperationsExplorer() {
     apiAdmin.operationsOverview(ctl.signal)
       .then((r) => {
         if (ctl.signal.aborted) return;
-        if (!isObj(r) || !isObj(r.operations)) {
+        // Shape validation, not just object-ness: a truncated
+        // {operations:{}} would otherwise render as fabricated
+        // healthy-zero instead of unavailable.
+        const ops = isObj(r) ? r.operations : undefined;
+        const shapeOk = isObj(ops)
+          && OPS_COUNTS.every(([k]) => typeof ops[k] === "number")
+          && OPS_LIVENESS.every(([k]) => ops[k] === null || typeof ops[k] === "number");
+        if (!shapeOk) {
           setSec({ kind: "error", err: new ApiError(200, "MALFORMED", "GET /api/operations returned a malformed payload") });
           return;
         }

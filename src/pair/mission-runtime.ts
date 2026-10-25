@@ -1647,9 +1647,10 @@ export class MissionRuntime {
           !barrieredExecs.has(String(e.execution_id)),
       );
     // Upgrade-edge witnesses: rows settled before `settle_complete`
-    // existed carry no marker, but a PASS disposition stamps
-    // result.settled_at and a REJECT disposition mints a
-    // recovery_decision for (task, execution). Built once per sweep.
+    // existed carry no marker, but a PASS disposition stamps the
+    // row-level settled_at (never executor-controlled result fields)
+    // and a REJECT disposition mints a recovery_decision for
+    // (task, execution). Built once per sweep.
     const handledDecisions = new Set(
       this.store
         .list("recovery_decision")

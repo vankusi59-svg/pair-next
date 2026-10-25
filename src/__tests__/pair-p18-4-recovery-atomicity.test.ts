@@ -708,13 +708,57 @@ describe("P18.4-A — recovery atomicity", () => {
         .filter((d) => String(d.execution_id ?? "") === String(e2!.execution_id)).length;
     expect(decCount()).toBe(1);
     const rejected = ctx.store.get("executor_execution", String(e2!.execution_id));
-    if (rejected.settle_complete === true) {
-      delete rejected.settle_complete;
-      ctx.store.put("executor_execution", String(e2!.execution_id), rejected, Number(rejected.version));
-      ctx.runtime.tick(mid);
-      const re2 = ctx.store.get("executor_execution", String(e2!.execution_id));
-      expect(re2.settle_complete).toBe(true);
-      expect(decCount()).toBe(1);
+    // Precondition: the FAILED settle stamped its witness — asserting it
+    // explicitly so a regression fails instead of silently skipping.
+    expect(rejected.settle_complete).toBe(true);
+    delete rejected.settle_complete;
+    ctx.store.put("executor_execution", String(e2!.execution_id), rejected, Number(rejected.version));
+    ctx.runtime.tick(mid);
+    const re2 = ctx.store.get("executor_execution", String(e2!.execution_id));
+    expect(re2.settle_complete).toBe(true);
+    expect(decCount()).toBe(1);
+  });
+
+  it("RA-13 committed-but-unsettled exec on a TERMINAL mission is neutralized exactly once (audit F-1/R5-M2)", () => {
+    const ctx = makeCtx("ra13", { taskCount: 2 });
+    const recon = new ReconciliationService(ctx.service, ctx.adapters);
+    const mid = startMission(ctx, 1);
+    const e1 = execs(ctx, mid)[0]!;
+    // Upgrade-edge shape: the result committed but the settle witness
+    // never stamped — terminal state means every live sweep skips the
+    // row, and the dead mission never ticks again.
+    const row = ctx.store.get("executor_execution", String(e1.execution_id));
+    row.execution_state = "COMPLETED";
+    row.result = { status: "COMPLETED", completed_at: utcnow() };
+    ctx.store.put("executor_execution", String(e1.execution_id), row, Number(row.version));
+    ctx.service.transitionMission(mid, "FAILED", "PAIR");
+
+    const r1 = recon.settleTerminalMissionOrphans(Date.now());
+    expect(r1.settled).toContain(String(e1.execution_id));
+    const after = ctx.store.get("executor_execution", String(e1.execution_id));
+    expect(after.terminal_outcome).toBe("MISSION_TERMINAL_BEFORE_SETTLE");
+    const evs = () =>
+      ctx.store.eventPage({
+        topics: ["EXECUTION_TERMINAL_ORPHAN_NEUTRALIZED"],
+        entity_type: "executor_execution",
+        entity_id: String(e1.execution_id),
+        after_seq: 0, limit: 10, descending: true,
+      });
+    expect(evs().length).toBe(1);
+    // Idempotent — the closed row is never re-processed or re-evented.
+    const r2 = recon.settleTerminalMissionOrphans(Date.now() + 1000);
+    expect(r2.settled).not.toContain(String(e1.execution_id));
+    expect(evs().length).toBe(1);
+    // An already-settled row on a terminal mission is never touched.
+    const e2 = execs(ctx, mid)[1];
+    if (e2) {
+      const s = ctx.store.get("executor_execution", String(e2.execution_id));
+      s.settle_complete = true;
+      s.result = { status: "COMPLETED", completed_at: utcnow() };
+      s.execution_state = "COMPLETED";
+      ctx.store.put("executor_execution", String(e2.execution_id), s, Number(s.version));
+      recon.settleTerminalMissionOrphans(Date.now() + 2000);
+      expect(ctx.store.get("executor_execution", String(e2.execution_id)).terminal_outcome).toBeFalsy();
     }
   });
 });

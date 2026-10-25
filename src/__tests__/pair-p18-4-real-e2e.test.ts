@@ -318,7 +318,14 @@ describe("P18.4-C — real multi-executor E2E", () => {
       () => ids.every((id) => observeStatus(ctx, id) !== "RUNNING"),
       "both real children settle",
     );
-    for (let i = 0; i < 6; i++) ctx.runtime.tick(mid);
+    // Bounded drive-until canonical settle — under parallel load the
+    // sweep's row-order/early-return interplay can legitimately need
+    // more than a fixed handful of ticks.
+    for (let i = 0; i < 200; i++) {
+      const rows = ids.map((id) => execRow(ctx, id));
+      if (rows.every((r) => String(r.execution_state) === "COMPLETED")) break;
+      ctx.runtime.tick(mid);
+    }
     const eA = byExec.get(CODEX_EXECUTOR_ID);
     const eB = byExec.get(E2E_B_ID);
     expect(eA).toBeTruthy();
