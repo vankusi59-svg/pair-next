@@ -1851,17 +1851,27 @@ export class MissionRuntime {
     let deferred =
       (rt.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? [];
     if (deferred.length === 0) return;
-    // Staleness re-validation (audit R1): entries queued during the
-    // pending window may describe tasks that have since reached a
-    // terminal state or executions that settled — replaying them mints
-    // spurious recovery chains / human gates on a healthy mission.
-    const TASK_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+    // Staleness re-validation (audit R1/R2): an entry queued during the
+    // pending window may describe work that has since RESOLVED — a task
+    // marked COMPLETED/CANCELLED by another governed path — where replay
+    // would mint a spurious recovery chain. FAILED is NOT a resolution:
+    // it is exactly why the entry exists (settle-arm entries always
+    // carry a committed failed result + FAILED task). Every pruned
+    // entry emits durable evidence — a dropped governed signal is never
+    // silent.
+    const TASK_RESOLVED = new Set(["COMPLETED", "CANCELLED"]);
     const alive = deferred.filter((d) => {
       const t = this.store.tryGet("task", String(d.task_id));
-      if (!t || TASK_TERMINAL.has(String(t.status))) return false;
-      if (d.execution_id != null) {
-        const ex = this.store.tryGet("executor_execution", String(d.execution_id));
-        if (ex && ex.result != null) return false; // already settled
+      if (!t || TASK_RESOLVED.has(String(t.status))) {
+        try {
+          this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+            task_id: String(d.task_id),
+            execution_id: d.execution_id ?? null,
+            failure_class: String(d.failure_class),
+            reason: !t ? "TASK_MISSING" : `TASK_RESOLVED:${String(t.status)}`,
+          });
+        } catch { /* drop evidence is best-effort */ }
+        return false;
       }
       return true;
     });
@@ -1906,10 +1916,23 @@ export class MissionRuntime {
     } catch (err) {
       // A thrown arm must not silently lose the failure signal — requeue
       // with a bounded drain counter; at the bound the entry drops with
-      // durable evidence instead of an unbounded retry cycle.
+      // durable evidence instead of an unbounded retry cycle. If the
+      // throw happened AFTER this entry's own pending_recovery armed,
+      // the signal landed — dropping is correct, not a loss.
       const attempts = Number(entry.drain_attempts ?? 0) + 1;
       const rt2 = this.runtimeEntity(missionId);
-      if (attempts < 5 && !rt2.pending_recovery) {
+      const armedTask = String(
+        (rt2.pending_recovery as Record<string, unknown> | null)?.task_id ?? "",
+      );
+      if (armedTask === String(entry.task_id)) {
+        this.store.appendEvidence(missionId, "DEFERRED_RECOVERY_DROPPED", {
+          task_id: String(entry.task_id),
+          execution_id: entry.execution_id ?? null,
+          failure_class: String(entry.failure_class),
+          reason: "ARMED_THEN_THROW",
+          error: String((err as Error)?.message ?? err).slice(0, 200),
+        });
+      } else if (attempts < 5) {
         rt2.deferred_recovery = [
           ...((rt2.deferred_recovery as Array<Record<string, unknown>> | undefined) ?? []),
           { ...entry, drain_attempts: attempts },

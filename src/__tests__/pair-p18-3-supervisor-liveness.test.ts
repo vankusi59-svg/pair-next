@@ -494,6 +494,42 @@ describe("P18.3 — collection liveness", () => {
     expect(decisions.length).toBeLessThanOrEqual(3);
   });
 
+  it("LV-12 drain fires a settle-arm deferred entry — FAILED is not resolved (audit R2-1)", async () => {
+    // The deferred entry's own task is FAILED with a committed result —
+    // that is WHY it was queued. A drain that prunes on task-terminal or
+    // committed-result silently deletes the normal deferred shape
+    // (stranded FAILED task, zero recovery, zero evidence).
+    const ctx = makeCtx("lv12");
+    const mid = startMission(ctx);
+    const [e1, e2] = execs(ctx, mid);
+    ctx.adapter.finish(String(e1!.execution_id), "FAILED");
+    ctx.runtime.tick(mid);
+    expect(rt(ctx, mid).pending_recovery).toBeTruthy();
+    ctx.adapter.finish(String(e2!.execution_id), "FAILED");
+    ctx.runtime.tick(mid);
+    const deferred = (rt(ctx, mid).deferred_recovery as Array<Record<string, unknown>>) ?? [];
+    expect(deferred.some((d) => String(d.task_id) === String(e2!.task_id))).toBe(true);
+    // Drive: e1's chain resolves (retry mints a new execution for T1),
+    // then the deferred entry MUST fire startRecovery for T2 — never
+    // be pruned as "stale" despite task FAILED + committed result.
+    // T1's RETRY arm carries a 1 s real-clock backoff — sleep past it
+    // so the due action can apply and free the pending slot.
+    let e2Armed = false;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && !e2Armed) {
+      ctx.runtime.tick(mid);
+      await new Promise((r) => setTimeout(r, 150));
+      const p = rt(ctx, mid).pending_recovery as Record<string, unknown> | null;
+      if (p && String(p.task_id) === String(e2!.task_id)) e2Armed = true;
+    }
+    expect(e2Armed).toBe(true);
+    // The deferred signal produced governed recovery work for T2.
+    const decisions = ctx.store
+      .list("recovery_decision")
+      .filter((d) => String(d.task_id) === String(e2!.task_id));
+    expect(decisions.length).toBeGreaterThanOrEqual(1);
+  });
+
   it("LV-11 observe-fault bound: persistent observe throw is bounded + excluded", () => {
     const ctx = makeCtx("lv11");
     const mid = startMission(ctx);
