@@ -324,6 +324,7 @@ export class ReasoningBriefService {
     const artifacts = val("artifacts");
     const experience = val("experience");
     const memory = val("memory");
+    const planner = val("planner");
 
     // -- objective identity/state (canonical row, strict-verified) --
     const oid = ctx.objective_id;
@@ -500,6 +501,46 @@ export class ReasoningBriefService {
       sections: ["artifacts"],
     });
 
+    // -- planner validation-feedback: settled attempt rows are
+    //    canonical entities and the markers are PAIR-sanitized
+    //    (never raw model output) → CANONICAL. Emit-on-real-content:
+    //    a wired-but-empty section must not mint a zero-fact. --
+    const rejectedAttempts = Number(planner.rejected_attempt_count ?? 0);
+    if (rejectedAttempts > 0) {
+      const recent = (planner.recent_rejections as Array<Record<string, unknown>> | undefined) ?? [];
+      out.push({
+        predicate: "PLANNER_RUN_SUMMARY",
+        subject: oid,
+        value: {
+          planner_run_count: planner.planner_run_count ?? 0,
+          rejected_attempt_count: rejectedAttempts,
+          shown_rejections: recent.length,
+        },
+        provenance: "CANONICAL",
+        sections: ["planner"],
+      });
+      for (const r of recent) {
+        out.push({
+          predicate: "PLAN_VALIDATION_REJECTION",
+          subject: r.work_item_id != null ? String(r.work_item_id) : oid,
+          value: {
+            planner_attempt_id: r.planner_attempt_id,
+            planner_run_id: r.planner_run_id,
+            attempt_no: r.attempt_no,
+            run_state: r.run_state,
+            run_attempt_count: r.run_attempt_count,
+            failure_class: r.failure_class,
+            validation_codes: r.validation_codes,
+            reask_attempted: r.reask_attempted,
+            task_hints: r.task_hints,
+            completed_at: r.completed_at,
+          },
+          provenance: "CANONICAL",
+          sections: ["planner"],
+        });
+      }
+    }
+
     // -- P17 tenancy-scoped advisory surfaces. Experience rows are
     //    canonical entities but advisory-tier content → PROJECTED.
     //    Layer-A memory is model-writable MODEL_HYPOTHESIS by
@@ -636,6 +677,24 @@ export class ReasoningBriefService {
         id: "KPI_GAPS_OPEN",
         detail: `${Number(ks.gap_kpi_count)} KPI(s) are unmet — objective is not near its success envelope`,
         rests_on: ["KPI_SUMMARY"],
+      });
+    }
+    const planner = (ctx.sections.planner?.value ?? {}) as Record<string, unknown>;
+    const rejections = (planner.recent_rejections as Array<Record<string, unknown>> | undefined) ?? [];
+    if (rejections.length >= 2) {
+      const counts: Record<string, number> = {};
+      for (const r of rejections) {
+        for (const code of (r.validation_codes as string[] | undefined) ?? []) {
+          counts[code] = (counts[code] ?? 0) + 1;
+        }
+      }
+      const dominant = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+      out.push({
+        id: "PLANNER_VALIDATION_REPEATING",
+        detail: dominant != null && dominant[1] >= 2
+          ? `the delegated planner repeatedly fails canonical validation with ${dominant[0]} (${dominant[1]}x in recent rejections) — retrying the same goal shape is likely to keep failing; the decomposition may need to change`
+          : `the delegated planner has failed canonical validation ${rejections.length} times recently — retrying the same goal shape is likely to keep failing; the decomposition may need to change`,
+        rests_on: ["PLAN_VALIDATION_REJECTION"],
       });
     }
     return out;
