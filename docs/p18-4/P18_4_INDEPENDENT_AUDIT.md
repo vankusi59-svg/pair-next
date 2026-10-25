@@ -96,3 +96,27 @@ convention-gated.
 
 Final gate: `verify:change --base 9a1e363` on post-remediation HEAD —
 see `.pair-verification/report.md`.
+
+---
+
+## Final pre-merge round (R6) — codex-reviewer on `aee9d1c` → `6b5048b`
+
+Verdict: **APPROVED** (initial round APPROVED_WITH_NON_BLOCKING_NOTES; delta re-audit APPROVED).
+
+| # | Sev | Finding | Resolution |
+|---|---|---|---|
+| F-1 | MAJOR (coverage) | `MISSION_TERMINAL_BEFORE_SETTLE` orphan close-out (R5-M2 fix) untested | RA-13 added — seeds committed-but-unsettled row on FAILED mission, asserts neutralization + exactly one `EXECUTION_TERMINAL_ORPHAN_NEUTRALIZED` event + idempotent re-sweep + settled-row untouched |
+| F-2 | MINOR | `committed_unsettled` metric/flag ignored `terminal_outcome` (neutralized rows counted as debt forever) | `!terminal_outcome` added to both predicates (`mission-observability.ts:170,311`) |
+| F-3 | MINOR | untracked Playwright spec dropped out of PR | `e2e/p184-operations.spec.ts` + `scripts/p184-browser-evidence.mjs` committed |
+| F-4 | MINOR | stale comment re-described forgeable `result.settled_at` | comment corrected to row-level `settled_at` (`mission-runtime.ts:1649`) |
+| F-5 | MINOR | RA-12 REJECT-witness assertions conditional | precondition now asserted; block unconditional |
+| F-6 | MINOR | OperationsExplorer shallow validation — `{operations:{}}` rendered fabricated healthy | per-key shape validation (counts numeric, liveness number-or-null) |
+| F-7/F-8 | NIT | `settled` over-reporting; stale drain_attempts read | accepted — cosmetic/fail-safe direction |
+| F-9 | NOTE | pre-upgrade unarmed-decision edge is fail-closed by design | documented as accepted upgrade-edge |
+
+Delta re-audit on `6b5048b`: all eight verification items confirmed; two NITs (RA-13 e2-precondition, HOME fallback) also fixed.
+
+Final gate on `6b5048b`: `verify:change --base origin/main` → READY_FOR_INDEPENDENT_AUDIT
+(claim 6/6, invariants 4/4, regression 13/13, TSC PASS, BUILD PASS,
+full suite PASS_WITH_KNOWN_BASELINE +133; focused RA 13/13, LV 14/14,
+OBS 9/9, real E2E 9/9; Playwright ops spec 4/4; browser evidence 9/9).

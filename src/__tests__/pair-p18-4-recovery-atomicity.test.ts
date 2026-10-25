@@ -750,8 +750,10 @@ describe("P18.4-A — recovery atomicity", () => {
     expect(r2.settled).not.toContain(String(e1.execution_id));
     expect(evs().length).toBe(1);
     // An already-settled row on a terminal mission is never touched.
+    for (let i = 0; i < 30 && execs(ctx, mid).length < 2; i++) ctx.runtime.tick(mid);
     const e2 = execs(ctx, mid)[1];
-    if (e2) {
+    expect(e2, "expected a second execution for the untouched-row check").toBeTruthy();
+    {
       const s = ctx.store.get("executor_execution", String(e2.execution_id));
       s.settle_complete = true;
       s.result = { status: "COMPLETED", completed_at: utcnow() };

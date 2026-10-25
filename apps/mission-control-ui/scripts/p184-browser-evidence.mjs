@@ -6,13 +6,14 @@
  * written — the token never enters artifacts. */
 import { chromium } from "@playwright/test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const BASE = process.env.PAIR_MC_BASE ?? "http://localhost:8801";
 const OUT = path.resolve("tmp/p184-browser-evidence");
 const MID_SETTLED = "MSN_01M5T0G5NMTEVA6FX1741KT01K"; // SETTLED exec + pending ABORT
 const MID_ABORTED = "MSN_01M5T0BHJ24Q5YCH6E5MG0NDM2"; // ABORTED, no execs
-const tok = fs.readFileSync(path.join(process.env.HOME, "pair-mc-token"), "utf8").trim();
+const tok = fs.readFileSync(path.join(process.env.HOME ?? os.homedir(), "pair-mc-token"), "utf8").trim();
 const CHROME = process.env.CHROME_BIN ??
   "C:\\Users\\Admin\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe";
 
