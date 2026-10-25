@@ -703,4 +703,66 @@ export const apiAdmin = {
   costProfiles: (signal?: AbortSignal) =>
     req<{ cost_profiles: Array<Record<string, unknown>> }>(
       "/cost-profiles", signal ? { signal } : undefined, { noAuthPrompt: true }),
+
+  /* ---- P18.1 — Operator Control Center owner seams. All
+     owner-scoped: authority derives ONLY from the x-operator-id
+     header the transport layer already sets; no owner/actor field is
+     ever sent in a body. POSTs carry caller-supplied dedup_key for
+     idempotent replay; reads are abortable. */
+  objectiveRelationsApp: (id: string, signal?: AbortSignal) =>
+    req<{ relations: import("./types").ObjectiveRelation[]; admission: import("./types").AdmissionView }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/relations`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  createRelationApp: (id: string, body: { to_objective_id: string; kind: "DEPENDS_ON" | "CONFLICTS" | "SUPERSEDES"; note?: string | null; dedup_key?: string }) =>
+    req<{ relation: import("./types").ObjectiveRelation }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/relations`,
+      { method: "POST", body: JSON.stringify(body) }, { noAuthPrompt: true }),
+  previewRelationApp: (id: string, body: { to_objective_id: string; kind: "DEPENDS_ON" | "CONFLICTS" | "SUPERSEDES" }) =>
+    req<import("./types").RelationPreview>(
+      `/vnext/objectives/${encodeURIComponent(id)}/relations/preview`,
+      { method: "POST", body: JSON.stringify(body) }, { noAuthPrompt: true }),
+  relationControlApp: (relationId: string, action: "suspend" | "resume" | "revoke") =>
+    req<{ relation: import("./types").ObjectiveRelation }>(
+      `/vnext/relations/${encodeURIComponent(relationId)}/${action}`,
+      { method: "POST", body: "{}" }, { noAuthPrompt: true }),
+  businessRelationsApp: (businessId: string, signal?: AbortSignal) =>
+    req<{ relations: import("./types").ObjectiveRelation[] }>(
+      `/vnext/businesses/${encodeURIComponent(businessId)}/relations`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  objectiveDutiesApp: (id: string, signal?: AbortSignal) =>
+    req<{ duties: import("./types").OrgAgentDuty[] }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/duties`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  agentDutiesApp: (agentId: string, signal?: AbortSignal) =>
+    req<{ duties: import("./types").OrgAgentDuty[] }>(
+      `/vnext/org-agents/${encodeURIComponent(agentId)}/duties`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  createDutyApp: (agentId: string, body: { objective_ids: string[]; note?: string | null; dedup_key?: string }) =>
+    req<{ duty: import("./types").OrgAgentDuty }>(
+      `/vnext/org-agents/${encodeURIComponent(agentId)}/duties`,
+      { method: "POST", body: JSON.stringify(body) }, { noAuthPrompt: true }),
+  dutyControlApp: (dutyId: string, action: "suspend" | "resume" | "revoke") =>
+    req<{ duty: import("./types").OrgAgentDuty }>(
+      `/vnext/duties/${encodeURIComponent(dutyId)}/${action}`,
+      { method: "POST", body: "{}" }, { noAuthPrompt: true }),
+  businessDutiesApp: (businessId: string, signal?: AbortSignal) =>
+    req<{ duties: import("./types").OrgAgentDuty[] }>(
+      `/vnext/businesses/${encodeURIComponent(businessId)}/duties`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  objectiveTransitionApp: (id: string, body: { business_id: string; to: "ACTIVE" | "PAUSED" | "CANCELLED"; reason?: string }) =>
+    req<{ objective: import("./types").CanonicalObjective }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/transition`,
+      { method: "POST", body: JSON.stringify(body) }, { noAuthPrompt: true }),
+  objectiveOperationsApp: (id: string, signal?: AbortSignal) =>
+    req<{ operations: import("./types").ObjectiveOperations }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/operations`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  businessOperationsApp: (businessId: string, signal?: AbortSignal) =>
+    req<{ operations: import("./types").BusinessOperationsRow[] }>(
+      `/vnext/businesses/${encodeURIComponent(businessId)}/operations`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  objectiveIntegrityApp: (id: string, signal?: AbortSignal) =>
+    req<import("./types").IntegrityProbe>(
+      `/vnext/objectives/${encodeURIComponent(id)}/integrity`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
 };

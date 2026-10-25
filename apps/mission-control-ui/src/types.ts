@@ -305,3 +305,97 @@ export interface CapabilityGap {
   evidence?: Array<Record<string, unknown>>;
   [k: string]: unknown;
 }
+
+/* ---- P18.1 — Operator Control Center canonical substrate models ----
+   Rows arrive verbatim from the canonical services; the UI never
+   fabricates edges, coverage or lifecycle state. */
+
+export interface ObjectiveRelation {
+  relation_id: string;
+  schema?: string;
+  business_id: string;
+  from_objective_id: string;
+  to_objective_id: string;
+  kind: "DEPENDS_ON" | "CONFLICTS" | "SUPERSEDES" | string;
+  state: "ACTIVE" | "SUSPENDED" | "REVOKED" | string;
+  note?: string | null;
+  created_by?: string;
+  dedup_key?: string;
+  created_at?: string;
+  updated_at?: string;
+  relation_digest?: string;
+  entity_id?: string;
+  version?: number;
+  [k: string]: unknown;
+}
+
+export interface AdmissionView {
+  upstream: string[];
+  conflicts: string[];
+  superseded_by: string[];
+}
+
+export interface OrgAgentDuty {
+  duty_id: string;
+  schema?: string;
+  business_id: string;
+  org_agent_id: string;
+  objective_ids: string[];
+  state: "ACTIVE" | "SUSPENDED" | "REVOKED" | string;
+  note?: string | null;
+  created_by?: string;
+  dedup_key?: string;
+  created_at?: string;
+  updated_at?: string;
+  duty_digest?: string;
+  entity_id?: string;
+  version?: number;
+  [k: string]: unknown;
+}
+
+export interface RelationPreview {
+  advisory: true;
+  valid: boolean;
+  errors: string[];
+  kind: string;
+  from_objective_id: string;
+  to_objective_id: string;
+  implications: Record<string, unknown>;
+  current?: { relations: number; admission?: AdmissionView };
+}
+
+export interface IntegrityProbe {
+  objective_id: string;
+  status: "CLEAN" | "WEDGED" | string;
+  checks: Array<{ name: string; ok: boolean; result?: unknown; code?: string; detail?: string }>;
+  remediation: string | null;
+}
+
+export interface ObjectiveOperations {
+  objective_id: string;
+  objective: CanonicalObjective;
+  auto_policy: AutoPolicyStatus | null;
+  auto_scheduler: AutoSchedulerStatus | null;
+  auto_driver: AutoDriverStatus | null;
+  admission: AdmissionView;
+  relations: ObjectiveRelation[];
+  duties: OrgAgentDuty[];
+}
+
+export interface BusinessOperationsRow {
+  objective_id: string;
+  status: string;
+  title?: string | null;
+  updated_at?: string;
+  auto_policy_effective?: boolean | "NOT_OBSERVED";
+  queue_state?: string;
+  pending_generation?: number;
+  claimed_generation?: number;
+  blocked_reason?: string | null;
+  next_due?: number | null;
+  lease?: { state: string; fence: number | null; expires_at: number | null } | null;
+  owner_action_required?: boolean;
+  driver_last_outcome?: string | null;
+  capability_gap?: CapabilityGap | null;
+  [k: string]: unknown;
+}

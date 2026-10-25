@@ -11,6 +11,10 @@ import {
   Skeleton,
 } from "../components/states";
 import { EntityCard, money } from "../components/EntityCard";
+/* P18.1 — Operator Control Center company sections. */
+import { CompanyRelations } from "../components/CompanyRelations";
+import { AgentDuties } from "../components/AgentDuties";
+import { BusinessOperations } from "../components/BusinessOperations";
 
 /* P15.9-B2 — Company Cockpit (D.2): the owner's "how is the company doing
    and what needs me". Reads ONLY GET /api/vnext/businesses/:id/company.
@@ -48,6 +52,27 @@ export function Company() {
   const [approvals, setApprovals] = useState<Record<string, unknown>[] | null>(null);
   const [approvalsErr, setApprovalsErr] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
+  /* P18.1 — org agents for the duty manager (global read, filtered
+     client-side to the selected business, labeled as such). */
+  const [bizAgents, setBizAgents] = useState<Array<{ agent_id: string; title?: string | null; department?: string | null; state?: string }>>([]);
+  useEffect(() => {
+    if (!biz) { setBizAgents([]); return; }
+    const ctl = new AbortController();
+    api.orgAgents(ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        setBizAgents((r.agents ?? [])
+          .filter((a) => String(a.business_id) === biz)
+          .map((a) => ({
+            agent_id: String(a.agent_id),
+            title: a.title ?? null,
+            department: a.department ?? null,
+            state: a.status,
+          })));
+      })
+      .catch(() => { if (!ctl.signal.aborted) setBizAgents([]); });
+    return () => ctl.abort();
+  }, [biz, reloadTick]);
 
   /* Company fetch: keyed on the selected business. Previous data is
      dropped immediately and an abort guard keeps a slower earlier
@@ -265,6 +290,26 @@ export function Company() {
           ))}
         </div>
       )}
+
+      <BusinessOperations
+        businessId={biz}
+        objectives={objectives.map((o) => ({ objective_id: o.objective_id, title: o.title }))}
+      />
+
+      <CompanyRelations
+        businessId={biz}
+        objectives={objectives.map((o) => ({
+          objective_id: o.objective_id, title: o.title, status: o.status }))}
+        onChanged={() => setReloadTick((n) => n + 1)}
+      />
+
+      <AgentDuties
+        businessId={biz}
+        objectives={objectives.map((o) => ({
+          objective_id: o.objective_id, title: o.title, status: o.status }))}
+        agents={bizAgents}
+        onChanged={() => setReloadTick((n) => n + 1)}
+      />
 
       <h2 className="sech">Recent reviews</h2>
       <div className="sub" style={{ marginBottom: 8 }}>
