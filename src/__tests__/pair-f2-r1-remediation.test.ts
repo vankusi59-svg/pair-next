@@ -31,6 +31,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   ApprovalQueue,
@@ -1866,15 +1867,24 @@ describe("R1.7 G — production E2E", () => {
   /** A REAL mission-control HTTP server in a SEPARATE OS PROCESS on the
    *  same pair.db — production-shaped: the remote worker's curl fetch and
    *  upload hit a live socket while the local runtime keeps ticking. */
-  const WORKER_PATH = new URL("./pair-f2-e2e-server.worker.mts", import.meta.url)
-    .pathname;
+  // P18.3 — URL.pathname yields `/D:/...` on Windows (unusable as an
+  // argv path); fileURLToPath is the correct cross-platform form.
+  const WORKER_PATH = fileURLToPath(
+    new URL("./pair-f2-e2e-server.worker.mts", import.meta.url),
+  );
   const TSX = path.join(process.cwd(), "node_modules", ".bin", "tsx");
+  const TSX_CLI = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
   const startServer = async (ctx: { d: string }) => {
-    const child: ChildProcess = spawn(
-      TSX,
-      [WORKER_PATH, path.join(ctx.d, "pair.db"), UPMASTER],
-      { stdio: ["ignore", "pipe", "inherit"] },
-    );
+    // P18.3 — Windows cannot spawn the POSIX .bin/tsx shim (ENOENT):
+    // the real entry is node + tsx/dist/cli.mjs, identical semantics on
+    // every platform.
+    const [cmd, args] =
+      process.platform === "win32"
+        ? [process.execPath, [TSX_CLI, WORKER_PATH, path.join(ctx.d, "pair.db"), UPMASTER]]
+        : [TSX, [WORKER_PATH, path.join(ctx.d, "pair.db"), UPMASTER]];
+    const child: ChildProcess = spawn(cmd, args as string[], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
     const port = await new Promise<number>((resolve, reject) => {
       let buf = "";
       const to = setTimeout(() => reject(new Error("server worker port timeout")), 30_000);

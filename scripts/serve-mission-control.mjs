@@ -104,6 +104,7 @@ import {
   makeReplanGenerationDriver,
   replanWorkItemId,
   makeServePlanner,
+  emitPlannerValidationRetryExhausted,
   plannerAdaptiveRetryForWorkItem,
   plannerExecutorCapSets,
   assertCodexOnlyPlannerRoute,
@@ -266,7 +267,25 @@ const runner = new PairNativeWorkerRunner({
   journalRoot,
   allowedEditRoot: dir,
 });
-const native = new PairNativeExecutorAdapter(runner);
+// P18.3 — worker-exit completion signal: the adapter's onFinished hook
+// fires the moment the worker exits terminal; it records a durable
+// EXECUTOR_COMPLETION wake. Detection never depends on it — the bounded
+// supervisor sweep remains the collection authority.
+const native = new PairNativeExecutorAdapter(runner, (info) => {
+  try {
+    if (info.mission_id) {
+      sup.wake(String(info.mission_id), "EXECUTOR_COMPLETION", {
+        execution_id: info.execution_id,
+        task_id: info.task_id,
+        executor_id: PAIR_NATIVE_EXECUTOR_ID,
+        status: info.status,
+        finished_at: info.finished_at,
+      });
+    }
+  } catch {
+    /* wake is a durable hint, never a collection precondition */
+  }
+});
 
 const adapters = new Map([[PAIR_NATIVE_EXECUTOR_ID, native]]);
 const governed = new Map();
@@ -292,7 +311,35 @@ if (process.env.PAIR_DSH_HOME) {
 // resolve driver-attributed provenance (mission → bound_open →
 // work_open_binding.created_by): autonomous dispatches run
 // subscription-only, with metered API keys stripped from the child env.
-if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot, store }));
+// P18.3 RC-C — registered UNCONDITIONALLY (same pattern as DEVIN below):
+// dispatch stays fail-closed via qualify() when CODEX_HOME is absent, but
+// observe/collect/rehydrate read journalRoot and work env-free. An
+// env-gated adapter made `adapterFor` return null for in-flight codex
+// executions after a restart without CODEX_HOME → reconcile reported
+// observed_status:null → UNKNOWN_SIDE_EFFECT_STATE → permanent RUNNING
+// zombies that re-probed every 30 s forever.
+governed.set(
+  CODEX_EXECUTOR_ID,
+  new CodexCliExecutorAdapter({
+    journalRoot,
+    store,
+    onFinished: (info) => {
+      try {
+        if (info.mission_id) {
+          sup.wake(String(info.mission_id), "EXECUTOR_COMPLETION", {
+            execution_id: info.execution_id,
+            task_id: info.task_id,
+            executor_id: CODEX_EXECUTOR_ID,
+            status: info.status,
+            finished_at: info.finished_at,
+          });
+        }
+      } catch {
+        /* wake is a durable hint, never a collection precondition */
+      }
+    },
+  }),
+);
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
 // Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the
@@ -1318,17 +1365,12 @@ const runReplanPoolGeneration = async (gen) => {
     ? plannerAdaptiveRetryForWorkItem(store, replanWi)
     : null;
   if (adaptive?.exhausted) {
-    store.event({
-      entity_type: "work_item",
-      entity_id: replanWi,
-      event_type: "PLANNER_VALIDATION_RETRY_EXHAUSTED",
-      new_state: null,
-      actor: "PAIR_REPLAN_GENERATION",
-      metadata: {
-        rejected_run_count: adaptive.rejected_run_count,
-        last_planner_run_id: adaptive.source?.planner_run_id ?? null,
-      },
-    });
+    emitPlannerValidationRetryExhausted(
+      store,
+      replanWi,
+      adaptive,
+      "PAIR_REPLAN_GENERATION",
+    );
     throw new PolicyError(
       "FAIL_CLOSED_PLANNER_VALIDATION_RETRY_EXHAUSTED",
       `work_item ${replanWi}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,

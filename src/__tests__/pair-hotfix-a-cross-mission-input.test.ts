@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
@@ -1522,7 +1523,11 @@ describe("HOTFIX-A cross-mission canonical artifact input binding", () => {
     expect(fs.existsSync(dist)).toBe(true);
     const r = spawnSync(
       process.execPath,
-      ["-e", `import("${dist}").then(()=>process.exit(0))`],
+      // P18.3 — Windows absolute paths are not valid ESM specifiers:
+      // `import("D:\...")` throws ERR_UNSUPPORTED_ESM_URL_SCHEME. The
+      // file:// URL is the cross-platform form (POSIX paths resolve to
+      // the same URL).
+      ["-e", `import(${JSON.stringify(pathToFileURL(dist).href)}).then(()=>process.exit(0))`],
       { encoding: "utf8", timeout: 60_000 },
     );
     expect(r.status).toBe(0);
