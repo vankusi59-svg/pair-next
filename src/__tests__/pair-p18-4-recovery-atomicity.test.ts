@@ -613,6 +613,110 @@ describe("P18.4-A — recovery atomicity", () => {
     expect(signaled).toBe(true);
     expect(Number(row.settle_faults)).toBeGreaterThanOrEqual(24);
   });
+
+  it("RA-11 crash inside the exclusion→signal boundary: exclusion and recovery commit atomically", () => {
+    const ctx = makeCtx("ra11");
+    const mid = startMission(ctx);
+    const e1 = execs(ctx, mid)[0]!;
+    // Reach COLLECT_FAULT_BOUND on the very next collect fault:
+    // collection_attempts seeds just below the bound; a FAILED status
+    // with no result makes collect_result throw (non-deterministic —
+    // the bound, not determinism, drives the handoff).
+    const seeded = ctx.store.get("executor_execution", String(e1.execution_id));
+    seeded.collection_attempts = 23;
+    ctx.store.put("executor_execution", String(e1.execution_id), seeded, Number(seeded.version));
+    ctx.adapter.markStatus(String(e1.execution_id), "FAILED");
+    // Crash on the recovery_decision write INSIDE the exclusion txn —
+    // the exclusion put + evidence + every arm write must roll back.
+    ctx.store.faultInjector = (op) => {
+      if (op.kind === "put" && op.entityType === "recovery_decision") {
+        throw new Error("INJECTED_CRASH");
+      }
+    };
+    try {
+      ctx.runtime.tick(mid);
+    } catch { /* injected faults may surface */ }
+    ctx.store.faultInjector = undefined;
+    const row = ctx.store.get("executor_execution", String(e1.execution_id));
+    const rtNow = rt(ctx, mid);
+    const excluded = row.collect_excluded != null;
+    const signaled =
+      rtNow.pending_recovery != null ||
+      deferredOf(ctx, mid).some((d) => String(d.task_id) === String(e1.task_id)) ||
+      ctx.store
+        .list("recovery_decision")
+        .some((d) => String(d.execution_id ?? "") === String(e1.execution_id));
+    // Atomic boundary: neither side may exist without the other.
+    expect(excluded).toBe(false);
+    expect(signaled).toBe(false);
+    // Next tick retries the whole boundary — now both commit together.
+    ctx.runtime.tick(mid);
+    const row2 = ctx.store.get("executor_execution", String(e1.execution_id));
+    const rt2 = rt(ctx, mid);
+    expect(row2.collect_excluded).toBeTruthy();
+    const signaled2 =
+      rt2.pending_recovery != null ||
+      deferredOf(ctx, mid).some((d) => String(d.task_id) === String(e1.task_id)) ||
+      ctx.store
+        .list("recovery_decision")
+        .some((d) => String(d.execution_id ?? "") === String(e1.execution_id));
+    expect(signaled2).toBe(true);
+  });
+
+  it("RA-12 upgrade backfill: pre-settle_complete rows stamp the marker, never re-settle", () => {
+    const ctx = makeCtx("ra12");
+    const mid = startMission(ctx, 2);
+    const [e1, e2] = execs(ctx, mid);
+    // PASS witness: a committed result carrying settled_at but no
+    // settle_complete (a row written by a pre-upgrade binary).
+    ctx.adapter.finish(String(e1!.execution_id), "COMPLETED");
+    ctx.runtime.tick(mid);
+    const settled = ctx.store.get("executor_execution", String(e1!.execution_id));
+    expect(settled.result).toBeTruthy();
+    expect(settled.settle_complete).toBe(true);
+    const completedEvents = () =>
+      ctx.store.list("event").filter(
+        (ev) =>
+          ev.event_type === "TASK_COMPLETED" &&
+          String((ev as Record<string, unknown>).entity_id ?? "") === String(e1!.task_id),
+      ).length;
+    const eventsBefore = completedEvents();
+    // Simulate the upgrade edge: strip settle_complete (as if the row
+    // was committed by the old binary), keep result.settled_at.
+    const legacy = ctx.store.get("executor_execution", String(e1!.execution_id));
+    delete legacy.settle_complete;
+    ctx.store.put("executor_execution", String(e1!.execution_id), legacy, Number(legacy.version));
+    ctx.runtime.tick(mid);
+    const backfilled = ctx.store.get("executor_execution", String(e1!.execution_id));
+    // Marker stamped — NO re-settle: no duplicate TASK_COMPLETED event,
+    // no second validation pass, no recovery chain.
+    expect(backfilled.settle_complete).toBe(true);
+    expect(completedEvents()).toBe(eventsBefore);
+    expect(
+      ctx.store
+        .list("recovery_decision")
+        .some((d) => String(d.execution_id ?? "") === String(e1!.execution_id)),
+    ).toBe(false);
+    // REJECT witness: a committed FAILED result with no settled_at and
+    // no settle_complete, but a decision already minted for (task, exec)
+    // — the pre-upgrade chain owns it; stamping must not mint another.
+    ctx.adapter.finish(String(e2!.execution_id), "FAILED");
+    ctx.runtime.tick(mid);
+    const decCount = () =>
+      ctx.store
+        .list("recovery_decision")
+        .filter((d) => String(d.execution_id ?? "") === String(e2!.execution_id)).length;
+    expect(decCount()).toBe(1);
+    const rejected = ctx.store.get("executor_execution", String(e2!.execution_id));
+    if (rejected.settle_complete === true) {
+      delete rejected.settle_complete;
+      ctx.store.put("executor_execution", String(e2!.execution_id), rejected, Number(rejected.version));
+      ctx.runtime.tick(mid);
+      const re2 = ctx.store.get("executor_execution", String(e2!.execution_id));
+      expect(re2.settle_complete).toBe(true);
+      expect(decCount()).toBe(1);
+    }
+  });
 });
 
 /** Test helper: clear a pending arm so the drain can fire next tick. */

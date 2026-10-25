@@ -77,3 +77,45 @@ observation, one boundary deeper.
 No second recovery authority, no new ledger: `pending_recovery` remains the
 single-slot arm and `deferred_recovery` the durable queue; transactions only
 make the transitions between them indivisible.
+
+## Phase K remediation — independent-audit findings closed
+
+The independent audit (FIX-THEN-SHIP) found two residual items; both are
+fixed and covered by RA-11/RA-12:
+
+**F13 — exclusion→signal boundary (HIGH, closed).** `markCollectExcluded`
+committed `collect_excluded` and `queueOrStartRecovery` committed its
+defer/arm chain as separate writes. A crash between them left a row
+permanently out of the sweep with no recovery signal — the same
+lost-signal class as F1, one boundary later. Both call sites (the
+`OBSERVE_FAULT_BOUND` sweep path and `handleSettleFault`'s bound/
+deterministic exit) now run `markCollectExcluded` +
+`queueOrStartRecovery` inside one `immediate()` transaction, and
+`markCollectExcluded` propagates faults so the exclusion can never
+commit without its successor signal. RA-11 crash-injects inside that
+transaction and asserts the XOR outcome, then drives the retry to the
+committed pair.
+
+**F14 — pre-upgrade settled rows re-entering the sweep (MEDIUM, closed).**
+`settle_complete` did not exist before P18.4, so rows settled by the old
+binary look identical to crash-orphaned unsettled rows. On a live
+mission, a re-driven PASS row would emit a duplicate `TASK_COMPLETED`
+event; a re-driven REJECT row could mint a second recovery chain. The
+sweep now witnesses durable proof of a prior settle —
+`result.settled_at` (PASS) or an existing `recovery_decision` for
+`(task_id, execution_id)` (REJECT arm) — stamps `settle_complete` and
+skips the row. RA-12 pins both witnesses plus the no-re-settle,
+no-duplicate-chain assertions. Genuine crash orphans carry neither
+witness and still self-heal through `settleExecution`.
+
+**Residual LOWs (documented, accepted):**
+- The settle transaction spans bounded local file IO (artifact CAS
+  persist + verify). The write lock is held through fsyncs; acceptable
+  under the single-writer object graph and `busy_timeout`, documented
+  rather than re-architected.
+- RA-1 sweeps the first 10 writes of one arm shape; auxiliary arm
+  writes (barrier, approval, backoff schedule) share the same
+  transaction and are covered by transaction semantics, with targeted
+  coverage in RA-2/RA-3/RA-11.
+- `EXECUTION_COLLECTION_EXCLUDED` reason taxonomy preserved:
+  `deterministic` / `post_commit` / `attempt_bound`.
