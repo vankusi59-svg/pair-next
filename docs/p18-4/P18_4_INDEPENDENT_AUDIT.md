@@ -56,16 +56,43 @@ Findings and resolution:
 | NIT | observed-bucket docstring overclaimed | Reworded: "facts about observation". |
 | NIT | unsorted executions array | Sorted by `dispatch_timestamp`. |
 
+## P18.4-A second-pass audit (post-remediation)
+
+A second independent pass audited the remediated spine — **FIX-THEN-SHIP
+→ all HIGH/MEDIUM closed** (`bd6443c`):
+
+| Sev | Finding | Resolution |
+|---|---|---|
+| HIGH | Upgrade witness read `result.settled_at` — adapter-controllable (dead + forgeable skip-settlement) | Corrected to canonical row-level `e.settled_at`; doc corrected |
+| HIGH | `settleExecution` no `settle_complete` early-return — apply-path replay could re-run a full disposition (duplicate events, clobbered successor arm) | In-txn re-read + early return on `settle_complete===true` |
+| HIGH | `clearPendingRecovery`→re-decide two commits on RECONCIL apply path | Both branches wrapped in `immediate()` |
+| MED | Drop evidence not exactly-once (prune: evidence-before-removal → duplicates; bound/armed: removal-before-evidence+swallow → silent drop) | All drops commit removal+evidence in one txn; missing `reason` field added |
+| MED | Committed-unsettled rows on terminal missions unreachable by every sweep | `settleTerminalMissionOrphans` neutralizes via `terminal_outcome=MISSION_TERMINAL_BEFORE_SETTLE` (atomic, idempotent) |
+| MED | Drain txn no in-txn pending check — racing arm could be clobbered | Early return on `rtTxn.pending_recovery` inside BEGIN IMMEDIATE |
+| NIT | Backfill stamp emitted no evidence | `EXECUTION_SETTLE_BACKFILLED` in the same txn |
+| LOW | faultInjector prod-assignable (convention only); settle-txn file IO; CAS-race determinism; dead-writer counter floor | Accepted + documented |
+
+E2E-3/E2E-5 "flakiness" was root-caused to test-assertion order, not a
+product defect: the sweep legitimately early-returns mid-pass when a
+settle arms recovery (sibling collect lands next tick — collection runs
+in every live state via `COLLECT_LIVE_STATES`), so the tests now drive
+until all canonical witnesses hold. E2E-5 additionally accepts the
+legitimate mission-terminal outcome (dead missions never drain; the
+deferred row remains durably queued — which IS the crash-safe signal
+preservation being proven).
+
 ## Integrated assessment
 
 The A and B fixes are disjoint (atomicity spine vs. read projections);
 the B remediations touch only observability/UI files, the A remediations
-only `mission-runtime.ts` + tests. No interaction risk identified.
+only `mission-runtime.ts`/`reconciliation.ts` + tests. No interaction
+risk identified.
 
 **Remaining documented limitations:** settle-txn file IO under the write
 lock; RA-1 arm-shape coverage; reconciliation_receipt unbounded scan
 (same class as existing metrics()); per-row flag/rollup phrasing
-inherently approximate for faulted-observe rows.
+inherently approximate for faulted-observe rows; faultInjector
+convention-gated.
 
-Final gate: `verify:change --base 9a1e363` verdict pending on
-post-remediation HEAD (see `.pair-verification/report.md`).
+Final gate: `verify:change --base 9a1e363` on post-remediation HEAD —
+see `.pair-verification/report.md`.
