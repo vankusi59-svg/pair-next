@@ -1,0 +1,9 @@
+{
+ "schema": "pair.goal-intent-benchmark.v1",
+ "lane": "seeded-fixture (deterministic pipeline)",
+ "denominator": 61,
+ "correct": 61,
+ "score": 1,
+ "rubric": "1 scenario is CORRECT iff every check passes: categories_include ⊆ analyzed item categories; ambiguity_class equal when specified; has_conflict presence matches reconciliation.conflicts; authority_must_not_be: no analyzed item may carry a forbidden authority class. Clearly-specified subset = all scenarios in this file (deterministic expectations).",
+ "failures": []
+}

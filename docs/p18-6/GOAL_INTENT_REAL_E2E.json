@@ -1,0 +1,346 @@
+{
+ "contract": "pair.goal-intent-real-e2e.v1",
+ "model": "gpt-6.1-sol",
+ "semantic_mode_env": "off",
+ "started_at": "2026-10-26T14:40:17.500Z",
+ "cases": [
+  {
+   "id": "R-1",
+   "lang": "en",
+   "family": "outcome+constraint",
+   "provider_requests": 1,
+   "latency_ms": 11273,
+   "categories": [
+    "primary_outcome",
+    "entity",
+    "temporal",
+    "prohibition",
+    "ambiguity",
+    "missing_information"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "primary_outcome",
+     "statement": "Increase the operator's Telegram channel subscriber count by 1,000 genuine subscribers.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "entity",
+     "statement": "The target is a Telegram channel belonging to the operator.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "temporal",
+     "statement": "Achieve the subscriber growth within 30 days.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i4",
+     "category": "prohibition",
+     "statement": "Do not buy advertisements to achieve the growth.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i5",
+     "category": "ambiguity",
+     "statement": "The criteria for qualifying subscribers as genuine are unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i6",
+     "category": "missing_information",
+     "statement": "The channel's identity, topic, and current subscriber count are unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  },
+  {
+   "id": "R-2",
+   "lang": "vi",
+   "family": "outcome-equivalent",
+   "provider_requests": 1,
+   "latency_ms": 8782,
+   "categories": [
+    "primary_outcome",
+    "secondary_outcome",
+    "requirement",
+    "missing_information"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "primary_outcome",
+     "statement": "Phát triển kênh Telegram.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "secondary_outcome",
+     "statement": "Thu hút thêm người đăng ký thật cho kênh Telegram.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "requirement",
+     "statement": "Người đăng ký thu hút thêm phải là người thật.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i4",
+     "category": "missing_information",
+     "statement": "Chưa xác định kênh Telegram cụ thể cần phát triển.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  },
+  {
+   "id": "R-3",
+   "lang": "vi",
+   "family": "prohibition",
+   "provider_requests": 1,
+   "latency_ms": 300037,
+   "verdict": "UNAVAILABLE",
+   "reason": "codex:timeout"
+  },
+  {
+   "id": "R-4",
+   "lang": "mixed",
+   "family": "mixed-language",
+   "provider_requests": 1,
+   "latency_ms": 289099,
+   "categories": [
+    "primary_outcome",
+    "quantity",
+    "temporal",
+    "soft_preference",
+    "ambiguity",
+    "missing_information"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "primary_outcome",
+     "statement": "Attract 200 genuine leads.",
+     "authority": "EXPLICIT_OPERATOR",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "quantity",
+     "statement": "The target is 200 genuine leads.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "temporal",
+     "statement": "Achieve the lead target within two weeks.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i4",
+     "category": "soft_preference",
+     "statement": "Prioritize free solutions.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i5",
+     "category": "ambiguity",
+     "statement": "The criteria for a genuine lead are unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i6",
+     "category": "missing_information",
+     "statement": "The offering and target audience for lead generation are unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i7",
+     "category": "missing_information",
+     "statement": "The start date of the two-week period is unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  },
+  {
+   "id": "R-5",
+   "lang": "vi",
+   "family": "conditional",
+   "provider_requests": 1,
+   "latency_ms": 8132,
+   "categories": [
+    "conditional",
+    "missing_information"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "conditional",
+     "statement": "Thử phương án B nếu phương án A không hiệu quả.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "missing_information",
+     "statement": "Chưa có thông tin mô tả phương án A.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "missing_information",
+     "statement": "Chưa có thông tin mô tả phương án B.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i4",
+     "category": "missing_information",
+     "statement": "Chưa nêu tiêu chí xác định phương án A không hiệu quả.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  },
+  {
+   "id": "R-6",
+   "lang": "en",
+   "family": "ambiguity-honest",
+   "provider_requests": 1,
+   "latency_ms": 9028,
+   "categories": [
+    "primary_outcome",
+    "missing_information",
+    "ambiguity"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "primary_outcome",
+     "statement": "Improve the product.",
+     "authority": "EXPLICIT_OPERATOR",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "missing_information",
+     "statement": "The product to improve is not identified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "ambiguity",
+     "statement": "The intended kind of improvement is unspecified.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  },
+  {
+   "id": "R-7",
+   "lang": "vi",
+   "family": "hard-constraint",
+   "provider_requests": 1,
+   "latency_ms": 300027,
+   "verdict": "UNAVAILABLE",
+   "reason": "codex:timeout"
+  },
+  {
+   "id": "R-8",
+   "lang": "en",
+   "family": "preference-priority",
+   "provider_requests": 1,
+   "latency_ms": 278245,
+   "categories": [
+    "priority",
+    "secondary_outcome",
+    "missing_information",
+    "ambiguity"
+   ],
+   "ambiguity_class": "MATERIAL",
+   "items": [
+    {
+     "id": "i1",
+     "category": "priority",
+     "statement": "Organic reach is the first priority.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i2",
+     "category": "secondary_outcome",
+     "statement": "Consider low-cost partnerships after prioritizing organic reach.",
+     "authority": "MODEL_INFERRED",
+     "confidence": "high"
+    },
+    {
+     "id": "i3",
+     "category": "missing_information",
+     "statement": "The goal does not define what cost qualifies as low.",
+     "authority": "UNRESOLVED",
+     "confidence": "high"
+    },
+    {
+     "id": "i4",
+     "category": "ambiguity",
+     "statement": "The transition to considering partnerships could depend on sequencing or on an unstated milestone for organic reach.",
+     "authority": "UNRESOLVED",
+     "confidence": "medium"
+    }
+   ],
+   "conflicts": [],
+   "verdict": "PASS",
+   "failures": []
+  }
+ ],
+ "provider_requests_total": 8,
+ "probe": {
+  "outcome": "AUTH_OK",
+  "latency_ms": 83428,
+  "detail": "invocation_ok code=0"
+ },
+ "score": "6/8",
+ "verdict": "REAL_MODEL_PARTIAL",
+ "finished_at": "2026-10-26T15:01:45.787Z"
+}
