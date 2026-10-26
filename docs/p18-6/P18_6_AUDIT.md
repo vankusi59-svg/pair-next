@@ -136,3 +136,70 @@ negative). Required suites: 303/303 green (benchmark 61/61, adversarial
   load — passes standalone on BOTH BASE and branch (13.2 s / 11.8 s);
   different real-CLI tests failed across runs (C1, C3). Host CLI
   timing variance, not a diff regression.
+
+## FINAL governance closure (second audit round, HEAD `773da14`)
+
+Three findings were reported against the post-remediation HEAD and
+closed with executable adversarial probes at the REAL
+`MissionControl.confirmPlanPreview` seam
+(`pair-semantic-goal-understanding.test.ts`, `P18.6-FINAL F1/F2/F3`).
+
+### F1 — GUARDED missing-evidence bypass (HIGH) — CLOSED
+
+Original hole: an analysis or `pinPlannerRunGoalIntent` exception was
+swallowed to `goalIntentPinned = null`, leaving `planner_run.goal_intent
+= null`; the gate early-returned on absent evidence → confirm passed.
+Fix: `planner_run.semantic_mode` is bound durably at `beginPlannerRun`
+(mjs stamps `semanticMode()` at BOTH the initial-plan and replan
+edges). `assertGuardedIntentConfirmed(run, resolution)` now requires a
+`guarded`-stamped run to carry non-null, mode-matching pinned
+evidence — missing/mismatched → `FAIL_CLOSED_GOAL_INTENT_EVIDENCE`;
+unavailable → `FAIL_CLOSED_GOAL_INTENT_UNAVAILABLE`; MATERIAL-class
+evidence without enumerable material items → malformed → fail closed.
+Legacy runs (no stamp — genuinely pre-stamp provenance) keep
+evidence-driven gating, so OFF/SHADOW/historical previews confirm
+unchanged; a non-guarded run carrying guarded-stamped evidence still
+gates (fail-safe direction).
+
+### F2 — approval resolved ambiguity it never reviewed (HIGH) — CLOSED
+
+Original hole: any verified approval flipped a boolean satisfying the
+gate wholesale — ambiguity introduced in the amended revision but
+never reviewed passed. Fix: the gate requires the verified approval's
+`item_statements` as `resolution.approved_statements`; every
+material-driving `UNRESOLVED` item in the confirmed revision's pinned
+analysis (same discriminator as `classifyAmbiguity`) must be covered by
+an approved statement via the deterministic ≥60% content-token overlap
+used by `reconcileIntent`. Uncovered items →
+`FAIL_CLOSED_GOAL_INTENT_AMBIGUITY` listing item ids. Item ids are
+positional per-analysis, so statements are the only stable
+cross-revision binding; `verifyGoalIntentApproval` continues to bind
+goal-sha + scope + operator + revision digest, so an unrelated
+approval cannot even reach the coverage check.
+
+### F3 — cross-scope replan snapshot reuse (HIGH/MEDIUM) — CLOSED
+
+Original hole: `latestGoalIntentSnapshot` filtered only on
+`project_id` when provided — a snapshot scoped {B1,OBJ1,WI1,P1}
+matched a request for {…,WI2,P1} or a bare {P1}. Fix: strict
+dimension-for-dimension equality across ALL FOUR lineage dims
+(business/objective/work_item/project; `""`-normalized), so an
+unknown/missing snapshot dimension can never silently satisfy a
+more-specific request and scoped evidence never leaks into unscoped
+reuse. mjs resolves the mission's canonical lineage
+(`bound_open_id → work_open_binding → work_item.{objective,business}`)
+once — `replanIntentScope` — used at the request-time lookup AND
+re-verified at generation time (`genIntentScopeOk`); mismatch forces
+an authorized fresh analysis, never a silent replay. Fresh replan
+analyses stamp the same resolved lineage so future replans can bind.
+
+### Closure verification
+
+- 36/36 `pair-semantic-goal-understanding.test.ts` green incl. all
+  F1/F2/F3 adversarial probes (missing-evidence guarded run,
+  unavailable-status injection, covered-vs-uncovered approval E2E,
+  full-lineage/foreign/under-specified snapshot cases).
+- 123/123 replan-generation + adversarial + f3-closure; benchmark
+  61/61 seeded lane unchanged (real-model lane: 6/8, honest
+  UNAVAILABLE on 2 provider timeouts — reported separately from the
+  seeded pipeline-integrity result per the benchmark doc's caveat).

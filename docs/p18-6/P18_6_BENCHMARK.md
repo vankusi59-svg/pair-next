@@ -40,7 +40,17 @@ Denominator = 61 (all clearly-specified deterministic expectations).
    REAL validate → reconcile → classify → render pipeline.
    **Result: 61/61 = 100%** (`docs/p18-6/GOAL_INTENT_BENCHMARK_RESULTS.json`).
 
-2. **Real-model lane** (qualification-gated):
+   **What this number is and is not:** the fixture injects each
+   scenario's *expected* model response — it proves the deterministic
+   pipeline (schema validation → reconciliation → ambiguity
+   classification → authority boundaries → render bounds) is correct
+   and zero-authority-violating. It is **not** a real-model accuracy
+   measurement and cannot establish a ≥90% real-model claim. The only
+   real-model evidence is lane 2 below, reported separately and
+   honestly.
+
+2. **Real-model lane** (qualification-gated — the ONLY real-model
+   accuracy evidence; no injected expectations):
    `scripts/dev-verification/goal-intent-real-e2e.mjs` qualifies the
    codex-cli transport via `codexPlannerProbe`, then runs 8 live
    scenarios through the real provider call.
