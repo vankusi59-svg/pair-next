@@ -281,3 +281,126 @@ describe("SEM-COV G′ — coverage report persistence", () => {
     expect((observed as { verdict: string }).verdict).toBe("PASS");
   });
 });
+
+/* ---------- K′ audit regression — extraction/matcher defects ---------- */
+
+describe("SEM-COV — K′ audit regressions", () => {
+  it("SC-10 — đ-initial VI verb is live code: 'Đạt 1.000…' mints obligation + floor + deadline", () => {
+    const c = extractGoalContract(
+      "Đạt 1.000 người đăng ký trong vòng 30 ngày",
+    );
+    expect(c.obligations).toHaveLength(1);
+    expect(c.obligations[0].quantity?.min).toBe(1000);
+    expect(c.deadline).toBeTruthy();
+  });
+
+  it("SC-11 — marker-path grouped quantities keep magnitude: 'at least 1,000' → floor 1000", () => {
+    const c = extractGoalContract(
+      "Grow the Telegram channel by at least 1,000 subscribers",
+    );
+    expect(c.obligations[0].quantity?.min).toBe(1000);
+    // A task stating a lesser magnitude must NOT satisfy the floor.
+    expect(() =>
+      assertPlanCoverage(c, [
+        work("T1", "Grow the Telegram channel by 5 subscribers"),
+      ]),
+    ).toThrowError(IntegrityError);
+  });
+
+  it("SC-12 — VI marker 'tối thiểu 1.000' resolves floor 1000 (dot-grouped)", () => {
+    const c = extractGoalContract("Tăng tối thiểu 1.000 người theo dõi");
+    expect(c.obligations[0].quantity?.min).toBe(1000);
+  });
+
+  it("SC-12b — 'ít nhất 500' VI min marker is live (was dead code on the í- boundary)", () => {
+    const c = extractGoalContract("Thu hút ít nhất 500 khách hàng mới");
+    expect(c.obligations[0].quantity?.min).toBe(500);
+  });
+
+  it("SC-13 — deadline phrasing mints NO quantity floor ('within 30 days' ≠ 30)", () => {
+    const c = extractGoalContract("Grow my channel within 30 days");
+    expect(c.obligations).toHaveLength(1);
+    expect(c.obligations[0].quantity).toBeUndefined();
+    expect(c.deadline).toBeTruthy();
+  });
+
+  it("SC-14 — 'in 2 weeks' and bare years mint no floor", () => {
+    const c1 = extractGoalContract("Attract new leads in 2 weeks");
+    expect(c1.obligations[0].quantity).toBeUndefined();
+    const c2 = extractGoalContract("Reach users in 2026");
+    expect(c2.obligations[0].quantity).toBeUndefined();
+  });
+
+  it("SC-15 — task-side dates/durations can NEVER satisfy a real floor (fail-closed)", () => {
+    const c = extractGoalContract(
+      "Grow the Telegram channel by 1,000 genuine subscribers",
+    );
+    // "in 2025" used to mint 2025 ≥ 1000 → vacuous floor satisfaction.
+    expect(() =>
+      assertPlanCoverage(c, [
+        work("T1", "Launch the Telegram channel growth campaign in 2025"),
+      ]),
+    ).toThrowError(IntegrityError);
+    // And a real magnitude still passes through the same mask.
+    const r = assertPlanCoverage(c, [
+      work(
+        "T1",
+        "Execute the Telegram channel growth campaign delivering 1,200 genuine subscribers in 2025",
+      ),
+    ]);
+    expect(r.rows.find((x) => x.kind === "obligation")!.state).toBe("PROVEN");
+  });
+
+  it("SC-16 — VI clause-initial 'Thu hút' mints no false anchor; fulfillment task covers", () => {
+    const c = extractGoalContract("Thu hút 500 khách hàng mới cho kênh");
+    expect(c.obligations).toHaveLength(1);
+    const r = assertPlanCoverage(c, [
+      work("T1", "Thực hiện chiến dịch thu hút 500 khách hàng mới cho kênh"),
+    ]);
+    expect(r.rows.find((x) => x.kind === "obligation")!.state).toBe("PROVEN");
+  });
+
+  it("SC-17 — 'X but do not Y' mints a coverable obligation (trailing connective trimmed)", () => {
+    const c = extractGoalContract(
+      "Research crypto markets but do not use leverage",
+    );
+    expect(c.obligations).toHaveLength(1);
+    expect(c.obligations[0].text).toBe("Research crypto markets");
+    const r = assertPlanCoverage(c, [
+      work("T1", "Research crypto markets and summarize the findings"),
+    ]);
+    expect(r.rows.find((x) => x.kind === "obligation")!.state).toBe("PROVEN");
+  });
+
+  it("SC-18 — 'without' is scoping vocabulary, never a prohibited term", () => {
+    const c = extractGoalContract(
+      "Write the report without using unverified sources",
+    );
+    expect(c.prohibitions).toHaveLength(1);
+    expect(c.prohibitions[0].terms).not.toContain("without");
+    // a compliant task holds the prohibition (action-gated: no `use` on
+    // the banned object terms)
+    const r = assertPlanCoverage(c, [
+      work("T1", "Write the report from reviewed materials"),
+    ]);
+    expect(
+      r.rows.find((x) => x.kind === "prohibition")!.state,
+    ).not.toBe("VIOLATED");
+  });
+
+  it("SC-19 — a substantive but unparseable goal mints a PRESERVED obligation (contract is never vacuous)", () => {
+    const c = extractGoalContract("Yield 40 bps improvement for the fund");
+    expect(c.obligations.length).toBeGreaterThanOrEqual(1);
+    // an unrelated task cannot vacuously cover the preserved row
+    expect(() =>
+      assertPlanCoverage(c, [work("T1", "Order office supplies")]),
+    ).toThrowError(IntegrityError);
+    // but a genuinely covering task can satisfy the operator's own words
+    // (the preserved row keeps the clause-initial anchor — `Yield` is a
+    // required subject token)
+    const r = assertPlanCoverage(c, [
+      work("T1", "Improve the fund's Yield metric by at least 40 bps"),
+    ]);
+    expect(r.rows.find((x) => x.kind === "obligation")!.state).toBe("PROVEN");
+  });
+});

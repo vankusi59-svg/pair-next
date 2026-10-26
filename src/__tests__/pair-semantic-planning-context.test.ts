@@ -373,4 +373,87 @@ describe("Semantic Planning V1 — PlanningContextEnvelope", () => {
     expect(raw).not.toContain(GOAL.slice(0, 40));
     expect(env.authoritative_input.operator_goal_sha256).toHaveLength(64);
   });
+
+  it("PC-10 K′ — max-fill envelope: the RENDER SEAM itself enforces the 4096 bound", () => {
+    // Worst-case fill: 24 artifacts × ~long names + 16 workstreams +
+    // fat KPI blob + 8 advisory rows + 8 gaps used to render ~8,229
+    // chars while evidence recorded a 4,096 truncation — model input
+    // and persisted proof diverged. The seam now packs whole lines to
+    // the bound deterministically.
+    const env = {
+      schema_version: "pair.planning-context.v1",
+      kind: "PLANNING_CONTEXT",
+      context_digest: "d".repeat(64),
+      unavailable: Array.from({ length: 8 }, (_, i) => `GAP_${i}`),
+      integrity: [],
+      sections: {
+        canonical_facts: {
+          digest: "a".repeat(64),
+          value: {
+            objective_id: "OB1",
+            status: "ACTIVE",
+            title: "t".repeat(240),
+            workstreams: {
+              rows: Array.from({ length: 16 }, (_, i) => ({
+                workstream_id: `ws-${i}-${"w".repeat(40)}`,
+                status: "ACTIVE",
+              })),
+              truncated: true,
+            },
+            accepted_artifacts: {
+              rows: Array.from({ length: 24 }, (_, i) => ({
+                logical_name: `artifact-${i}-${"n".repeat(80)}`,
+              })),
+              truncated: true,
+            },
+            kpis: { blob: "k".repeat(380) },
+          },
+        },
+        advisory: {
+          digest: "b".repeat(64),
+          value: {
+            experience: {
+              rows: Array.from({ length: 8 }, (_, i) => ({
+                type: `TYPE_${i}`,
+                status: "PAST",
+              })),
+            },
+            planner_evidence: {
+              recent_validation_codes: {
+                rows: Array.from({ length: 8 }, (_, i) => `CODE_${i}`),
+              },
+            },
+          },
+        },
+      },
+    };
+    const block = renderPlanningContextBlock(
+      env as unknown as import("../pair/planning-context.js").PlanningContextEnvelope,
+    );
+    expect(block.length).toBeLessThanOrEqual(4096);
+    expect(block).toContain("(context truncated to bound)");
+    expect(block).toContain("context_digest: " + "d".repeat(64));
+  });
+
+  it("PC-11 K′ — persisted evidence is byte-identical to the block the model consumed", () => {
+    const s = freshStack("pc11");
+    const businessId = mkBusiness(s);
+    const obj = mkObjective(s, businessId);
+    const env = s.planning.envelopeFor({
+      objective_id: String(obj.objective_id),
+      authorityGoal: GOAL,
+      actor: "PAIR_PLANNER",
+    });
+    const block = renderPlanningContextBlock(env);
+    const run = beginPlannerRun(s.store, {
+      project_id: s.projectId,
+      routes: ["codex-cli:test"],
+      actor: "PAIR_PLANNER",
+      planning_context_digest: env.context_digest,
+      planning_context_block: block,
+    });
+    // render is ≤4096 ⇒ the stored row is the untruncated prompt bytes.
+    expect(run.planning_context_block).toBe(block);
+    expect(run.planning_context_digest).toBe(env.context_digest);
+  });
 });

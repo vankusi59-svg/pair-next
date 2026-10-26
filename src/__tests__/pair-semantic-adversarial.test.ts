@@ -219,7 +219,9 @@ describe("SEM-ADV — envelope scope & authority", () => {
     const many = Array.from({ length: 500 }, (_, i) => ({ logical_name: `artifact-${i}` }));
     const env = envFor(store, mockReader("CTX", { artifacts: many }), { objective_id: "OB1" });
     const block = renderPlanningContextBlock(env);
-    expect(block.length).toBeLessThan(8192);
+    // K′ audit — the render seam itself enforces the persisted bound:
+    // what the model consumes is exactly what evidence records (≤4096).
+    expect(block.length).toBeLessThanOrEqual(4096);
     expect(block).toContain("…"); // truncated marker
     const arts = (env.sections.canonical_facts.value as Record<string, unknown>)
       .accepted_artifacts as { rows: unknown[] };

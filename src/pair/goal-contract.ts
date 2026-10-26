@@ -588,9 +588,12 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
   return false;
 }
 
-/** Work verbs that make a clause an obligation. Delivery verbs (send /
- *  gửi / deliver) are deliberately absent — delivery is governed by the
- *  existing telegram intent authority, never by an obligation row. */
+/** Work verbs that make a clause an obligation. The `deliver` form is
+ *  present so a non-telegram "deliver X" clause still mints work —
+ *  telegram-delivery clauses are consumed by the intent check above the
+ *  obligation scan and never reach it. Boundaries are unicode
+ *  lookarounds — JS `\b` is ASCII-only and can never see `đ`/`í`-edged
+ *  words (K′ audit: `đạt`/`ít nhất`-led lexemes were dead code). */
 const LEADING_FILLER_RE =
   /^(?:please|hãy|xin|first(?:ly)?|also|then|next|finally|lastly|đầu tiên|tiếp(?: theo)?|sau đó|rồi|bây giờ|sau khi|ok(?:ay)?|and|và|\d{1,2}[.)]|[•\-–—*])\s*/iu;
 
@@ -601,14 +604,21 @@ const LEADING_FILLER_RE =
  * nouns and metric nouns stay object-identity, never obligations
  * themselves. */
 const OBLIGATION_VERB_RE =
-  /\b(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver(?:ing|ed)?|convert|recruit|onboard|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển)/iu;
+  /(?<![\p{L}\p{N}])(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver(?:ing|ed)?|convert|recruit|onboard|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển)/iu;
 
 const QUANTITY_MIN_RE =
-  /\b(?:at least|minimum of|min(?:imum)?|no fewer than|ít nhất|tối thiểu|>=|≥)\s*(\d+)/iu;
+  /(?<![\p{L}\p{N}])(?:at least|minimum of|min(?:imum)?|no fewer than|ít nhất|tối thiểu|>=|≥)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
 const QUANTITY_MAX_RE =
-  /\b(?:at most|up to|maximum of|no more than|tối đa|không quá|<=|≤)\s*(\d+)/iu;
+  /(?<![\p{L}\p{N}])(?:at most|up to|maximum of|no more than|tối đa|không quá|<=|≤)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
 const QUANTITY_EXACT_RE =
-  /\b(?:exactly|đúng|chính xác)\s+(\d+)/iu;
+  /(?<![\p{L}\p{N}])(?:exactly|đúng|chính xác)\s+(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
+/** K′ audit — scheduling phrasing carries numbers that are NEVER
+ *  quantity evidence: "within 30 days", "in 2 weeks", "trong vòng 30
+ *  ngày", a bare year "…in 2026". Masked before the bare-quantity scan
+ *  in both contract extraction and task-side floor comparison so a
+ *  deadline can neither mint a phantom floor nor satisfy a real one. */
+export const TEMPORAL_NUM_RE =
+  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong)\s+\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm)\b|\b\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm)\b|\b(?:19|20)\d{2}\b/giu;
 /* Semantic Planning V1 (C′) — grouped-thousand forms: `1,000` (EN) is
  *  unambiguous thousands grouping; VI `1.000` is accepted only with a
  *  VI-unit lookahead so a version/decimals token ("1.000.2") never
@@ -635,6 +645,7 @@ const PROHIBITION_STOPWORDS = new Set([
   // prohibited object
   "if", "when", "unless", "nếu", "khi", "miễn", "trường", "hợp", "thì",
   "nào", "bao", "giờ", "case", "provided", "long", "as", "and", "or",
+  "without",
   "nor", "else", "than", "hoặc", "cùng", "với", "của", "cho", "là",
   "các", "những", "một", "mỗi", "vào", "ra", "lên", "xuống", "lại",
   "hết", "còn", "sau", "trước", "giữa", "dưới", "ở", "tại", "về",
@@ -651,20 +662,23 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
   const exactM = QUANTITY_EXACT_RE.exec(clause);
   const q: { min?: number; max?: number } = {};
   if (exactM) {
-    const n = Number(exactM[1]);
+    const n = parseNum(exactM[1]);
     q.min = n;
     q.max = n;
   } else {
-    if (minM) q.min = Number(minM[1]);
-    if (maxM) q.max = Number(maxM[1]);
+    if (minM) q.min = parseNum(minM[1]);
+    if (maxM) q.max = parseNum(maxM[1]);
     if (q.min === undefined && q.max === undefined) {
       // A bare quantity in a work clause is the operator's stated floor —
       // "propose 3 strategies" means at least 3, never "some". Grouped
       // thousands ("1,000" / VI "1.000 người") resolve to the same floor;
       // the VI dot form must win before bare digits can mint a wrong
-      // "1" out of "1.000".
-      const viDot = BARE_NUM_VI_DOT_RE.exec(clause);
-      const bare = BARE_NUM_RE.exec(clause);
+      // "1" out of "1.000". Numbers inside deadline/duration/year
+      // phrasing are scheduling context — masked so "within 30 days"
+      // never mints a floor of 30 (K′ audit).
+      const scan = clause.replace(TEMPORAL_NUM_RE, " ");
+      const viDot = BARE_NUM_VI_DOT_RE.exec(scan);
+      const bare = BARE_NUM_RE.exec(scan);
       if (viDot && (!bare || viDot.index <= bare.index)) {
         q.min = parseNum(viDot[1]);
       } else if (bare) {
@@ -785,6 +799,21 @@ function prohibitionPayload(clause: string): {
   };
 }
 
+/** A connective left dangling at a clause tail is syntax, not subject —
+ *  "Research crypto but do not use leverage" splits at the prohibition
+ *  trigger leaving "Research crypto but"; the trailing `but` must be
+ *  trimmed before the requirement text is minted or the coverage
+ *  anchor scan promotes it to a required (unreachable) subject. */
+const TRAILING_CONNECTIVE_RE =
+  /[\s,;:–—-]+(?:but|however|nevertheless|nonetheless|yet|though|although|whereas|while|and|or|nor|nhưng|và|hoặc|mà|với|còn|then)\.?\s*$/iu;
+function trimTrailingConnective(clause: string): string {
+  let s = clause.trim();
+  for (let i = 0; i < 3 && TRAILING_CONNECTIVE_RE.test(s); i++) {
+    s = s.replace(TRAILING_CONNECTIVE_RE, "").trim();
+  }
+  return s;
+}
+
 /** Extract the Goal Contract — the deterministic, append-only projection
  *  of the text it is handed. Same input → same contract, always.
  *  AUTHORITY BOUNDARY: callers must pass `operatorGoalOf(source)` —
@@ -801,16 +830,17 @@ export function extractGoalContract(goal: string): GoalContract {
   for (const c of clauses) {
     const tm = PROHIBITION_RE.exec(c);
     if (tm && tm.index > 0 && /[\p{L}\p{N}]/u.test(c.slice(0, tm.index))) {
-      expanded.push(c.slice(0, tm.index).trim());
+      expanded.push(trimTrailingConnective(c.slice(0, tm.index)));
       expanded.push(c.slice(tm.index).trim());
     } else {
-      expanded.push(c);
+      expanded.push(trimTrailingConnective(c));
     }
   }
   const obligations: GoalRequirement[] = [];
   const deliverables: GoalRequirement[] = [];
   const constraints: GoalRequirement[] = [];
   const prohibitions: GoalRequirement[] = [];
+  const unclassified: string[] = [];
   let deadline: { id: string; text: string } | null = null;
 
   const push = (
@@ -909,6 +939,33 @@ export function extractGoalContract(goal: string): GoalContract {
     }
     // Unclassifiable clauses are objective-only — never invent a
     // requirement from them.
+    unclassified.push(clause);
+  }
+
+  /* K′ audit — a contract with NO coverable requirement must never be
+   *  the silent product of a requirement-shaped goal: "Đạt 1.000 người
+   *  đăng ký…" whose verb class went unrecognized used to mint an empty
+   *  contract that coverage then vacuously PASSED (fail-open on the
+   *  deterministic authority). When nothing at all classified, the
+   *  longest unclassified clause CARRYING REQUIREMENT EVIDENCE (a stated
+   *  quantity floor or deadline phrase) is preserved verbatim as an
+   *  obligation row — the operator's own words become the coverage
+   *  target. Markerless unparseable goals keep the baseline
+   *  conservative-incompleteness semantics (they mint nothing — no
+   *  requirement evidence existed to preserve). */
+  if (!obligations.length && !deliverables.length) {
+    const shaped = unclassified
+      .filter(
+        (c) =>
+          (c.match(/[\p{L}]{3,}/gu) ?? []).length >= 2 &&
+          (extractQuantity(c) !== undefined || DEADLINE_RE.test(c)),
+      )
+      .sort((a, b) => b.length - a.length)[0];
+    if (shaped) {
+      push(obligations, "OBL", shaped, {
+        quantity: extractQuantity(shaped),
+      });
+    }
   }
 
   const contractBase = {

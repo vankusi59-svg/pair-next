@@ -178,7 +178,10 @@ export function MissionNew() {
         source: r.plan_source ?? null,
         model: r.plan_model ?? null,
         coverage_report:
-          cov && typeof cov === "object" && (cov as { verdict?: unknown }).verdict === "PASS"
+          cov &&
+          typeof cov === "object" &&
+          (cov as { verdict?: unknown }).verdict === "PASS" &&
+          Array.isArray((cov as { rows?: unknown }).rows)
             ? (cov as Pinned["coverage_report"])
             : null,
         project_id: projectId,

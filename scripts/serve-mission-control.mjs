@@ -1211,12 +1211,17 @@ const invokePlannerPool = ({
     },
     // P-REASK R4 — durable re-ask initiation on the SAME attempt row
     // before the second model invocation (never a second row).
-    onAttemptReask: (paid, code) =>
-      markPlannerAttemptReask(store, {
+    onAttemptReask: (paid, code) => {
+      // K′ audit — a fresh emission owns the coverage slot: if this
+      // re-ask dies before canonicalize, the settled row must not carry
+      // the PRIOR emission's report as if it described the final one.
+      attemptCoverage = null;
+      return markPlannerAttemptReask(store, {
         planner_attempt_id: String(paid),
         validation_code: String(code),
         actor: "PAIR_PLANNER",
-      }),
+      });
+    },
     onAttemptEnd: (paid, rec) =>
       settlePlannerAttempt(store, {
         planner_attempt_id: String(paid),
