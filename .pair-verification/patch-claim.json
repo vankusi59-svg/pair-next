@@ -1,6 +1,6 @@
 {
   "claim_id": "P18_6_SEMANTIC_FIRST_GOAL_UNDERSTANDING",
-  "title": "P18.6 — Semantic-First Goal Understanding + FINAL closure: guarded evidence binding, item-bound approval resolution, strict snapshot scope + IDENTITY closure: structured issue keys (entity/quantity/scope swaps are never the reviewed issue), accept-vs-supplied decisions, approval endpoint ownership+lifecycle authority",
+  "title": "P18.6 — Semantic-First Goal Understanding + closures: guarded evidence binding, strict snapshot scope, IDENTITY-binding approval (structured issue keys, accept-vs-supplied decisions, endpoint ownership+lifecycle authority)",
   "affected_surfaces": [
     "PLANNER",
     "MISSION_DRAFT",
