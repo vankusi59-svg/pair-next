@@ -1390,16 +1390,18 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
         item_ids: ["i1"], operator_id: null,
       }),
     ).toThrow(/FAIL_CLOSED_OPERATOR_ID_REQUIRED/);
-    // Lifecycle: a CONSUMED preview cannot mint amendments.
+    // Lifecycle: a CONSUMED preview cannot mint NEW amendments (the
+    // pinned analysis must still carry an approvable item so validation
+    // reaches the lifecycle gate).
     const aHarmless = fakeAnalysis(
-      [item({ id: "i1", category: "primary_outcome", statement: GOALI })],
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
       GOALI,
     );
     const runH = beginPlannerRun(store, {
       routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
       goal_intent: {
         analysis_digest: aHarmless.analysis_digest, block: "b",
-        ambiguity_class: "HARMLESS", status: "analyzed",
+        ambiguity_class: aHarmless.ambiguity.class, status: "analyzed",
         unavailable_reason: null, model: "m", provider_id: "codex-cli",
         provider_requests: 1, analysis_ms: 1, from_cache: false,
         source_goal_sha: digest({ operator_goal: GOALI }),
@@ -1414,7 +1416,8 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
       },
       { planner_run_id: String(runH.planner_run_id), attempts: [], winner: null, warnings: [] },
     );
-    control.confirmPlanPreview({ preview_id: String(pvH.preview_id), plan_digest: String(pvH.plan_digest) });
+    const rowH = store.get("mission_plan_preview", String(pvH.preview_id)) as Record<string, unknown>;
+    store.put("mission_plan_preview", String(pvH.preview_id), { ...rowH, state: "CONSUMED" }, (rowH as { version: number }).version);
     expect(() =>
       approveGoalIntentItems(store, {
         preview_id: String(pvH.preview_id), base_goal: GOALI,
@@ -1485,5 +1488,181 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+  });
+});
+
+/* ==================================================================
+ * P18.6-IDENTITY-R3 — audit residuals: short-token discriminators,
+ * wh-dimension swaps, content-free keys, resolutions tamper, and the
+ * response-lost retry ordering.
+ * ================================================================== */
+describe("P18.6-IDENTITY-R3 — tokenizer + key-edge residuals", () => {
+  it("short discriminating tokens are identity-bound (v2/us/50/ii…)", () => {
+    const k = (s: string) =>
+      issueKeyFor({ category: "missing_information", statement: s });
+    // Every pair shares generic wording but differs ONLY by a ≤2-char
+    // discriminating token — the old tokens() (len<3 drop) collapsed
+    // them to identical keys (same-class F2 residual).
+    expect(k("no api key specified for phase ii")).not.toBe(
+      k("no api key specified for phase iv"),
+    );
+    expect(k("deployment target v2 unspecified")).not.toBe(
+      k("deployment target v3 unspecified"),
+    );
+    expect(k("region us rollout unclear")).not.toBe(
+      k("region eu rollout unclear"),
+    );
+    expect(k("batch of 50 records missing target")).not.toBe(
+      k("batch of 90 records missing target"),
+    );
+    // Single-char numerics discriminate quantities too.
+    expect(k("target of 5 launches unclear")).not.toBe(
+      k("target of 9 launches unclear"),
+    );
+    // Sanity: genuine rephrase of the same issue still collapses.
+    expect(k("no telegram subscriber target specified")).toBe(
+      k("telegram subscriber target missing"),
+    );
+  });
+
+  it("wh-dimension swaps are different issues (when ≠ where ≠ who)", () => {
+    const k = (s: string) =>
+      issueKeyFor({ category: "ambiguity", statement: s });
+    expect(k("unclear when to deploy the release")).not.toBe(
+      k("unclear where to deploy the release"),
+    );
+    expect(k("unclear who approves the budget")).not.toBe(
+      k("unclear how to approve the budget"),
+    );
+  });
+
+  it("content-free statements cannot cross-cover; identical still covers", () => {
+    const k = (s: string) =>
+      issueKeyFor({ category: "missing_information", statement: s });
+    // Both have an EMPTY discriminating set — without the normalized-
+    // statement fallback either would cover the other.
+    expect(k("missing required information")).not.toBe(
+      k("no details given"),
+    );
+    expect(k("missing required information")).toBe(
+      k("missing required information"),
+    );
+  });
+
+  it("tampered resolutions[] fails verification closed", () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    const a = fakeAnalysis([itm], "grow subs");
+    a.scope = { ...a.scope, project_id: String(project.project_id) };
+    const runId = (() => {
+      const run = beginPlannerRun(store, {
+        routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+        goal_intent: {
+          analysis_digest: a.analysis_digest, block: "b",
+          ambiguity_class: a.ambiguity.class, status: "analyzed",
+          unavailable_reason: null, model: "m", provider_id: "codex-cli",
+          provider_requests: 1, analysis_ms: 1, from_cache: false,
+          source_goal_sha: digest({ operator_goal: "grow subs" }),
+          context_digest: null, mode: "guarded",
+          analysis: a as unknown as Record<string, unknown>,
+        },
+      });
+      return String(run.planner_run_id);
+    })();
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: "grow subs", operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: runId, attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: "grow subs",
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    const mi = {
+      operator_goal: approval.amended_goal,
+      project_id: project.project_id, operator_id: "op1",
+      metadata: {
+        goal_intent_approval: {
+          approval_id: approval.approval_id,
+          revision_digest: approval.revision_digest,
+        },
+      },
+    };
+    // Baseline verify passes.
+    expect(verifyGoalIntentApproval(store, { mission_input: mi }).approval_id)
+      .toBe(approval.approval_id);
+    // Tamper: forge a supplied_value decision + wrong statement.
+    const row = store.get("goal_intent_approval", approval.approval_id) as Record<string, unknown>;
+    store.put(
+      "goal_intent_approval",
+      approval.approval_id,
+      {
+        ...row,
+        resolutions: [
+          { item_id: "i1", statement: "forged statement", issue_key: "missing_information|forged", decision: "supplied_value" },
+        ],
+      },
+      (row as { version: number }).version,
+    );
+    expect(() => verifyGoalIntentApproval(store, { mission_input: mi }))
+      .toThrow(/FAIL_CLOSED_GOAL_INTENT_APPROVAL/);
+  });
+
+  it("response-lost retry on a consumed preview returns the minted row", () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    const a = fakeAnalysis([itm], "grow subs");
+    const run = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a.analysis_digest, block: "b",
+        ambiguity_class: a.ambiguity.class, status: "analyzed",
+        unavailable_reason: null, model: "m", provider_id: "codex-cli",
+        provider_requests: 1, analysis_ms: 1, from_cache: false,
+        source_goal_sha: digest({ operator_goal: "grow subs" }),
+        context_digest: null, mode: "guarded",
+        analysis: a as unknown as Record<string, unknown>,
+      },
+    });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: "grow subs", operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(run.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: "grow subs",
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    // The preview is consumed AFTER the mint — a retry of the SAME call
+    // must resolve to the existing row, not FAIL_CLOSED_PREVIEW_STATE.
+    const row = store.get("mission_plan_preview", String(pv.preview_id)) as Record<string, unknown>;
+    store.put(
+      "mission_plan_preview", String(pv.preview_id),
+      { ...row, state: "CONSUMED" },
+      (row as { version: number }).version,
+    );
+    const retry = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: "grow subs",
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    expect(retry.approval_id).toBe(approval.approval_id);
+    // …but a NEW amendment on that consumed preview still fails closed.
+    expect(() =>
+      approveGoalIntentItems(store, {
+        preview_id: String(pv.preview_id), base_goal: "grow subs",
+        item_ids: ["i1"], operator_id: "op1",
+        supplied: { i1: "different decision" },
+      }),
+    ).toThrow(/FAIL_CLOSED_PREVIEW_STATE/);
   });
 });

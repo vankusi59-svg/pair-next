@@ -620,19 +620,36 @@ const ISSUE_GENERIC_TOKENS = new Set<string>([
   "no","not","missing","unspecified","specified","given","information",
   "info","required","requirement","requirements","unclear","ambiguous",
   "defined","provided","lack","lacks","lacking","absent","none",
-  "without","any","what","which","who","how","when","where","why",
+  "without","any",
   "is","are","be","the","a","an","for","of","to","in","on","at","by",
   "per","and","or","with","value","amount","detail","details","exact",
   "specific","needed","need","must","should","would","could","can",
   "will","target","goal","scope","set","number","count","total",
   "current","currently","appropriate","stated","mentioned","enough",
+  // NOTE: wh-dimension words (what/which/who/how/when/where/why) are
+  // deliberately NOT generic — "unclear WHEN to deploy" and "unclear
+  // WHERE to deploy" are different review questions (temporal vs
+  // location). They remain discriminating identity tokens.
   // vietnamese issue-shape words (accented + unaccented forms)
   "không","khong","chưa","chua","thiếu","thieu","thông","thong","tin",
   "cần","can","phải","phai","được","duoc","của","cua","và","va","hoặc",
   "hoac","cho","với","voi","trong","trên","tren","là","la","có","co",
-  "một","mot","các","cac","những","nhung","nào","nao","gì","gi","bao",
-  "nhiêu","nhieu","rõ","ro","đủ","du","xác","xac","định","dinh",
+  "một","mot","các","cac","những","nhung","rõ","ro","đủ","du",
+  "xác","xac","định","dinh",
 ]);
+
+/* Issue-identity tokenizer — intentionally NOT the reconciliation
+ * `tokens()` (which drops len<3 for fuzzy-overlap tuning). Identity
+ * binding exists precisely for short discriminating payloads: version
+ * tags (v2/v3), region codes (us/eu/uk), small quantities (50/90/5/9),
+ * roman numerals (ii/iv). Kept: len>=2 tokens AND single-char numerics;
+ * single-char LETTERS stay dropped (noise — "a", stray possessives). */
+function issueTokens(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/)
+      .filter((t) => t.length >= 2 || /\p{N}/u.test(t)),
+  );
+}
 
 /** The deterministic identity of an interpretation item's ISSUE —
  *  `category|sorted discriminating tokens`. Two items are the same
@@ -643,10 +660,17 @@ export function issueKeyFor(item: {
   category: string;
   statement: string;
 }): string {
-  const disc = [...tokens(item.statement)]
+  const disc = [...issueTokens(item.statement)]
     .filter((t) => !ISSUE_GENERIC_TOKENS.has(t))
     .sort();
-  return `${item.category}|${disc.join(",")}`.slice(0, 640);
+  // A content-free statement ("missing required information") yields an
+  // EMPTY discriminating set — left bare it would let any content-free
+  // statement cover any other in the category. Fall back to the
+  // normalized statement itself so only the identical statement covers.
+  const key =
+    disc.join(",") ||
+    item.statement.toLowerCase().replace(/\s+/g, " ").trim();
+  return `${item.category}|${key}`.slice(0, 640);
 }
 
 /** An approved issue identity — the reviewable unit a resolution
@@ -753,14 +777,6 @@ export function approveGoalIntentItems(
       | undefined;
     if (!preview) {
       throw new IntegrityError("FAIL_CLOSED_PREVIEW_MISSING", `preview ${args.preview_id}`);
-    }
-    // Lifecycle: only a READY preview can mint amendments — a consumed
-    // or otherwise terminal preview's evidence is settled history.
-    if (String(preview.state) !== "READY") {
-      throw new IntegrityError(
-        "FAIL_CLOSED_PREVIEW_STATE",
-        `preview ${args.preview_id} state ${String(preview.state)} is not READY`,
-      );
     }
     const mi = (preview.mission_input ?? {}) as Record<string, unknown>;
     if (
@@ -876,6 +892,16 @@ export function approveGoalIntentItems(
       if (r.revision_digest === revisionDigest && r.preview_id === args.preview_id) {
         return r;
       }
+    }
+    // Lifecycle is a MINT precondition, not a lookup one — a response-
+    // lost approve-retry on a now-consumed preview must return the
+    // already-minted row (above), but no NEW amendment may be minted
+    // against a consumed or otherwise terminal preview.
+    if (String(preview.state) !== "READY") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PREVIEW_STATE",
+        `preview ${args.preview_id} state ${String(preview.state)} is not READY`,
+      );
     }
     const amended_goal =
       `${args.base_goal.trim()}\n` + amendmentLines.join("\n");
@@ -1023,6 +1049,32 @@ export function verifyGoalIntentApproval(
     const it = byId.get(id)!;
     return { category: it.category, issue_key: issueKeyFor(it) };
   });
+  // `resolutions` is the decision evidence the endpoint echoes — same
+  // tamper surface as item_statements: every entry must re-derive from
+  // the pinned analysis item it references or the row fails closed.
+  const derivedById = new Map(
+    approval.item_ids.map((id, i) => [
+      String(id),
+      { statement: derived[i], issue_key: derivedIssues[i].issue_key },
+    ]),
+  );
+  if (
+    !Array.isArray(approval.resolutions) ||
+    approval.resolutions.length !== approval.item_ids.length ||
+    approval.resolutions.some(
+      (r) =>
+        r == null ||
+        !derivedById.has(String(r.item_id)) ||
+        String(r.statement) !== derivedById.get(String(r.item_id))!.statement ||
+        String(r.issue_key) !== derivedById.get(String(r.item_id))!.issue_key ||
+        (r.decision !== "accepted_assumption" && r.decision !== "supplied_value"),
+    )
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_APPROVAL",
+      "approval resolutions inconsistent with the pinned analysis items",
+    );
+  }
   return { ...approval, item_statements: derived, approved_issues: derivedIssues };
 }
 

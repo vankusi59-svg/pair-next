@@ -228,3 +228,55 @@ window); approval re-proof binds `project_id` (goal-sha binding makes
 cross-dim replay impossible); `genIntentScopeOk` in the mjs script is
 untested-by-construction (mirrors the tested
 `latestGoalIntentSnapshot` normalization verbatim).
+
+---
+
+## Round 3 — F2 identity-binding hardening (final semantic approval identity closure)
+
+### Finding
+
+`statementCoveredBy()` accepted >=60% token overlap as proof a MATERIAL
+ambiguity was reviewed. Insufficient when the affected entity, scope,
+quantity, currency, audience or requirement changed: an approval for
+"telegram subscriber target" covered "email subscriber target";
+Telegram-budget covered YouTube-budget; differing quantities and
+cross-project generic wording passed confirm unreviewed.
+
+### Reproduction (red probes, pre-remediation)
+
+- `approved=telegram` + revision carrying `email subscriber target
+  unclear` -> confirm PASSED (false equivalence).
+- Telegram-budget approval covered YouTube-budget ambiguity.
+- Same wording, different quantity (5000 vs 50000) -> PASSED.
+- Same generic wording, different project scope -> PASSED.
+
+### Remediation
+
+1. `issueKeyFor(item)`: structured identity = category +
+   discriminating-token set; generic issue-shape vocabulary filtered
+   (EN+VI). Coverage = identical category + identical issue_key — no
+   threshold. Swaps of entity/channel/quantity/project are never the
+   reviewed issue.
+2. `resolutions[]` on `goal_intent_approval`: per-item decision
+   `accepted_assumption` vs `supplied_value` (bounded operator text);
+   `supplied` for a non-approved item id or empty text fails closed.
+   Decisions fold into `revision_digest` — changed decision text is a
+   different amendment.
+3. `approveGoalIntentItems` authority: preview must be READY
+   (`FAIL_CLOSED_PREVIEW_STATE`), operator non-null
+   (`FAIL_CLOSED_OPERATOR_ID_REQUIRED`), and must own the preview's
+   operator binding (`FAIL_CLOSED_GOAL_INTENT_OPERATOR`).
+4. `verifyGoalIntentApproval` re-derives `item_statements` AND
+   `approved_issues` from the pinned analysis — tampered row fields
+   fail closed.
+5. Gate signature: `assertGuardedIntentConfirmed(run, { approved_issues })`.
+
+### Closure verification
+
+- 42/42 `pair-semantic-goal-understanding.test.ts` green incl. the new
+  identity probes (entity/channel/quantity/project swaps, decision-kind
+  distinction) and an HTTP-level endpoint probe (READY-lifecycle +
+  operator-bound approval over the real server seam).
+- Genuine approve->amend->re-preview->confirm E2E preserved — generic
+  rephrasing of the same issue still covers.
+- `npx tsc --noEmit` clean.
