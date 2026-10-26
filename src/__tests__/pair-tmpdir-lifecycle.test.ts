@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
   utimesSync,
 } from "node:fs";
@@ -89,13 +90,96 @@ describe("TMP-LC — mkTmpDir lifecycle", () => {
 });
 
 describe("TMP-LC — stale sweep safety", () => {
-  it("S1 — sweep deletes only aged allowlisted dirs", () => {
+  it("S1 — an aged allowlisted dir with NO owner marker is never swept", () => {
     const old = foreign("pair-tmplc-");
     ageDir(old, 2 * 60 * 60 * 1000);
     const res = sweepStaleTestDirs({ minAgeMs: 60 * 60 * 1000 });
-    expect(existsSync(old)).toBe(false);
+    // Prefix + age are NOT proof of ownership — no marker → skip.
+    expect(existsSync(old)).toBe(true);
+    expect(res.removed).toBe(0);
+  });
+
+  it("S1b — reclaim still works: valid marker + confirmed-dead pid + aged", () => {
+    const orphan = foreign("pair-tmplc-");
+    writeFileSync(
+      join(orphan, ".pair-tmp-owner"),
+      JSON.stringify({ pid: 999999999, ts: Date.now() - 2 * 60 * 60 * 1000 }),
+    );
+    ageDir(orphan, 2 * 60 * 60 * 1000);
+    const res = sweepStaleTestDirs({ minAgeMs: 60 * 60 * 1000 });
+    expect(existsSync(orphan)).toBe(false);
     expect(res.removed).toBeGreaterThanOrEqual(1);
-    scratch.splice(scratch.indexOf(old), 1);
+    scratch.splice(scratch.indexOf(orphan), 1);
+  });
+
+  it("A1 — aged foreign dirs on every allowlisted prefix shape survive unmarked", () => {
+    for (const prefix of ["ws-", "live-", "pair-"]) {
+      const d = foreign(prefix);
+      ageDir(d, 48 * 60 * 60 * 1000);
+    }
+    const res = sweepStaleTestDirs({ minAgeMs: 60 * 60 * 1000 });
+    expect(res.removed).toBe(0);
+    for (const d of scratch) expect(existsSync(d)).toBe(true);
+  });
+
+  it("A2 — malformed owner markers are never proof of ownership", () => {
+    const cases: Array<[string, string]> = [
+      ["garbage", "not-json{{{"],
+      ["no-pid", JSON.stringify({ ts: Date.now() - 86400000 })],
+      ["no-ts", JSON.stringify({ pid: 999999999 })],
+      ["pid-string", JSON.stringify({ pid: "999999999", ts: 1 })],
+      ["pid-zero", JSON.stringify({ pid: 0, ts: 1 })],
+      ["ts-negative", JSON.stringify({ pid: 999999999, ts: -5 })],
+      ["ts-string", JSON.stringify({ pid: 999999999, ts: "old" })],
+      ["pid-float", JSON.stringify({ pid: 1.5, ts: 1 })],
+      ["ts-future", JSON.stringify({ pid: 999999999, ts: Date.now() + 86400000 })],
+      ["empty-file", ""],
+    ];
+    const dirs = cases.map(([label, content]) => {
+      const d = foreign(`pair-tmplc-${label}-`.replace(/-+$/, "-"));
+      writeFileSync(join(d, ".pair-tmp-owner"), content);
+      ageDir(d, 48 * 60 * 60 * 1000);
+      return d;
+    });
+    const res = sweepStaleTestDirs({ minAgeMs: 60 * 60 * 1000 });
+    expect(res.removed).toBe(0);
+    for (const d of dirs) expect(existsSync(d)).toBe(true);
+  });
+
+  it("A3 — uncertain owner liveness (non-ESRCH) is treated as ALIVE", () => {
+    const uncertain = foreign("pair-tmplc-");
+    writeFileSync(
+      join(uncertain, ".pair-tmp-owner"),
+      JSON.stringify({ pid: 424242, ts: Date.now() - 48 * 60 * 60 * 1000 }),
+    );
+    ageDir(uncertain, 48 * 60 * 60 * 1000);
+    // EPERM-style outcome → treated alive → skip even though ancient.
+    const res = sweepStaleTestDirs({
+      minAgeMs: 60 * 60 * 1000,
+      isAlive: () => true,
+    });
+    expect(res.removed).toBe(0);
+    expect(existsSync(uncertain)).toBe(true);
+  });
+
+  it("A4 — removal unlinks junctions instead of descending into targets", () => {
+    // Node ≥24 rmSync classifies mount-point junctions as directories
+    // and would delete the TARGET's contents — the pre-pass must
+    // unlink the reparse point first. Junctions need no privilege on
+    // Windows, so this runs unprivileged.
+    const target = foreign("pair-tmplc-target-");
+    writeFileSync(join(target, "keep.txt"), "precious");
+    const mine = mkTmpDir("pair-tmplc-");
+    symlinkSync(target, join(mine, "esc"), "junction");
+    cleanupTmpDirs();
+    expect(existsSync(mine)).toBe(false);
+    expect(existsSync(join(target, "keep.txt"))).toBe(true);
+  });
+
+  it("A5 — mkTmpDir rejects prefixes that could escape the temp root", () => {
+    for (const bad of ["../x-", "a\\b-", "a/b-", "C:x-", ".."]) {
+      expect(() => mkTmpDir(bad)).toThrow();
+    }
   });
 
   it("S2 — sweep never touches fresh dirs or non-allowlisted prefixes", () => {

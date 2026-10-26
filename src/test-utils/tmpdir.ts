@@ -21,15 +21,23 @@
  * Safety invariants:
  *  - never deletes outside `os.tmpdir()`;
  *  - never deletes a path this process did not create unless it
- *    matches the explicit stale-prefix allowlist AND is older than
- *    `PAIR_TMP_SWEEP_MIN_AGE_MS` (default 60 min — longer than any
- *    expected single test-run residency);
+ *    carries a VALID `.pair-tmp-owner` marker (well-formed JSON with a
+ *    positive integer pid and a positive timestamp) — prefix and age
+ *    alone are never sufficient proof of ownership;
+ *  - a marker whose pid is live, inaccessible, or uncertain (EPERM and
+ *    any non-ESRCH liveness-check outcome) is treated as ALIVE — only
+ *    confirmed process absence (ESRCH) may qualify a dir for
+ *    reclamation, and even then the age gate still applies;
+ *  - missing, malformed, or unreadable markers are never deleted —
+ *    such residue is handled by the opt-in recovery tool
+ *    `scripts/dev-verification/tmp-recover.mts` (dry-run by default,
+ *    explicit path selection, `--confirm` approval);
  *  - never recursively sweeps the whole TEMP root;
  *  - every delete is per-path `rmSync` inside try/catch — a locked or
  *    foreign dir is skipped, never fatal.
  */
 
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync, lstatSync, unlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -94,10 +102,40 @@ function safeReal(path: string): string {
   }
 }
 
+/** Unlink every reparse point (symlink/junction) inside `dir` without
+ *  following it. Mandatory pre-pass before `rmSync`: Node ≥24's native
+ *  rmSync classifies mount-point junctions as directories and would
+ *  descend into the junction TARGET — deleting real files outside the
+ *  link. lstat().isSymbolicLink() flags junctions on every supported
+ *  Node version, so unlinking them first bounds deletion to the dir's
+ *  own contents on all engines. */
+function unlinkReparsePoints(dir: string, depth = 0): void {
+  if (depth > 64) return;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    try {
+      if (lstatSync(p).isSymbolicLink()) {
+        unlinkSync(p); // unlink the link itself, never its target
+      } else if (e.isDirectory()) {
+        unlinkReparsePoints(p, depth + 1);
+      }
+    } catch {
+      /* locked/vanished entry — rmSync retry path handles residue */
+    }
+  }
+}
+
 /** rm a single dir, tolerating Windows file locks via rmSync retries
  *  and swallowing terminal failures (ENOENT, EPERM, EBUSY residue). */
 function removeDir(dir: string): boolean {
   try {
+    unlinkReparsePoints(dir);
     rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 });
     return true;
   } catch {
@@ -121,6 +159,11 @@ function installExitHook(): void {
  *  inside an owned root do not need this — the root's removal covers
  *  them. */
 export function mkTmpDir(prefix: string): string {
+  // The prefix becomes a path component under tmpdir() — reject any
+  // form that could escape the root (traversal, separators, drives).
+  if (!prefix || /[\\/]|:|\.\./.test(prefix)) {
+    throw new Error(`mkTmpDir: unsafe prefix "${prefix}"`);
+  }
   installExitHook();
   const dir = mkdtempSync(join(tmpdir(), prefix));
   // Register both spellings — cleanup must find the dir whichever form
@@ -164,6 +207,46 @@ export interface SweepResult {
   bytesFreed: number;
 }
 
+/** Liveness probe — default for the sweep, injectable for tests.
+ *  Only a CONFIRMED absence (ESRCH) reports dead. EPERM ("the pid
+ *  exists but we may not signal it") and every other error are
+ *  uncertain → treated as alive. */
+export function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code !== "ESRCH";
+  }
+}
+
+export type OwnerStatus = "live" | "orphan" | "invalid";
+
+/** Read and validate a dir's ownership marker. A marker is only valid
+ *  if it parses as JSON carrying a positive integer pid and a positive
+ *  timestamp — anything else is "invalid" (never deletable by the
+ *  sweep). */
+export function ownerStatusOf(
+  dir: string,
+  isAlive: (pid: number) => boolean = pidIsAlive,
+): { status: OwnerStatus; ts?: number } {
+  const markerPath = join(dir, OWNER_MARKER);
+  let owner: { pid?: unknown; ts?: unknown };
+  try {
+    // Bound the read: a planted multi-GB marker must not stall/OOM the
+    // sweep. Real markers are <100 bytes; anything oversized is
+    // treated as invalid → the dir is skipped, never auto-deleted.
+    if (statSync(markerPath).size > 65536) return { status: "invalid" };
+    owner = JSON.parse(readFileSync(markerPath, "utf8"));
+  } catch {
+    return { status: "invalid" };
+  }
+  const { pid, ts } = owner ?? {};
+  if (!Number.isInteger(pid) || (pid as number) <= 0) return { status: "invalid" };
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return { status: "invalid" };
+  return { status: isAlive(pid as number) ? "live" : "orphan", ts: ts as number };
+}
+
 function dirSize(dir: string): number {
   let bytes = 0;
   try {
@@ -188,6 +271,9 @@ function dirSize(dir: string): number {
 export function sweepStaleTestDirs(opts?: {
   minAgeMs?: number;
   extraPrefixes?: readonly string[];
+  /** Test seam — override liveness probing. Production callers must
+   *  leave this unset so the real `pidIsAlive` is used. */
+  isAlive?: (pid: number) => boolean;
 }): SweepResult {
   if (process.env.PAIR_TMP_SWEEP === "0") {
     return { scanned: 0, removed: 0, skipped: 0, bytesFreed: 0 };
@@ -212,31 +298,20 @@ export function sweepStaleTestDirs(opts?: {
     if (!prefixes.some((p) => name.startsWith(p))) continue;
     const dir = join(root, name);
     res.scanned++;
-    // Live-owner guard: a `.pair-tmp-owner` marker with a LIVE pid means
-    // the dir belongs to a running worker — untouchable at any age gate.
-    // The marker's `ts` is also the better staleness proxy (dir mtime
-    // ignores content writes; a long-lived suite's dir is not stale).
-    let markerTs: number | undefined;
-    try {
-      const raw = readFileSync(join(dir, OWNER_MARKER), "utf8");
-      const owner = JSON.parse(raw) as { pid?: number; ts?: number };
-      if (typeof owner.pid === "number") {
-        try {
-          process.kill(owner.pid, 0);
-          res.skipped++;
-          continue; // live owner — never sweep
-        } catch {
-          /* dead pid — orphaned dir, age gate applies */
-        }
-      }
-      if (typeof owner.ts === "number") markerTs = owner.ts;
-    } catch {
-      /* no marker — pre-factory residue; mtime fallback */
+    // Ownership gate: a VALID marker is mandatory — prefix + age are
+    // not proof. Missing/malformed/unreadable markers and any pid that
+    // is live, inaccessible, or uncertain all SKIP; only a confirmed-
+    // dead (ESRCH) owner proceeds to the age gate.
+    const owner = ownerStatusOf(dir, opts?.isAlive);
+    if (owner.status !== "orphan") {
+      res.skipped++;
+      continue;
     }
+    // The marker's `ts` is the staleness proxy (dir mtime ignores
+    // content writes; a long-lived suite's dir is not stale).
     try {
       const st = statSync(dir);
-      const ageBasis = markerTs ?? st.mtimeMs;
-      if (!st.isDirectory() || ageBasis > cutoff) {
+      if (!st.isDirectory() || (owner.ts as number) > cutoff) {
         res.skipped++;
         continue;
       }
@@ -249,7 +324,12 @@ export function sweepStaleTestDirs(opts?: {
       res.skipped++;
       continue;
     }
-    const bytes = dirSize(dir);
+    let bytes = 0;
+    try {
+      bytes = dirSize(dir);
+    } catch {
+      /* pathological depth — measure what we could, still removable */
+    }
     if (removeDir(dir)) {
       res.removed++;
       res.bytesFreed += bytes;

@@ -70,3 +70,14 @@ env): `pair-phase-b` 9≡9 (`D:\` vs `/` path canon), `pair-f1-r1` 3≡3 and
 spawn EFTYPE), `dev-verification` 4≡4, `bootstrap` 15≡15, `p10` 10≡10,
 `p15-3` 9≡9, plus 10 more files byte-identical. Zero new failures
 introduced by the codemod/lifecycle change.
+
+## Hotfix — ownership-marker mandate (post-audit safety correction)
+
+**Finding:** the first sweep version allowed prefix+age alone to qualify a dir for deletion — insufficient proof of ownership. Corrected:
+
+- A **valid `.pair-tmp-owner` marker** (well-formed JSON, positive integer `pid`, positive `ts`) is now MANDATORY. Missing/malformed/unreadable markers are skipped permanently — the sweep never reclaims unmarked residue.
+- Liveness: only a **confirmed** `ESRCH` from `process.kill(pid, 0)` counts as dead. `EPERM` and every other outcome are treated as ALIVE/uncertain → skip at any age.
+- Orphaned-but-valid markers are still age-gated on marker `ts`.
+- Historical unmarked dirs route to `scripts/dev-verification/tmp-recover.mts` — dry-run listing by default; deletion requires explicit `--paths` selection **and** `--confirm`, and still refuses outside-temp-root, non-allowlisted, and live-owned targets.
+
+Adversarial probes: S1 rewritten (unmarked aged dir survives), S1b (valid marker + dead pid + aged → reclaimed), A1 (unmarked `ws-`/`live-`/`pair-` aged dirs all survive), A2 (7 malformed-marker shapes), A3 (EPERM-uncertain liveness → skip via injectable `isAlive` seam — production `globalSetup` uses the real `pidIsAlive`).
