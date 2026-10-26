@@ -9,6 +9,7 @@
   "required_tests": [
     "src/__tests__/pair-semantic-adversarial.test.ts",
     "src/__tests__/pair-semantic-goal-understanding.test.ts",
+    "src/__tests__/pair-goal-intent-benchmark.test.ts",
     "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-goal-contract-produce-binding.test.ts",
     "src/__tests__/pair-goal-context-authority.test.ts",
