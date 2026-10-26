@@ -86,8 +86,9 @@ interpretation evidence anywhere (strict spec parity with P18.5).
 ### INFORMATIONAL-11..15
 - Item sort now numeric-aware (`i2 < i10`).
 - `ref.analysis_digest` verified when present (was dead field).
-- Approve/amend flow is API-surface only — documented limitation;
-  `MissionNew.tsx` renders interpretation read-only.
+- Approve/amend flow now surfaced in `MissionNew.tsx`: approvable
+  items are selectable → `POST /goal-intent/approve` → re-preview via
+  `goal_intent_approval_id` (the governed amended-revision seam).
 - NEGATION regex covers EN+VI; advisory-only by design.
 - Reservation-leak probe: verified safe (throws settle the run).
 
@@ -121,3 +122,17 @@ mode this path was never exercised — latent since the pin seam landed.
 approve→amend→confirm E2E and AUTHORITY_CRITICAL-still-closed
 negative). Required suites: 303/303 green (benchmark 61/61, adversarial
 60, coverage, contract, context, replan). `tsc --noEmit` clean.
+
+## Environment-drift findings (not diff-caused, proven at BASE)
+
+- `pair-p5#22` (`GEMINI_API_KEY` literal): failed identically at BASE
+  `cabd25d` (BASE worktree run) — host DSH provider config drifted
+  gemini→agnes, so `credential_env` resolves `AGNES_API_KEY`.
+  **Remediated in-diff**: the assertion now derives the expected name
+  from the adapter's own `probe().credential_env` — the invariant
+  (env NAMES may appear, VALUES never) is unchanged and
+  provider-agnostic.
+- `pair-p0 C3` (real codex-cli red control): flaky under full-suite
+  load — passes standalone on BOTH BASE and branch (13.2 s / 11.8 s);
+  different real-CLI tests failed across runs (C1, C3). Host CLI
+  timing variance, not a diff regression.
