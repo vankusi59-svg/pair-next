@@ -58,6 +58,13 @@ export function beginPlannerRun(
     routes: string[];
     actor?: string;
     now?: () => string;
+    /** Semantic Planning V1 — digest of the PlanningContextEnvelope the
+     *  run's prompts were rendered against (evidence-class: advisory,
+     *  never bound into plan/effective-input digests). */
+    planning_context_digest?: string | null;
+    /** The bounded advisory context block actually rendered into the
+     *  prompts (≤4096 chars — evidence of what the planner saw). */
+    planning_context_block?: string | null;
   },
 ): Record<string, unknown> {
   return store.immediate(() => {
@@ -68,6 +75,11 @@ export function beginPlannerRun(
       project_id: args.project_id != null ? String(args.project_id) : null,
       operator_id: args.operator_id ?? null,
       routes: args.routes,
+      planning_context_digest: args.planning_context_digest ?? null,
+      planning_context_block:
+        typeof args.planning_context_block === "string"
+          ? args.planning_context_block.slice(0, 4096)
+          : null,
       attempts: 0,
       // AUDIT R1 F4 — provider requests PROVABLY initiated across all
       // attempts (transport-reported, never inferred from attempt rows).
@@ -87,7 +99,11 @@ export function beginPlannerRun(
       event_type: "PLANNER_RUN_STARTED",
       new_state: RUN_STATE.RUNNING,
       actor: args.actor ?? "PAIR_PLANNER",
-      metadata: { routes: args.routes, project_id: row.project_id },
+      metadata: {
+        routes: args.routes,
+        project_id: row.project_id,
+        planning_context_digest: row.planning_context_digest,
+      },
     });
     return row;
   });
@@ -229,6 +245,32 @@ export function markPlannerAttemptReask(
   });
 }
 
+/** G′ — bounded persistence form of the deterministic PlanCoverageReport
+ *  the canonical authority proved. Descriptive evidence only: nothing
+ *  reads this back as authority — coverage remains a canonicalize-time
+ *  verdict (a plan that failed coverage throws before the sink fires). */
+function boundCoverageReport(report: unknown): Record<string, unknown> | null {
+  if (typeof report !== "object" || report === null) return null;
+  const r = report as { contractDigest?: unknown; verdict?: unknown; rows?: unknown };
+  if (r.verdict !== "PASS") return null; // only a proven report is evidence
+  const rows = Array.isArray(r.rows) ? r.rows : [];
+  return {
+    contractDigest: typeof r.contractDigest === "string" ? r.contractDigest.slice(0, 128) : null,
+    verdict: "PASS",
+    rows: rows.slice(0, 128).map((x) => {
+      const row = (typeof x === "object" && x !== null ? x : {}) as Record<string, unknown>;
+      return {
+        requirement_id: String(row.requirement_id ?? "").slice(0, 80),
+        kind: String(row.kind ?? "").slice(0, 32),
+        state: String(row.state ?? "").slice(0, 32),
+        task_keys: (Array.isArray(row.task_keys) ? row.task_keys : [])
+          .slice(0, 64)
+          .map((k) => String(k).slice(0, 80)),
+      };
+    }),
+  };
+}
+
 /** Settle a STARTED attempt row to its final outcome — same row updated,
  *  never a duplicate row per invocation. */
 export function settlePlannerAttempt(
@@ -238,6 +280,10 @@ export function settlePlannerAttempt(
     record: PlannerAttemptRecord;
     winner?: boolean;
     plan_digest?: string | null;
+    /** G′ — the coverage report this attempt's canonical plan proved
+     *  (captured via canonicalize coverageSink; null when the attempt
+     *  never reached canonicalize or coverage was not proven). */
+    coverage_report?: unknown;
     actor?: string;
   },
 ): void {
@@ -258,6 +304,12 @@ export function settlePlannerAttempt(
       // attempt; settled terminal rows always carry it (0 = provably no
       // provider invocation, e.g. eligibility-rejected before planFn).
       provider_requests: Number(r.provider_requests ?? 0),
+      // G′ — coverage evidence the canonical authority proved for THIS
+      // attempt's plan; absent → null (never inferred, never refetched).
+      coverage_report:
+        args.coverage_report !== undefined
+          ? boundCoverageReport(args.coverage_report)
+          : (row.coverage_report ?? null),
     };
     store.put(ATTEMPT_ENTITY, args.planner_attempt_id, body, Number(row.version ?? 0));
     // AUDIT R1 F4 — aggregate the attempt's proven provider spend onto
@@ -483,12 +535,13 @@ export function createPlanPreview(
         },
       });
     }
-    const winnerAttemptId = args.winner
-      ? String(
-          ((linkedAttempts.length ? linkedAttempts : store.list(ATTEMPT_ENTITY).filter((r) => String(r.preview_id) === previewId)).find(
-            (r) => Number(r.attempt_no) === Number(args.winner!.attempt_no),
-          ) as Record<string, unknown> | undefined)?.planner_attempt_id ?? "",
-        )
+    const winnerAttemptRow = args.winner
+      ? ((linkedAttempts.length ? linkedAttempts : store.list(ATTEMPT_ENTITY).filter((r) => String(r.preview_id) === previewId)).find(
+          (r) => Number(r.attempt_no) === Number(args.winner!.attempt_no),
+        ) as Record<string, unknown> | undefined)
+      : undefined;
+    const winnerAttemptId = winnerAttemptRow
+      ? String(winnerAttemptRow.planner_attempt_id ?? "")
       : null;
     const preview = {
       preview_id: previewId,
@@ -501,6 +554,10 @@ export function createPlanPreview(
       canonical_tasks: args.canonical_tasks,
       planner_run_id: args.planner_run_id ?? null,
       planner_attempt_id: winnerAttemptId || null,
+      // G′ — the deterministic coverage report the WINNING attempt's
+      // canonical plan proved (durable attempt evidence, projected
+      // verbatim onto the preview; null when the path has no report).
+      coverage_report: boundCoverageReport(winnerAttemptRow?.coverage_report),
       planner: args.winner
         ? {
             provider: args.winner.provider,

@@ -1,0 +1,328 @@
+{
+  "report": "SEMANTIC_CONTEXT_PLANNING_V1_REAL_E2E",
+  "generated_at": "2026-10-26T02:27:33.105Z",
+  "model": "gpt-6.1-sol",
+  "qualification": {
+    "outcome": "AUTH_OK",
+    "latency_ms": 25781,
+    "detail": "invocation_ok code=0"
+  },
+  "cases": [
+    {
+      "case_id": "E2E-1",
+      "name": "EN outcome goal (Telegram growth, quantity+deadline)",
+      "goal": "Grow my Telegram channel by 1,000 genuine subscribers within 30 days",
+      "started_at": "2026-10-26T02:27:58.924Z",
+      "latency_ms": 60607,
+      "provider_requests": 2,
+      "contract": {
+        "obligations": [
+          "OBL_001"
+        ],
+        "deliverables": [],
+        "prohibitions": [],
+        "deadline": "DDL_001"
+      },
+      "envelope_context_digest": "4a82e848fafa923d97f03b533ffb25787e4cff31bdb66d523c23b2ce3aab9311",
+      "envelope_block_bytes": 719,
+      "rounds": [
+        {
+          "round": "INITIAL",
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+          "note": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT:{\"task\":\"T3\",\"artifact\":\"growth_plan.md\"}",
+          "coverage_report": null
+        },
+        {
+          "round": "REASK",
+          "rejection_context": {
+            "validation_code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+            "task_warnings": [],
+            "detail": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT"
+          },
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+          "note": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT:{\"task\":\"T3\",\"artifact\":\"growth_baseline.md\"}",
+          "coverage_report": null
+        }
+      ],
+      "verdict": "FAIL_CLOSED",
+      "code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT"
+    },
+    {
+      "case_id": "E2E-2",
+      "name": "VI equivalent outcome goal",
+      "goal": "Tăng thêm 1.000 người đăng ký thật cho kênh Telegram của tôi trong vòng 30 ngày",
+      "started_at": "2026-10-26T02:28:59.532Z",
+      "latency_ms": 76211,
+      "provider_requests": 2,
+      "contract": {
+        "obligations": [
+          "OBL_001"
+        ],
+        "deliverables": [],
+        "prohibitions": [],
+        "deadline": "DDL_001"
+      },
+      "envelope_context_digest": "39ab7147852f5d293ab0acd6bd21b4047c1612dd4f4f202cdf59133923700573",
+      "envelope_block_bytes": 719,
+      "rounds": [
+        {
+          "round": "INITIAL",
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK",
+          "note": "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK:{\"task\":\"T4\"}",
+          "coverage_report": null
+        },
+        {
+          "round": "REASK",
+          "rejection_context": {
+            "validation_code": "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK",
+            "task_warnings": [],
+            "detail": "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK"
+          },
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": [
+            "T1",
+            "T2",
+            "T3",
+            "T4",
+            "T5"
+          ],
+          "verdict": "CANONICAL_PASS",
+          "code": null,
+          "note": null,
+          "coverage_report": {
+            "contractDigest": "ea1e6c711b6ff329b1c0e3244f797c58",
+            "verdict": "PASS",
+            "rows": [
+              {
+                "requirement_id": "OBL_001",
+                "kind": "obligation",
+                "state": "PROVEN",
+                "task_keys": [
+                  "T2",
+                  "T3",
+                  "T4",
+                  "T5"
+                ]
+              },
+              {
+                "requirement_id": "DDL_001",
+                "kind": "constraint",
+                "state": "PRESERVED",
+                "task_keys": []
+              }
+            ]
+          }
+        }
+      ],
+      "verdict": "CANONICAL_PASS",
+      "code": null
+    },
+    {
+      "case_id": "E2E-3",
+      "name": "Conventional research+deliverable goal (regression anchor)",
+      "goal": "Research the top 3 MQL5 EA frameworks and write report.md",
+      "started_at": "2026-10-26T02:30:15.744Z",
+      "latency_ms": 10717,
+      "provider_requests": 1,
+      "contract": {
+        "obligations": [
+          "OBL_001"
+        ],
+        "deliverables": [
+          "DEL_001"
+        ],
+        "prohibitions": [],
+        "deadline": null
+      },
+      "envelope_context_digest": "174d0f73acddb608ab345981f38898d8ddf39b88066143495df1a79228160f86",
+      "envelope_block_bytes": 719,
+      "rounds": [
+        {
+          "round": "INITIAL",
+          "warnings": [],
+          "raw_task_keys": [
+            "T1"
+          ],
+          "canonical_tasks": [
+            "T1",
+            "T2"
+          ],
+          "verdict": "CANONICAL_PASS",
+          "code": null,
+          "note": null,
+          "coverage_report": {
+            "contractDigest": "a8a934890ff9ecd260997b5f148ceac2",
+            "verdict": "PASS",
+            "rows": [
+              {
+                "requirement_id": "OBL_001",
+                "kind": "obligation",
+                "state": "PROVEN",
+                "task_keys": [
+                  "T2"
+                ]
+              },
+              {
+                "requirement_id": "DEL_001",
+                "kind": "deliverable",
+                "state": "PROVEN",
+                "task_keys": [
+                  "T2"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "verdict": "CANONICAL_PASS",
+      "code": null
+    },
+    {
+      "case_id": "E2E-4",
+      "name": "Bilingual mixed goal (EN verb + VI deadline)",
+      "goal": "Attract 200 real leads trong vòng 2 tuần",
+      "started_at": "2026-10-26T02:30:26.462Z",
+      "latency_ms": 58378,
+      "provider_requests": 2,
+      "contract": {
+        "obligations": [
+          "OBL_001"
+        ],
+        "deliverables": [],
+        "prohibitions": [],
+        "deadline": "DDL_001"
+      },
+      "envelope_context_digest": "bae8ddb09e7aaca93d8f6ff26441366c10cebd41c13066ff86e401c7520f4686",
+      "envelope_block_bytes": 719,
+      "rounds": [
+        {
+          "round": "INITIAL",
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID",
+          "note": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID:{\"task\":\"T1\",\"reason\":\"UNAUTHORIZED_SOURCE\"}",
+          "coverage_report": null
+        },
+        {
+          "round": "REASK",
+          "rejection_context": {
+            "validation_code": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID",
+            "task_warnings": [],
+            "detail": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID"
+          },
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID",
+          "note": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID:{\"task\":\"T1\",\"reason\":\"UNAUTHORIZED_SOURCE\"}",
+          "coverage_report": null
+        }
+      ],
+      "verdict": "FAIL_CLOSED",
+      "code": "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID"
+    },
+    {
+      "case_id": "E2E-5",
+      "name": "Prohibition-bearing goal (without bots)",
+      "goal": "Grow Telegram subscribers without bots or unsolicited messages",
+      "started_at": "2026-10-26T02:31:24.840Z",
+      "latency_ms": 63443,
+      "provider_requests": 2,
+      "contract": {
+        "obligations": [
+          "OBL_001"
+        ],
+        "deliverables": [],
+        "prohibitions": [
+          "PRO_001"
+        ],
+        "deadline": null
+      },
+      "envelope_context_digest": "5966608943d37163ceb95439583c3429cb69305ebc002a233c70f0bf156e8892",
+      "envelope_block_bytes": 719,
+      "rounds": [
+        {
+          "round": "INITIAL",
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2",
+            "T3"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+          "note": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT:{\"task\":\"T3\",\"artifact\":\"campaign_execution.md\"}",
+          "coverage_report": null
+        },
+        {
+          "round": "REASK",
+          "rejection_context": {
+            "validation_code": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+            "task_warnings": [],
+            "detail": "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT"
+          },
+          "warnings": [],
+          "raw_task_keys": [
+            "T1",
+            "T2"
+          ],
+          "canonical_tasks": null,
+          "verdict": "FAIL_CLOSED",
+          "code": "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+          "note": "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION:{\"requirement\":\"PRO_001\",\"kind\":\"prohibition\",\"why\":\"task T2 invokes prohibited term \\\"bots\\\"\",\"text\":\"without bots or unsolicited messages\"}",
+          "coverage_report": null
+        }
+      ],
+      "verdict": "FAIL_CLOSED",
+      "code": "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION"
+    }
+  ],
+  "verdict": "2_PASS_3_FAIL_CLOSED_0_OTHER"
+}

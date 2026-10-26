@@ -57,7 +57,7 @@ export function deriveWorkTaskBudget(goal: string): number {
   const connectives = (
     g
       .toLowerCase()
-      .match(/\b(và|and|then|sau đó|tiếp|rồi|cuối cùng|finally|also|song song)\b|[,;]/gu) ?? []
+      .match(/(?<![\p{L}\p{N}])(?:và|and|then|sau đó|tiếp|rồi|cuối cùng|finally|also|song song)(?![\p{L}\p{N}])|[,;]/gu) ?? []
   ).length;
   const score = words + 4 * enumerations + 2 * connectives;
   if (score <= 40) return WORK_TASK_BUDGET_SIMPLE;
@@ -170,7 +170,7 @@ const WEEK_CURRENCY_RE =
  *  the week marker inside the clause; a week marker in a clause
  *  without a preceding schedule role keeps full recency authority. */
 const SCHEDULE_ROLE_RE =
-  /\b(họp|meeting|schedule[sd]?|lịch|deadline|hạn|nộp|bàn\s+giao|giao\s+(?!dịch)|deliver(?:ed|y|s|ing)?|submit(?:ted|s|ting)?|present(?:ed|s|ing|ation)?|trình\s+bày|gửi|send(?:s|t|ing)?|đăng|post(?:ed|s|ing)?|publish(?:ed|es|ing)?|share[sd]?)\b/iu;
+  /(?<![\p{L}\p{N}])(họp|meeting|schedule[sd]?|lịch|deadline|hạn|nộp|bàn\s+giao|giao\s+(?!dịch)|deliver(?:ed|y|s|ing)?|submit(?:ted|s|ting)?|present(?:ed|s|ing|ation)?|trình\s+bày|gửi|send(?:s|t|ing)?|đăng|post(?:ed|s|ing)?|publish(?:ed|es|ing)?|share[sd]?)(?![\p{L}\p{N}])/iu;
 
 /** TRUE when the goal carries at least one week-recency marker that is
  *  NOT governed by a schedule/deadline role within its own clause. */
@@ -200,7 +200,7 @@ const ONLINE_RE =
  *  repo, not on the network. Presence suppresses the requirement unless
  *  an online marker coexists. */
 const LOCAL_SOURCE_RE =
-  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)\b|\b(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
+  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
 
 /** Information-retrieval verbs. Word-bounded so "fetched", "scraper"
  *  do NOT match — only an explicit request to retrieve. */
@@ -371,6 +371,20 @@ const ANCHOR_STOP = new Set([
   "computes", "evaluate", "evaluates", "predict", "parse", "parses",
   "validate", "verify", "describe", "explain", "plot", "plots",
   "visualize", "recommend", "suggest", "analyze",
+  // outcome/fulfillment verbs (Semantic Planning V1) — an action word
+  // sentence-initially capitalized ("Grow my channel") is never a
+  // subject identity anchor
+  "grow", "grows", "grew", "grown", "growing", "growth", "increase",
+  "increases", "increased", "increasing", "boost", "boosts", "gain",
+  "gains", "achieve", "achieves", "reach", "reaches", "attain",
+  "acquire", "acquires", "attract", "attracts", "earn", "earns",
+  "expand", "expands", "scale", "scales", "improve", "improves",
+  "raise", "raises", "drive", "drives", "convert", "converts",
+  "recruit", "recruits", "onboard", "onboards", "execute", "executes",
+  "operate", "operates", "deliver", "delivers", "launch", "launches",
+  "perform", "performs", "conduct", "conducts", "measure", "measures",
+  "quantify", "estimate", "estimates", "forecast", "forecasts",
+  "monitor", "monitors", "track", "tracks",
   // recency / shape words
   "today", "tonight", "latest", "newest", "live", "breaking", "current",
   "currently", "online", "recent", "new", "real", "time", "up", "date",
@@ -392,6 +406,20 @@ const ANCHOR_STOP = new Set([
   "filesystem", "monorepo", "source", "open",
   // quantity bounds — modifiers, never subject identity
   "least", "most", "min", "max", "minimum", "maximum", "fewer",
+  // K′ audit — clause-initial connectives orphaned by a prohibition
+  // split ("Research crypto but…") or leading a subordinate clause are
+  // syntax, never subject identity; the ±2 context-anchor scan used to
+  // promote them into required (uncoverable) anchors.
+  "but", "however", "nevertheless", "nonetheless", "whereas", "while",
+  "yet", "though", "although", "nor",
+  // fulfill-class verbs — "Carry out…" / "Roll out…" lead work, never
+  // name a subject.
+  "carry", "carries", "roll", "rolls",
+  // Vietnamese action-verb syllables that are pure ASCII — a diacritic
+  // fragment can never anchor (token test rejects non-ASCII), but
+  // clause-initial "Thu hút…" minted a false `thu` anchor and rejected
+  // genuine fulfillment tasks. Mirrors CONTENT_TOKEN_VI_ACTION_STOP.
+  "thu", "tra", "xem", "ghi", "gia", "khai",
 ]);
 
 /** Canonical form of an anchor-lexeme token (alias + plural stem). */
@@ -589,6 +617,13 @@ export interface LlmPlannerConfig {
     source_mission_id?: string;
     source_task_id?: string;
   }>;
+  /** Semantic Planning V1 — the PRE-RENDERED advisory planning-context
+   *  block (renderPlanningContextBlock output, bounded). Advisory data
+   *  only: it informs planning but can never mint authority, widen
+   *  scope, or substitute for the Goal Contract. Assembled at the async
+   *  planner seams (or pinned on a durable replan_generation row) —
+   *  never inside the synchronous canonicalizer. */
+  planningContextBlock?: string;
 }
 
 export interface LlmPlanResult {
@@ -1042,6 +1077,8 @@ export function buildPlannerUserPrompt(
       source_mission_id?: string;
       source_task_id?: string;
     }>;
+    /** Pre-rendered advisory planning-context block (bounded). */
+    planningContextBlock?: string;
   },
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -1131,6 +1168,7 @@ export function buildPlannerUserPrompt(
           : "") +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
+    (cfg.planningContextBlock ? `\n${cfg.planningContextBlock}` : "") +
     `\nMISSION GOAL:\n${goal}`
   );
 }

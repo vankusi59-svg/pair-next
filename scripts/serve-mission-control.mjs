@@ -133,6 +133,9 @@ import {
   digest,
   utcnow,
   resolveMcAdminToken,
+  PlanningContextService,
+  BrainContextService,
+  renderPlanningContextBlock,
   operationalStatusMaxChars,
   OperationalQueryService,
   ConversationReadGrantService,
@@ -442,9 +445,40 @@ const executorCapSets = plannerExecutorCapSets(service, adapters);
 // explicitly reports FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE, and
 // recovery falls through to a fresh bounded RecoveryController decision
 // instead of replaying the stored plan as a fake candidate.
+// Semantic Planning V1 — the advisory PlanningContextEnvelope seam.
+// Assembled ONLY through existing gated reads (BrainContextService is
+// owner-gated + bounded + volatile-stripped; the scoped readers carry
+// tenancy admission). Advisory evidence-class: the digest is persisted
+// as run/generation provenance, never bound into plan authority.
+// LAZY: business/workforce/autoDriver compose later in boot — the seam
+// resolves them on first call (request/generation time), never at
+// construction.
+let planningContext = null;
+const resolvePlanningContext = () => {
+  planningContext ??= new PlanningContextService({
+    store,
+    objectiveContext: new BrainContextService({
+      store,
+      business,
+      workforce,
+      objectives: business.objectives,
+      workstreams: new ObjectiveWorkstreamService({
+        store, business, workforce, objectives: business.objectives,
+      }),
+      autoPolicy: objectiveAutoPolicy,
+      autoDriver: objectiveAutoDriver?.driver ?? undefined,
+      artifacts: service.artifactResolver,
+      experience,
+      scopedMemory: scopedMemoryReader,
+    }),
+  });
+  return planningContext;
+};
 const replanGenerationEnabled = process.env.PAIR_ASYNC_REPLAN_PROVIDER === "1";
 const replanGeneration = replanGenerationEnabled
-  ? new ReplanGenerationService(store, { deadlineMs: cfgReplanGenerationDeadlineMs })
+  ? new ReplanGenerationService(store, { deadlineMs: cfgReplanGenerationDeadlineMs }, {
+      envelopeFor: (req) => resolvePlanningContext().envelopeFor(req),
+    })
   : null;
 console.log(`ASYNC_REPLAN_PROVIDER: ${replanGeneration ? `ENABLED (deadline=${cfgReplanGenerationDeadlineMs}ms)` : "disabled"}`);
 const { planner, canonicalizeLlmTasks } = makeServePlanner({
@@ -1050,8 +1084,15 @@ const invokePlannerPool = ({
   replanContext,
   externalInputArtifacts,
   priorRejectionContext,
-}) =>
-  runPlannerFailover({
+  planningContextBlock,
+}) => {
+  // Semantic Planning V1 (G′) — per-attempt coverage evidence slot.
+  // onAttemptStart resets it (a stale report from a prior attempt can
+  // never attach to one that failed before canonicalize); the
+  // canonicalize sink fills it; settle persists it. Attempts run
+  // sequentially inside one failover — no interleaving.
+  let attemptCoverage = null;
+  return runPlannerFailover({
     candidates,
     ...(priorRejectionContext ? { priorRejectionContext } : {}),
     // §9 — full canonical eligibility re-proved before EVERY invocation
@@ -1105,6 +1146,9 @@ const invokePlannerPool = ({
         raw_delivery_emission_state:
           evidence?.raw_delivery_emission_state,
         external_input_artifacts: externalInputArtifacts,
+        // Semantic Planning V1 (G′) — capture the deterministic coverage
+        // report the canonical seam PROVED so attempt settle persists it.
+        coverageSink: (r) => { attemptCoverage = r; },
       });
       validatePlanProposal({ tasks: canon }, knownCapabilityIds());
       return canon;
@@ -1139,6 +1183,11 @@ const invokePlannerPool = ({
         replanContext: replanContext ?? undefined,
         rejectionContext: invocation?.rejectionContext,
         providerCounter: invocation?.providerCounter,
+        // Semantic Planning V1 — the advisory context block assembled at
+        // this seam (fresh path) or pinned on the durable
+        // replan_generation row (replan path). Advisory only — never
+        // authority.
+        planningContextBlock: planningContextBlock ?? undefined,
       });
     },
     // P-REASK R3 — hard per-candidate latency ceiling, measured from
@@ -1149,26 +1198,38 @@ const invokePlannerPool = ({
       ceilingMs: cfgCodexPlannerTimeoutMs,
       requestTimeoutMs: cfgCodexPlannerTimeoutMs,
     }),
-    onAttemptStart: (base) =>
-      persistPlannerAttemptStart(store, {
+    onAttemptStart: (base) => {
+      // G′ — this attempt owns the coverage slot from now on: a report
+      // set by a PRIOR attempt's canonicalize can never leak forward.
+      attemptCoverage = null;
+      return persistPlannerAttemptStart(store, {
         planner_run_id: plannerRunId,
         project_id: projectId,
         record: base,
         actor: "PAIR_PLANNER",
-      }).planner_attempt_id,
+      }).planner_attempt_id;
+    },
     // P-REASK R4 — durable re-ask initiation on the SAME attempt row
     // before the second model invocation (never a second row).
-    onAttemptReask: (paid, code) =>
-      markPlannerAttemptReask(store, {
+    onAttemptReask: (paid, code) => {
+      // K′ audit — a fresh emission owns the coverage slot: if this
+      // re-ask dies before canonicalize, the settled row must not carry
+      // the PRIOR emission's report as if it described the final one.
+      attemptCoverage = null;
+      return markPlannerAttemptReask(store, {
         planner_attempt_id: String(paid),
         validation_code: String(code),
         actor: "PAIR_PLANNER",
-      }),
+      });
+    },
     onAttemptEnd: (paid, rec) =>
       settlePlannerAttempt(store, {
         planner_attempt_id: String(paid),
         record: rec,
         winner: rec.outcome === "SUCCESS",
+        // G′ — the coverage report THIS attempt's canonical plan proved
+        // (null when it never reached/passed canonicalize).
+        coverage_report: attemptCoverage,
         actor: "PAIR_PLANNER",
       }),
     onExhausted: () =>
@@ -1180,6 +1241,7 @@ const invokePlannerPool = ({
     // Phase C — one absolute deadline across the whole failover chain.
     deadlineMs: deadlineAt,
   });
+};
 const planExpander = async (input, expandCtx) => {
   // Phase C — the ONE planner for every new-Mission ingress. The
   // PAIR_MC_TEMPLATE_PLANNER bypass is gone: there is no environment
@@ -1196,6 +1258,27 @@ const planExpander = async (input, expandCtx) => {
   // prompt. Direct submissions carry no operator_goal → goal itself is
   // the operator request.
   const authorityGoal = operatorGoalOf(input);
+  // Semantic Planning V1 — assemble the advisory planning context at
+  // this async seam (the ONLY place fresh planning touches a model).
+  // Assembly is sync-safe canonical reads through the owner-gated brain
+  // seam; a degraded/absent scope still yields an honest envelope.
+  // Advisory-only failure handling: an assembly throw never blocks a
+  // plan — the run proceeds context-free exactly like the pre-upgrade
+  // path, and the run evidence records null.
+  let planningEnvelope = null;
+  try {
+    planningEnvelope = resolvePlanningContext().envelopeFor({
+      work_item_id: expandCtx?.work_item_id != null ? String(expandCtx.work_item_id) : null,
+      project_id: input.project_id != null ? String(input.project_id) : null,
+      authorityGoal,
+      actor: "PAIR_PLANNER",
+    });
+  } catch {
+    planningEnvelope = null;
+  }
+  const planningContextBlock = planningEnvelope
+    ? renderPlanningContextBlock(planningEnvelope)
+    : "";
   // The planner_run row opens before any candidate check so even a
   // zero-eligible request leaves durable canonical evidence (run FAILED
   // / FAIL_CLOSED_PLANNER_NO_ELIGIBLE), never a silent template fallback.
@@ -1204,6 +1287,8 @@ const planExpander = async (input, expandCtx) => {
     operator_id: input.operator_id,
     routes: candidates.map((c) => c.ref),
     actor: "PAIR_PLANNER",
+    planning_context_digest: planningEnvelope?.context_digest ?? null,
+    planning_context_block: planningContextBlock || null,
   });
   // Phase C — the ONE run-level deadline: absolute epoch, spanning every
   // candidate's eligibility, INITIAL call, transport retries and REASK.
@@ -1271,6 +1356,7 @@ const planExpander = async (input, expandCtx) => {
       deadlineAt,
       externalInputArtifacts,
       priorRejectionContext: expandCtx?.prior_rejection ?? undefined,
+      planningContextBlock,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
@@ -1376,11 +1462,25 @@ const runReplanPoolGeneration = async (gen) => {
       `work_item ${replanWi}: ${adaptive.rejected_run_count} validation-rejected planner runs — repair budget exhausted`,
     );
   }
+  // Semantic Planning V1 — the replan path renders the context block
+  // PINNED on the durable generation row at request time (never a live
+  // re-fetch — the durable record's claim must equal what the planner
+  // saw). Absent/null → context-free generation, identical prior path.
+  const replanContextBlock =
+    typeof gen.planning_context?.block === "string"
+      ? gen.planning_context.block
+      : "";
+  const replanContextDigest =
+    typeof gen.planning_context?.context_digest === "string"
+      ? gen.planning_context.context_digest
+      : null;
   const run = beginPlannerRun(store, {
     project_id: mission.project_id != null ? String(mission.project_id) : undefined,
     operator_id: mission.operator_id,
     routes: candidates.map((c) => c.ref),
     actor: "PAIR_REPLAN_GENERATION",
+    planning_context_digest: replanContextDigest,
+    planning_context_block: replanContextBlock || null,
   });
   // The generation row's durable deadline bounds this run; the env
   // planner-run deadline may tighten, never widen it.
@@ -1425,6 +1525,7 @@ const runReplanPoolGeneration = async (gen) => {
       replanContext: gen.replan_context,
       externalInputArtifacts: externalInputs,
       priorRejectionContext: adaptive?.context ?? undefined,
+      planningContextBlock: replanContextBlock,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),

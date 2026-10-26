@@ -274,6 +274,17 @@ function splitSegGuarded(seg: string): string[] {
     ) {
       continue;
     }
+    /* Semantic Planning V1 (C′) — a comma inside a grouped-thousands
+       number ("1,000 subscribers") is numeric punctuation, never a
+       clause separator. Bounded guard: digit before + exactly-3-digit
+       group after. */
+    if (
+      m[0].includes(",") &&
+      /\d$/.test(seg.slice(0, m.index)) &&
+      /^\d{3}\b/.test(seg.slice(m.index + m[0].length))
+    ) {
+      continue;
+    }
     out.push(seg.slice(last, m.index));
     last = m.index + m[0].length;
   }
@@ -345,7 +356,20 @@ const ACTION_TAIL_RE = new RegExp(`(?:${ALL_ACTION_FORMS})$`, "iu");
  *  lookarounds — JS `\b` is ASCII-only and can never see `đừng`/`ế`-
  *  edged words. */
 const PROHIBITION_RE = new RegExp(
-  `(?<![\\p{L}\\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))(?![\\p{L}\\p{N}])`,
+  `(?<![\\p{L}\\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))` +
+    /* Semantic Planning V1 (C′) — "without X" bans X inside the goal:
+       bounded to a following bounded noun-phrase so an innocuous
+       "a world without borders" idiom is read the same way — as an
+       exclusion the operator stated. VI equivalents keep structural
+       action evidence (`không` needs a forbidden action after it). */
+    `|(?<![\\p{L}\\p{N}])without(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])` +
+    /* K″ review F1 — `không cần` means "no need to" (relief), not
+       "must not": gating it on a following ACTION FORM keeps `không
+       cần dùng martingale` a ban while `không cần thiết` (unnecessary)
+       and `không cần kiểm tra lại` stop minting term-bans on the
+       goal's own content words. `mà không`/`và không` keep the
+       any-word tail (pre-existing semantics). */
+    `|(?<![\\p{L}\\p{N}])(?:mà không|và không|không cần(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])`,
   "iu",
 );
 
@@ -379,11 +403,19 @@ function prohibitionHead(clause: string): string {
   return clause;
 }
 
+/* K″ audit — every boundary here is a unicode lookaround, never `\b`:
+ *  `giờ` ends on the non-ASCII vowel `ờ` where ASCII `\b` can never
+ *  fire, so "trước 10 giờ" / "trong vòng 30 giờ" minted no deadline
+ *  row AND leaked `10`/`30` into the bare-quantity scan. */
 const DEADLINE_RE =
-  /\bdeadline\b|\bdue\b|\bhạn\b|\btrước ngày\b|\btrước\b.{0,12}\b(?:giờ|ngày)\b|\bby\s+\d{1,2}[/-]\d{1,2}/iu;
+  /(?<![\p{L}\p{N}])deadline(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])due(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])hạn(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước ngày(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước(?![\p{L}\p{N}]).{0,12}(?<![\p{L}\p{N}])(?:giờ|ngày)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])by\s+\d{1,2}[/-]\d{1,2}|(?<![\p{L}\p{N}])within\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|hours?|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|hours?)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+vòng\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+khoảng\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])/iu;
 
+/* K″ audit — `không quá` (ends `á`), bare `chỉ` (`ỉ`) and `ngoại trừ`
+ *  (`ừ`) were dead under ASCII `\b`: "không quá 50 USD" minted no
+ *  constraint and fell through to the preserved-obligation backstop —
+ *  a ceiling inverting into a floor. Unicode lookarounds throughout. */
 const CONSTRAINT_RE =
-  /\bbudget\b|\bngân sách\b|\btối đa\b|\bkhông quá\b|\bonly\b|\bchỉ\b|\bchỉ được\b|\bngoại trừ\b|\bexcept\b|\bin (?:english|vietnamese|spanish|french|japanese)\b|\bbằng tiếng\b|\b(?:max|maximum|up to|at most)\s+\d|\b(?:<=|≤)\s*\$?\s*\d/i;
+  /(?<![\p{L}\p{N}])budget(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngân sách(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])tối đa(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])không quá(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])only(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ được(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngoại trừ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])except(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in (?:english|vietnamese|spanish|french|japanese)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])bằng tiếng(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:max|maximum|up to|at most)\s+\d|(?<![\p{L}\p{N}])(?:<=|≤)\s*\$?\s*\d/iu;
 
 const BUDGET_RE =
   /\bbudget\b[^\d]{0,20}(\d+(?:\.\d+)?)|\bngân sách\b[^\d]{0,20}(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)\s*(?:budget|max|tối đa)/i;
@@ -570,22 +602,56 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
   return false;
 }
 
-/** Work verbs that make a clause an obligation. Delivery verbs (send /
- *  gửi / deliver) are deliberately absent — delivery is governed by the
- *  existing telegram intent authority, never by an obligation row. */
+/** Work verbs that make a clause an obligation. The `deliver` form is
+ *  present so a non-telegram "deliver X" clause still mints work —
+ *  telegram-delivery clauses are consumed by the intent check above the
+ *  obligation scan and never reach it. Boundaries are unicode
+ *  lookarounds — JS `\b` is ASCII-only and can never see `đ`/`í`-edged
+ *  words (K′ audit: `đạt`/`ít nhất`-led lexemes were dead code). */
 const LEADING_FILLER_RE =
   /^(?:please|hãy|xin|first(?:ly)?|also|then|next|finally|lastly|đầu tiên|tiếp(?: theo)?|sau đó|rồi|bây giờ|sau khi|ok(?:ay)?|and|và|\d{1,2}[.)]|[•\-–—*])\s*/iu;
 
+/* Semantic Planning V1 (C′) — outcome/growth verbs: a goal like "Grow
+ * the channel by 1,000 subscribers" or "đạt 1.000 người đăng ký" is a
+ * genuine operator obligation even though no classical work verb leads
+ * it. The class is deliberately bound to OUTCOME verbs only — platform
+ * nouns and metric nouns stay object-identity, never obligations
+ * themselves. */
 const OBLIGATION_VERB_RE =
-  /\b(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn)/iu;
+  /(?<![\p{L}\p{N}])(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver(?:ing|ed)?|convert|recruit|onboard|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển)/iu;
 
 const QUANTITY_MIN_RE =
-  /\b(?:at least|minimum of|min(?:imum)?|no fewer than|ít nhất|tối thiểu|>=|≥)\s*(\d+)/iu;
+  /(?<![\p{L}\p{N}])(?:at least|minimum of|min(?:imum)?|no fewer than|ít nhất|tối thiểu|>=|≥)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
 const QUANTITY_MAX_RE =
-  /\b(?:at most|up to|maximum of|no more than|tối đa|không quá|<=|≤)\s*(\d+)/iu;
+  /(?<![\p{L}\p{N}])(?:at most|up to|maximum of|no more than|tối đa|không quá|<=|≤)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
 const QUANTITY_EXACT_RE =
-  /\b(?:exactly|đúng|chính xác)\s+(\d+)/iu;
-const BARE_NUM_RE = /\b(\d{1,6})\b/;
+  /(?<![\p{L}\p{N}])(?:exactly|đúng|chính xác)\s+(\d{1,3}(?:[.,]\d{3})+|\d+)/iu;
+/** K′ audit — scheduling phrasing carries numbers that are NEVER
+ *  quantity evidence: "within 30 days", "in 2 weeks", "trong vòng 30
+ *  ngày", a bare year "…in 2026". Masked before the bare-quantity scan
+ *  in both contract extraction and task-side floor comparison so a
+ *  deadline can neither mint a phantom floor nor satisfy a real one. */
+/* K″ audit — trailing edges are `(?![\p{L}\p{N}])`, never `\b`: `giờ`
+ *  ends on `ờ` where ASCII `\b` cannot fire, so `30 giờ` leaked into
+ *  the quantity scan on both the contract side (phantom floor) and
+ *  the task side (a duration satisfying an unrelated floor). */
+/* Date ordinals — `ngày 15`, `tháng 5`, `ngày 15/10` (dd/mm tail),
+ * `thứ 6`, `tuần 15`, `quý 3`, `week 15`, `năm 2026`, `day 365` are
+ * schedule positions, never quantity floors. Per-unit digit bounds so
+ * `tháng 500 đơn` keeps its real 500. */
+export const TEMPORAL_NUM_RE =
+  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong|trước)\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]\s*\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:ngày|day)\s+\d{1,3}(?:\s*[/–-]\s*\d{1,2}(?:\s*[/–-]\s*\d{2,4})?)?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:tháng|month)\s+\d{1,2}(?:\s*[/–-]\s*\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:thứ|tuần|quý|week)\s+\d{1,2}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])năm\s+\d{1,4}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d{1,2}[/–-]\d{1,2}(?:[/–-]\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:19|20)\d{2}(?![\p{L}\p{N}])/giu;
+/* Semantic Planning V1 (C′) — grouped-thousand forms: `1,000` (EN) is
+ *  unambiguous thousands grouping; VI `1.000` is accepted only with a
+ *  VI-unit lookahead so a version/decimals token ("1.000.2") never
+ *  mints a quantity. */
+const BARE_NUM_RE = /\b(\d{1,3}(?:,\d{3})+|\d{1,6})\b/;
+const BARE_NUM_VI_DOT_RE =
+  /\b(\d{1,3}(?:\.\d{3})+)(?=\s*(?:người|ngày|tháng|tuần|giờ|đăng ký|đơn|lượt|tài khoản|thành viên|khách|đơn hàng|bài|file|video|sản phẩm|usd|vnd|đồng))\b/iu;
+
+function parseNum(raw: string): number {
+  return Number(raw.replace(/[,.]/g, ""));
+}
 
 /** Tokens that may appear inside a prohibition clause but are not the
  *  prohibited thing itself (verbs, articles, negation words). */
@@ -601,7 +667,9 @@ const PROHIBITION_STOPWORDS = new Set([
   // prohibited object
   "if", "when", "unless", "nếu", "khi", "miễn", "trường", "hợp", "thì",
   "nào", "bao", "giờ", "case", "provided", "long", "as", "and", "or",
+  "without",
   "nor", "else", "than", "hoặc", "cùng", "với", "của", "cho", "là",
+  "trong",
   "các", "những", "một", "mỗi", "vào", "ra", "lên", "xuống", "lại",
   "hết", "còn", "sau", "trước", "giữa", "dưới", "ở", "tại", "về",
   "theo", "như",
@@ -617,17 +685,28 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
   const exactM = QUANTITY_EXACT_RE.exec(clause);
   const q: { min?: number; max?: number } = {};
   if (exactM) {
-    const n = Number(exactM[1]);
+    const n = parseNum(exactM[1]);
     q.min = n;
     q.max = n;
   } else {
-    if (minM) q.min = Number(minM[1]);
-    if (maxM) q.max = Number(maxM[1]);
+    if (minM) q.min = parseNum(minM[1]);
+    if (maxM) q.max = parseNum(maxM[1]);
     if (q.min === undefined && q.max === undefined) {
       // A bare quantity in a work clause is the operator's stated floor —
-      // "propose 3 strategies" means at least 3, never "some".
-      const bare = BARE_NUM_RE.exec(clause);
-      if (bare) q.min = Number(bare[1]);
+      // "propose 3 strategies" means at least 3, never "some". Grouped
+      // thousands ("1,000" / VI "1.000 người") resolve to the same floor;
+      // the VI dot form must win before bare digits can mint a wrong
+      // "1" out of "1.000". Numbers inside deadline/duration/year
+      // phrasing are scheduling context — masked so "within 30 days"
+      // never mints a floor of 30 (K′ audit).
+      const scan = clause.replace(TEMPORAL_NUM_RE, " ");
+      const viDot = BARE_NUM_VI_DOT_RE.exec(scan);
+      const bare = BARE_NUM_RE.exec(scan);
+      if (viDot && (!bare || viDot.index <= bare.index)) {
+        q.min = parseNum(viDot[1]);
+      } else if (bare) {
+        q.min = parseNum(bare[1]);
+      }
     }
   }
   return q.min !== undefined || q.max !== undefined ? q : undefined;
@@ -642,11 +721,24 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
  *  alternation match ("use only" capturing "use") can never win. */
 const ONLY_AFTER_RE = /\bonly\s+([\p{L}\p{N}_-]+)/iu;
 const ONLY_BEFORE_RE = /([\p{L}\p{N}_-]+(?:\s+[\p{L}\p{N}_-]+){0,2})\s+only\b/iu;
-const ONLY_VI_RE = /\bchỉ\s+(?:dùng\s+|dụng\s+)?([\p{L}\p{N}_-]+)/iu;
+/* K″ follow-up — `chỉ` is now live again (CONSTRAINT_RE edge fixed), so
+ *  this extractor must not bind VI auxiliaries/modals as the permitted
+ *  value: "chỉ được dùng CSV" must bind `csv`, but "chỉ cần/muốn/là/số/
+ *  trong …" binds a function word no task can carry — an onlyTerm minted
+ *  on an auxiliary is unsatisfiable by construction (guaranteed fail-
+ *  closed). The skip-chain strips licensed auxiliaries; the stop-set
+ *  degrades everything else to a harmless PRESERVED constraint. */
+const ONLY_VI_RE =
+  /(?<![\p{L}\p{N}])chỉ\s+(?:(?:dùng|dụng|được)\s+)*([\p{L}\p{N}_-]+)/iu;
 const ONLY_TERM_STOP = new Set([
   "the", "a", "an", "this", "that", "these", "those", "one", "two",
   "for", "to", "in", "on", "at", "of", "with", "by", "as", "be",
   "use", "using", "dùng", "dụng", "if", "when", "than", "then",
+  // VI function words — `chỉ <modal|aux|function>` is hedging, never a
+  // bounded permitted value (K″ review: chỉ cần/muốn/được/là/số/trong).
+  "cần", "muốn", "được", "là", "để", "sẽ", "mới", "vẫn", "có",
+  "phải", "nên", "mong", "hỏi", "xem", "số", "thị", "đạo", "trong",
+  "với", "cho", "của", "thôi", "hãy", "xin",
 ]);
 
 function extractOnlyTerms(clause: string): string[] | undefined {
@@ -743,6 +835,21 @@ function prohibitionPayload(clause: string): {
   };
 }
 
+/** A connective left dangling at a clause tail is syntax, not subject —
+ *  "Research crypto but do not use leverage" splits at the prohibition
+ *  trigger leaving "Research crypto but"; the trailing `but` must be
+ *  trimmed before the requirement text is minted or the coverage
+ *  anchor scan promotes it to a required (unreachable) subject. */
+const TRAILING_CONNECTIVE_RE =
+  /[\s,;:–—-]+(?:but|however|nevertheless|nonetheless|yet|though|although|whereas|while|and|or|nor|nhưng|và|hoặc|mà|với|còn|then)\.?\s*$/iu;
+function trimTrailingConnective(clause: string): string {
+  let s = clause.trim();
+  for (let i = 0; i < 3 && TRAILING_CONNECTIVE_RE.test(s); i++) {
+    s = s.replace(TRAILING_CONNECTIVE_RE, "").trim();
+  }
+  return s;
+}
+
 /** Extract the Goal Contract — the deterministic, append-only projection
  *  of the text it is handed. Same input → same contract, always.
  *  AUTHORITY BOUNDARY: callers must pass `operatorGoalOf(source)` —
@@ -759,16 +866,17 @@ export function extractGoalContract(goal: string): GoalContract {
   for (const c of clauses) {
     const tm = PROHIBITION_RE.exec(c);
     if (tm && tm.index > 0 && /[\p{L}\p{N}]/u.test(c.slice(0, tm.index))) {
-      expanded.push(c.slice(0, tm.index).trim());
+      expanded.push(trimTrailingConnective(c.slice(0, tm.index)));
       expanded.push(c.slice(tm.index).trim());
     } else {
-      expanded.push(c);
+      expanded.push(trimTrailingConnective(c));
     }
   }
   const obligations: GoalRequirement[] = [];
   const deliverables: GoalRequirement[] = [];
   const constraints: GoalRequirement[] = [];
   const prohibitions: GoalRequirement[] = [];
+  const unclassified: string[] = [];
   let deadline: { id: string; text: string } | null = null;
 
   const push = (
@@ -857,7 +965,7 @@ export function extractGoalContract(goal: string): GoalContract {
       if (
         first &&
         OBLIGATION_VERB_RE.test(rest.slice(0, first[0].length + 8)) &&
-        /^(?:research|analy|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identif|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|nghiên|phân|đánh|xem|khảo|so|đối|đề|xác|lấy|tải|thu|tra|tìm|tạo|viết|soạn|lưu|xuất|xây|phát|thiết|triển|tính|ước|dự|vẽ|tóm|kiểm|theo|giám|dịch|liệt|xếp|chọn)/iu.test(rest)
+        /^(?:research|analy|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identif|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver|convert|recruit|onboard|nghiên|phân|đánh|xem|khảo|so|đối|đề|xác|lấy|tải|thu|tra|tìm|tạo|viết|soạn|lưu|xuất|xây|phát|thiết|triển|tính|ước|dự|vẽ|tóm|kiểm|theo|giám|dịch|liệt|xếp|chọn|tăng|gia|đạt|thu|mở|nâng|cải|thúc|chuyển|tuyển)/iu.test(rest)
       ) {
         push(obligations, "OBL", clause, {
           quantity: extractQuantity(clause),
@@ -867,6 +975,39 @@ export function extractGoalContract(goal: string): GoalContract {
     }
     // Unclassifiable clauses are objective-only — never invent a
     // requirement from them.
+    unclassified.push(clause);
+  }
+
+  /* K′ audit — a contract with NO coverable requirement must never be
+   *  the silent product of a requirement-shaped goal: "Đạt 1.000 người
+   *  đăng ký…" whose verb class went unrecognized used to mint an empty
+   *  contract that coverage then vacuously PASSED (fail-open on the
+   *  deterministic authority). When nothing at all classified, the
+   *  longest unclassified clause CARRYING REQUIREMENT EVIDENCE (a stated
+   *  quantity floor or deadline phrase) is preserved verbatim as an
+   *  obligation row — the operator's own words become the coverage
+   *  target. Markerless unparseable goals keep the baseline
+   *  conservative-incompleteness semantics (they mint nothing — no
+   *  requirement evidence existed to preserve). */
+  if (!obligations.length && !deliverables.length) {
+    const shaped = unclassified
+      .filter(
+        (c) =>
+          (c.match(/[\p{L}]{3,}/gu) ?? []).length >= 2 &&
+          (extractQuantity(c) !== undefined || DEADLINE_RE.test(c)),
+      )
+      .sort((a, b) => b.length - a.length)[0];
+    if (shaped) {
+      /* K″ review F4 — a constraint-shaped preserved clause ("budget
+       *  max $500…", "tối đa tháng 500 đơn") must never promote its
+       *  bare number to a floor: keep `max`, drop `min`, else the
+       *  ceiling inverts into a floor the plan must reach. */
+      const q = extractQuantity(shaped);
+      if (q && CONSTRAINT_RE.test(shaped)) delete q.min;
+      push(obligations, "OBL", shaped, {
+        quantity: q && (q.min !== undefined || q.max !== undefined) ? q : undefined,
+      });
+    }
   }
 
   const contractBase = {

@@ -113,7 +113,11 @@ describe("PRV2-B contract extraction", () => {
     expect(c.delivery_intent.requested).toBe(false);
   });
 
-  it("conservative incompleteness: unclassifiable clauses mint nothing", () => {
+  it("conservative incompleteness: markerless unclassifiable clauses still mint nothing", () => {
+    // K′ audit narrowed the hole: only clauses carrying requirement
+    // EVIDENCE (quantity/deadline) are preserved as OBL rows when the
+    // contract would otherwise be empty. A markerless declarative stays
+    // objective material — never a requirement.
     const c = extractGoalContract("the market is interesting");
     expect(c.obligations).toHaveLength(0);
     expect(c.deliverables).toHaveLength(0);

@@ -33,6 +33,7 @@ import { extractTaskDataflow } from "./plan-dataflow.js";
 import { externalSubjectKeys, subjectAnchors } from "./llm-planner.js";
 import {
   PROHIBITION_ACTION_CLASSES,
+  TEMPORAL_NUM_RE,
   type GoalContract,
   type GoalRequirement,
 } from "./goal-contract.js";
@@ -59,20 +60,29 @@ export interface PlanCoverageReport {
 /** Verb classes shared by obligation text and task instruction. A task
  *  must perform work of the same class as the obligation it covers. */
 const VERB_CLASSES: Array<{ cls: string; re: RegExp }> = [
-  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|search|find|browse|gather|collect|nghiên cứu|khảo sát|thu thập|tìm)/iu },
-  { cls: "analyze", re: /\b(?:analy[sz]e|analys|assess|evaluat|review|phân tích|đánh giá|xem xét)/iu },
-  { cls: "compare", re: /\b(?:compar|benchmark|contrast|so sánh|đối chiếu)/iu },
-  { cls: "propose", re: /\b(?:propos|recommend|suggest|deriv|identify|đề xuất|xác định)/iu },
-  { cls: "fetch", re: /\b(?:fetch|retriev|get|pull|download|scrape|extract|search|find|browse|gather|collect|lấy|tải|thu thập|tra cứu|tìm)/iu },
-  { cls: "create", re: /\b(?:creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai)/iu },
-  { cls: "compute", re: /\b(?:comput|calcul|measure|quantif|estimat|forecast|tính|ước tính|dự báo)/iu },
-  { cls: "plot", re: /\b(?:plot|draw|chart|graph|vẽ|biểu đồ)/iu },
-  { cls: "summarize", re: /\b(?:summar|digest|tóm tắt)/iu },
-  { cls: "test", re: /\b(?:test|verif|validat|check|kiểm tra|kiểm)/iu },
-  { cls: "monitor", re: /\b(?:monitor|track|watch|theo dõi|giám sát)/iu },
-  { cls: "translate", re: /\b(?:translat|dịch)/iu },
-  { cls: "deploy", re: /\b(?:deploy|publish|xuất bản)/iu },
-  { cls: "list", re: /\b(?:list|rank|score|select|choose|screen|liệt kê|xếp hạng|chọn)/iu },
+  { cls: "research", re: /(?<![\p{L}\p{N}])(?:research|study|studies|investigat|survey|search|find|browse|gather|collect|nghiên cứu|khảo sát|thu thập|tìm)/iu },
+  { cls: "analyze", re: /(?<![\p{L}\p{N}])(?:analy[sz]e|analys|assess|evaluat|review|phân tích|đánh giá|xem xét)/iu },
+  { cls: "compare", re: /(?<![\p{L}\p{N}])(?:compar|benchmark|contrast|so sánh|đối chiếu)/iu },
+  { cls: "propose", re: /(?<![\p{L}\p{N}])(?:propos|recommend|suggest|deriv|identify|đề xuất|xác định)/iu },
+  { cls: "fetch", re: /(?<![\p{L}\p{N}])(?:fetch|retriev|get|pull|download|scrape|extract|search|find|browse|gather|collect|lấy|tải|thu thập|tra cứu|tìm)/iu },
+  { cls: "create", re: /(?<![\p{L}\p{N}])(?:creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai)/iu },
+  { cls: "compute", re: /(?<![\p{L}\p{N}])(?:comput|calcul|measure|quantif|estimat|forecast|tính|ước tính|dự báo)/iu },
+  { cls: "plot", re: /(?<![\p{L}\p{N}])(?:plot|draw|chart|graph|vẽ|biểu đồ)/iu },
+  { cls: "summarize", re: /(?<![\p{L}\p{N}])(?:summar|digest|tóm tắt)/iu },
+  { cls: "test", re: /(?<![\p{L}\p{N}])(?:test|verif|validat|check|kiểm tra|kiểm)/iu },
+  { cls: "monitor", re: /(?<![\p{L}\p{N}])(?:monitor|track|watch|theo dõi|giám sát)/iu },
+  { cls: "translate", re: /(?<![\p{L}\p{N}])(?:translat|dịch)/iu },
+  { cls: "deploy", re: /(?<![\p{L}\p{N}])(?:deploy|publish|xuất bản)/iu },
+  { cls: "list", re: /(?<![\p{L}\p{N}])(?:list|rank|score|select|choose|screen|liệt kê|xếp hạng|chọn)/iu },
+  /* Semantic Planning V1 (D′) — outcome verbs: pursuing a measured
+   *  result ("grow subscribers", "đạt 1.000 người đăng ký", "attract
+   *  leads"). Distinct from preparation classes so a research-only task
+   *  can never claim to satisfy an outcome obligation. */
+  { cls: "outcome", re: /(?<![\p{L}\p{N}])(?:grow|growth|grows|grew|grown|growing|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|expand|scal|improv|rais|driv|convert|recruit|onboard|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển dụng|tuyển)/iu },
+  /* Fulfillment verbs — direct goal-pursuing work that is neither pure
+   *  preparation nor the outcome verb itself: executing, delivering,
+   *  operating the thing that produces the outcome. */
+  { cls: "fulfill", re: /(?<![\p{L}\p{N}])(?:execut|operat|deliver|run|launch|perform|conduct|carry out|roll out|triển khai|thực hiện|thực thi|vận hành|chạy|phát hành|phát sóng|đăng tải|đăng)/iu },
 ];
 
 function verbClasses(text: string): Set<string> {
@@ -185,13 +195,62 @@ function taskKeys(tasks: Array<Record<string, unknown>>): Map<string, Record<str
  *  task instruction: same verb class, the obligation's subject identity
  *  anchors are all bound, subject classes preserved when no anchors
  *  exist, and any stated quantity is preserved (never downgraded). */
+/** Preparation-only verb classes — a task whose work is ENTIRELY one of
+ *  these is groundwork, never goal fulfillment (Semantic Planning V1
+ *  D2): "research growth strategies" prepares for "grow subscribers"
+ *  but does not perform it. */
+const PREPARATION_ONLY = new Set([
+  "research", "analyze", "compare", "propose", "fetch", "summarize",
+  "list",
+]);
+
+function isPreparationOnly(taskVerbs: Set<string>): boolean {
+  if (!taskVerbs.size) return false;
+  for (const v of taskVerbs) if (!PREPARATION_ONLY.has(v)) return false;
+  return true;
+}
+
+/** Extract every quantity mention from task text — including
+ *  thousands-grouped forms ("1,000" EN / "1.000" VI) so a stated floor
+ *  of 1,000 is preserved against grouped task text and a bare "1" can
+ *  never satisfy it. */
+function quantityNums(text: string): number[] {
+  const out: number[] = [];
+  // K′ audit — scheduling numbers are not quantity evidence on the task
+  // side either: "launch the campaign in 2025" / "finish in 30 days"
+  // must not satisfy a real floor. Mask temporal phrasing first.
+  const scan = text.replace(TEMPORAL_NUM_RE, " ");
+  const re = /\b(\d{1,3}(?:[.,]\d{3})+|\d{1,9})\b/g;
+  re.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(scan)) !== null) {
+    const raw = m[1];
+    out.push(raw.includes(",") || raw.includes(".")
+      ? Number(raw.replace(/[.,]/g, ""))
+      : Number(raw));
+  }
+  return out;
+}
+
 function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
   const t = instr.trim();
   if (!t) return false;
   const reqVerbs = verbClasses(req.text);
   const taskVerbs = verbClasses(t);
-  // The task must perform at least one verb class the requirement asked.
+  // The task must perform at least one verb class the requirement
+  // asked. Exception (Semantic Planning V1): an OUTCOME obligation is
+  // covered by fulfillment — the task needn't restate the outcome verb
+  // ("execute the growth campaign" covers "grow subscribers") — but a
+  // preparation-only task never does.
   if (reqVerbs.size && ![...reqVerbs].some((v) => taskVerbs.has(v))) {
+    const outcomeReq = reqVerbs.has("outcome");
+    if (!outcomeReq) return false;
+    if (!taskVerbs.has("outcome") && !taskVerbs.has("fulfill")) return false;
+  }
+  // Semantic Planning V1 (D2) — outcome obligations demand fulfillment
+  // evidence: a task whose verbs are ALL preparation-class can never
+  // satisfy "grow / increase / achieve", however topical it is.
+  if (reqVerbs.has("outcome") && isPreparationOnly(taskVerbs)) {
     return false;
   }
   const reqAnchors = subjectAnchors(req.text);
@@ -223,9 +282,10 @@ function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
     }
   }
   // Quantity preservation: a stated floor must appear in the task at
-  // the same or a larger magnitude — "20" can never become "5".
+  // the same or a larger magnitude — "20" can never become "5", and
+  // "1,000" / VI "1.000" count at their true magnitude, never as "1".
   if (req.quantity?.min !== undefined) {
-    const nums = [...t.matchAll(/\b(\d{1,6})\b/g)].map((m) => Number(m[1]));
+    const nums = quantityNums(t);
     if (!nums.length || Math.max(...nums) < req.quantity.min) return false;
   }
   return true;
@@ -420,15 +480,19 @@ const ONLY_CHANNELS = new Set([
 function versionFamilyRe(term: string): RegExp | null {
   const m = /^([a-z][a-z0-9_-]{1,}?)(\d+)$/.exec(term);
   if (!m) return null;
-  return new RegExp(`\\b${m[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+\\b`, "i");
+  return new RegExp(
+    `(?<![\\p{L}\\p{N}])${m[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+(?![\\p{L}\\p{N}])`,
+    "iu",
+  );
 }
 
 /** Does the instruction carry evidence of engaging the constrained
- *  dimension at all (it names the permitted value)? */
+ *  dimension at all (it names the permitted value)? Unicode-boundary
+ *  lookarounds — a `đ`-edged VI term must match like an ASCII one. */
 function onlyConstraintEvidence(instr: string, term: string): boolean {
   return new RegExp(
-    `\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
-    "i",
+    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
+    "iu",
   ).test(instr);
 }
 

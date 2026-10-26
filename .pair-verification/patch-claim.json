@@ -1,21 +1,32 @@
 {
-  "claim_id": "P18_4_RECOVERY_OPS",
-  "title": "P18.4 Recovery Integrity & Mission Control Operations — atomic deferred→pending handoff, atomic canonical settlement, crash-orphan re-eligibility, liveness/recovery operations projections + UI, real multi-executor E2E",
+  "claim_id": "SEMANTIC_CONTEXT_PLANNING_V1_FULL",
+  "title": "Semantic & Context-Aware Planning V1 (full PR scope incl. K′/K″ remediation) — PlanningContextEnvelope advisory at async seams, deterministic EN/VI extraction + coverage, Unicode-boundary remediation, persisted coverage evidence, replan pinning",
   "affected_surfaces": [
+    "PLANNER",
+    "MISSION_DRAFT",
     "RECOVERY_REPLAY",
+    "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "REMOTE_EXECUTION",
-    "GATE_ROUTER",
     "UI",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p18-4-recovery-atomicity.test.ts",
-    "src/__tests__/pair-p18-4-observability.test.ts",
-    "src/__tests__/pair-p18-4-real-e2e.test.ts",
-    "src/__tests__/pair-p18-3-supervisor-liveness.test.ts",
-    "src/__tests__/pair-p18-3-real-executor-e2e.test.ts",
-    "src/__tests__/pair-runtime-hardening.test.ts"
+    "src/__tests__/pair-semantic-planning-context.test.ts",
+    "src/__tests__/pair-semantic-coverage.test.ts",
+    "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
+    "src/__tests__/pair-goal-contract-produce-binding.test.ts",
+    "src/__tests__/pair-goal-context-authority.test.ts",
+    "src/__tests__/pair-planner-prompt-contract.test.ts",
+    "src/__tests__/pair-planner-contract-simplify.test.ts",
+    "src/__tests__/pair-cpl1-codex-planner.test.ts",
+    "src/__tests__/pair-p18-2-planner-adaptive-retry.test.ts",
+    "src/__tests__/pair-async-replan-generation.test.ts",
+    "src/__tests__/pair-p16-a-brain-context.test.ts",
+    "src/__tests__/pair-p16-b-reasoning-brief.test.ts",
+    "src/__tests__/pair-f3-plan-feasibility.test.ts",
+    "src/__tests__/pair-llm-planner.test.ts",
+    "src/__tests__/pair-output-delivery-contract.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
@@ -23,6 +34,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "P18.4-A (docs/p18-4/P18_4_RECOVERY_ATOMICITY_AUDIT.md): the deferred-recovery drain popped the queue entry and persisted the shortened queue BEFORE the successor pending_recovery was durable — a crash inside that window lost the recovery signal; canonical settlement committed result, task status, recovery arm and settle marker as independent writes so a mid-chain crash orphaned a committed result or a FAILED task with no signal. Fix: drainDeferredRecovery's pop + the entire startRecovery arm chain now commit inside ONE store.immediate() transaction (rt re-read inside for CAS correctness); canonical settlement/disposition co-commits where the store allows while adapter I/O stays outside the write lock; committed-result rows without settle_complete re-enter the bounded sweep (crash-orphan re-eligibility); fault accounting (drain_attempts/settle_faults) is explicitly bounded with durable DEFERRED_RECOVERY_DROPPED evidence. PairEvidenceStore gained a test-only faultInjector seam (never set in production). P18.4-B: MissionObservability gains executionHealth/recoveryOps/operationsOverview — provenance-classified projections (persisted/observed/derived/unknown; no synthesized timestamps); routes GET /api/missions/:id/operations + GET /api/operations; MissionControl UI adds Execution health + Recovery operations sections on Mission Detail and an Operations rollup tab in System Observability — read-only, fail-closed validation, existing governed actions only. P18.4-C: real multi-executor E2E (E2E-1..9) — real child processes via production CodexCliExecutorAdapter + a second subclassed real executor proving routing; supervisor restart over durable store; injected mid-tick power loss at the handoff; born-failing retry boundedness; UNKNOWN outcome (missing result.json) never mints success or replays side effects; MC API auth/operator gates verified against the real server.",
+  "description": "Full PR #154 scope (46b05bf..HEAD) per docs/plans/2026-10-26-semantic-context-planning-v1.md + K′/K″ audit remediations. Core V1: PlanningContextEnvelope — advisory provenance-bound context snapshot (volatile-stripped digest) assembled only at the two async planner seams (planExpander + runReplanPoolGeneration), persisted as evidence, never bound into effective_input_digest/plan_digest, never a gate; deterministic EN/VI extraction + coverage extension (outcome verbs, grouped quantities, relative deadlines, prohibitions); PlanCoverageReport persisted on attempt/preview evidence + read-only UI; zero new provider invocations. K′ remediation: Unicode verb-boundary dead code (đ/í-edged lexemes → vacuous coverage), grouped-marker quantity collapse, temporal-number floors both directions, VI anchor stop-set, render-bound enforcement, trailing-connective trim, prohibition-term leak, reask staleness, UI guard. K″ remediation: ASCII \\b dead adjacent to non-ASCII-edged VI lexemes across DEADLINE_RE/TEMPORAL_NUM_RE ('trước 10 giờ'/'trong vòng 30 giờ' deadlines + duration masking both sides), CONSTRAINT_RE ('không quá'/'chỉ'/'ngoại trừ'/'<='/'≤' → ceilings can never invert into floors), LOCAL_SOURCE_RE ('cục bộ'/'dữ liệu'), output-language markers ('kết quả'/'đọc'), connective counter ('và'/'sau đó'); review follow-ups: không cần action-gate (relief-vs-ban), DD/MM + duration-range + ordinal masks, constraint-shaped backstop never promotes min, render ≤4096 bound; ONLY_VI_RE auxiliary skip-chain + VI function-word stop-set ('chỉ cần/muốn/được' no longer mints unsatisfiable onlyTerms), ordinal masks (thứ/tuần/quý/week/năm + dd/mm tails, per-unit digit bounds). Adversarial probes H1–H42 + SC-1..19 + PC-1..11. Deterministic authority/fail-closed semantics preserved; no auto-merge.",
   "risk_override": "HIGH"
 }

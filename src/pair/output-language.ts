@@ -107,11 +107,11 @@ const LANGUAGE_DIRECTIVES: Array<[RegExp, string]> = [
 const DIRECTIVE_LOOKBACK = 160;
 const OUTPUT_MARKERS: RegExp[] = [
   /\b(?:write|writes|writing|compose|composing|summari[sz]e[sd]?|summarizing|respond|response|produce|produces|producing|answers?|translat(?:e|es|ing|ion)|convert(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|deliver(?:able|ables|y|ing)?|outputs?|final|report|reports)\b/giu,
-  /\b(?:viết|viet|soạn|soan|tóm\s+tắt|tom\s+tat|trả\s+lời|tra\s+loi|tạo|tao|gửi|gui|báo\s+cáo|bao\s+cao|kết\s+quả|ket\s+qua|xuất|xuat)\b/iu,
+  /(?<![\p{L}\p{N}])(?:viết|viet|soạn|soan|tóm\s+tắt|tom\s+tat|trả\s+lời|tra\s+loi|tạo|tao|gửi|gui|báo\s+cáo|bao\s+cao|kết\s+quả|ket\s+qua|xuất|xuat)(?![\p{L}\p{N}])/iu,
 ];
 const SOURCE_MARKERS: RegExp[] = [
   /\b(?:read|reads|reading|sources?|inputs?|materials?|documents?|references?|from|based\s+on)\b/giu,
-  /\b(?:đọc|doc|nguồn|nguon|tài\s+liệu|tai\s+lieu|tham\s+khảo|tham\s+khao)\b/iu,
+  /(?<![\p{L}\p{N}])(?:đọc|doc|nguồn|nguon|tài\s+liệu|tai\s+lieu|tham\s+khảo|tham\s+khao)(?![\p{L}\p{N}])/iu,
 ];
 
 const lastMarkerIndex = (text: string, markers: RegExp[]): number => {
