@@ -1,6 +1,6 @@
 {
-  "claim_id": "P18_5_GOVERNANCE_TEST_HARDENING",
-  "title": "P18.5 — F10 deterministic numeric-ceiling enforcement (money/task-count/object-count) + test temp-dir lifecycle remediation (mkTmpDir factory, registry cleanup, stale sweep)",
+  "claim_id": "P18_6_SEMANTIC_FIRST_GOAL_UNDERSTANDING",
+  "title": "P18.6 — Semantic-First Goal Understanding: versioned GoalIntentAnalysis (bounded 1-call interpretation, provenance classes), governed reconciliation + ambiguity/owner-approval policy, OFF/SHADOW/GUARDED modes, planner+replan integration, evidence persistence",
   "affected_surfaces": [
     "PLANNER",
     "MISSION_DRAFT",
@@ -8,6 +8,7 @@
   ],
   "required_tests": [
     "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-semantic-goal-understanding.test.ts",
     "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-goal-contract-produce-binding.test.ts",
     "src/__tests__/pair-goal-context-authority.test.ts",
@@ -23,6 +24,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "P18.5 on base 2174e91 (post-#154 main). F10: dimension-aware numeric ceilings on constraint requirements - ceiling{amount,kind:money|task-count|object-count,unit} extracted from EN/VI ceiling markers (at most/no more than/up to/max/toi da/khong qua/khong vuot qua/nhieu nhat/khong hon/<=/<=) with grouped numbers; money ceilings feed legacy maxAmount, enforced via currency-tagged instructionAmounts - over bound VIOLATES (fail-closed), at/under PROVEN, no evidence PRESERVED (never fabricated); task-count ceilings enforce plan task count; object-count ceilings bind numbers to the same unit noun; duration/frequency/percent never mint ceilings; quantity.max enforced by contradiction via bound numbers; ceilings never invert into floors. Runtime note: plan-time inspection proves declared plan evidence only; unverifiable limits stay PRESERVED. Test infra: src/test-utils/tmpdir.ts factory (mkTmpDir registry + idempotent cleanupTmpDirs + exit hook + marker-gated sweepStaleTestDirs - VALID .pair-tmp-owner with ESRCH-confirmed dead pid mandatory; missing/malformed markers and live/EPERM-uncertain pids SKIP; prefix+age never proof; opt-in tmp-recover.mts for unmarked residue (dry-run + explicit --paths + --confirm + realpath containment); top-level links rejected pre-inspection via lstat+realpath; removal aborts on ununlinkable links (no unsafe rmSync); dirSize lstat-safe; mkTmpDir rejects escaping prefixes; oversized markers invalid), vitest setupFiles/globalSetup wiring, codemod of literal-prefix mkdtempSync callsites; measured residuals. No planner/canonicalizer/executor refactor; deterministic authority + fail-closed preserved; zero new provider invocations; no auto-merge",
+  "description": "P18.6 on base cabd25d (post-#155 main). Semantic-First Goal Understanding: new src/pair/semantic-goal-understanding.ts produces a versioned GoalIntentAnalysis via ONE bounded provider request per planning invocation (cached on goal x context x schema x model digest; malformed/unavailable => typed unavailable, never fabricated). Items carry id/source-span/category/provenance/confidence/authority-class (EXPLICIT_OPERATOR|VERIFIED_CONTEXT|MODEL_INFERRED|PROPOSED_AMENDMENT|OWNER_APPROVED|UNRESOLVED) - interpretation is ADVISORY only: extractGoalContract/assertPlanCoverage + P18.5 F10 ceilings + operatorGoalOf remain sole authority; advisory metadata never mints requirements, capabilities, budgets or permissions and never satisfies coverage. Deterministic reconcileIntent classifies contradictions; ambiguity policy HARMLESS|MATERIAL|AUTHORITY_CRITICAL fails closed only where warranted; owner-approved amendments mint a new canonical goal revision via authenticated approval bound to proposal+revision digests (append-only, stale previews invalidated). PAIR_SEMANTIC_MODE=off|shadow|guarded (default off; shadow persists+compares without changing validity; guarded informs planning and blocks materially-ambiguous confirms). Both planner transports get the bounded advisory block via buildPlannerUserPrompt; replan_generation pins the interpretation snapshot like planning_context. Scope-tenanted cache/evidence; no cross-tenant reuse; no secrets persisted. Semantic benchmark + adversarial tests prove zero authority violations; OFF mode is regression-identical to P18.5. No planner/canonicalizer/executor refactor; no auto-merge.",
   "risk_override": "HIGH"
 }
