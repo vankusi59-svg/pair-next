@@ -251,3 +251,38 @@ left-edge change is the intended token-boundary semantics, and the `_`
 boundary delta (`due_date` mints deadline) is acceptable.
 
 Post-remediation probes: **37/37 adversarial green**.
+
+---
+
+## Final full-scope verification (merge-readiness run)
+
+Owner-requested final gate — run against the **original** pre-V1 baseline,
+not the K″ baseline:
+
+`env -u PAIR_DSH_* -u AGNES_API_KEY TMP/TEMP→D: npm run verify:change --
+--base 46b05bf` at HEAD `613a715` (code state ≡ `f3da8ac` + claim text):
+
+- patch-claim tests **16/16 PASS** (+22 known baseline)
+- invariants **9/9 PASS** (+3)
+- affected regression **48/48 PASS** (+40)
+- TSC **PASS**, production build **PASS**
+- full suite **PASS_WITH_KNOWN_BASELINE** (+133 — all verified
+  `BASE≡HEAD` Windows spawn/artifact baselines; C1 live-codex flake
+  observed mid-run passed isolated in 17s, not a baseline entry)
+- **FINAL VERDICT: READY_FOR_INDEPENDENT_AUDIT**
+
+Environment hardening note: two earlier runs failed on `ENOSPC` — C: had
+0 bytes free from ~2,000 leaked `pair-*` mkdtemp dirs (~20 GB) under
+`%TEMP%` accumulated across historical test runs. Freed; TMP redirected
+to D: for the record run. The leak is a test-fixture cleanup gap —
+recorded as a post-merge hardening item, out of this PR's scope.
+
+### Merge-readiness classification (final)
+
+| Scope | Result |
+|---|---|
+| Semantic correctness | PASS — all K′/K″ findings remediated + probed (37/37 adversarial); revived edges mint satisfiable semantics |
+| Canonical authority/security | PASS — advisory envelope never touches digests/gates; coverage sink per-attempt; confirm binds plan_digest only |
+| Production integration | PASS — both transports identical prompt threading; replan pin durable; UI read-only |
+
+Unresolved correctness-critical findings: **none**.
