@@ -260,7 +260,7 @@ Owner-requested final gate — run against the **original** pre-V1 baseline,
 not the K″ baseline:
 
 `env -u PAIR_DSH_* -u AGNES_API_KEY TMP/TEMP→D: npm run verify:change --
---base 46b05bf` at HEAD `613a715` (code state ≡ `f3da8ac` + claim text):
+--base 46b05bf` at HEAD `a2d75f5` (final code state, post review-remediation):
 
 - patch-claim tests **16/16 PASS** (+22 known baseline)
 - invariants **9/9 PASS** (+3)
