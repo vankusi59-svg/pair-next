@@ -3,9 +3,10 @@
 **Claim:** `SEMANTIC_CONTEXT_PLANNING_V1`
 **Branch:** `feat/semantic-context-planning-v1`
 **BASE:** `46b05bfb0fc6af60a228d5e3438a5b30b3b664ff` (main @ P18.4 merge)
-**HEAD:** `b2e85b54ce80fdf6b1b8cbfd3a95512b8ce5c44b`
+**HEAD:** `64cae3a` (post-K′ remediation)
 **Plan:** `docs/plans/2026-10-26-semantic-context-planning-v1.md` (+ architecture map)
-**Verification verdict:** `READY_FOR_INDEPENDENT_AUDIT`
+**Independent audit:** `docs/e2e-semantic-v1/SEMANTIC_V1_INDEPENDENT_AUDIT.md` — FIX-THEN-SHIP → all 10 findings remediated with regression probes
+**Verification verdict:** `READY_FOR_INDEPENDENT_AUDIT` (re-verified post-remediation)
 **Risk class:** HIGH (authority-adjacent surfaces touched; every authority claim re-proven by deterministic seams)
 
 ---
@@ -39,6 +40,9 @@ authority path; preview/confirm still pins and replays the canonical plan.
 | `43a8b49` | H′ — 20 adversarial seam probes |
 | `aaa42b2` | I′ — real-model E2E (codex `AUTH_OK`, 5-case governed loop) |
 | `b2e85b5` | Patch-claim surface names per harness vocabulary |
+| `8b717cb` | J′ verification record + implementation report |
+| `2f88931` | K′ remediation — Unicode verb boundaries, grouped marker quantities, temporal-number masking, VI anchor stop-set, render-bound enforcement, preserved-row backstop |
+| `64cae3a` | K′ audit doc + verification record |
 
 ## 3. Architecture (as built)
 
@@ -96,16 +100,30 @@ npm run verify:change -- --base 46b05bf
 | Full suite | **PASS_WITH_KNOWN_BASELINE** (+133) |
 | **Verdict** | **READY_FOR_INDEPENDENT_AUDIT** |
 
-Focused suites:
+Focused suites (post-K′ remediation):
 
-- `pair-semantic-planning-context.test.ts` — 9/9 (envelope digest stability,
-  volatility stripping, bounded render, replan pinning, seam wiring)
-- `pair-semantic-coverage.test.ts` — 13/13 (EN/VI extraction, grouped
-  quantities, relative deadlines, outcome-vs-preparation, subject/quantity
-  mismatch, evidence persistence, preview projection)
+- `pair-semantic-planning-context.test.ts` — 11/11 (envelope digest stability,
+  volatility stripping, bounded render incl. max-fill bound + prompt≡evidence,
+  replan pinning, seam wiring)
+- `pair-semantic-coverage.test.ts` — 24/24 (EN/VI extraction, grouped
+  quantities incl. marker path, relative deadlines, temporal masking both
+  directions, outcome-vs-preparation, subject/quantity mismatch, VI initial
+  anchors, connective trim, preserved-row backstop, evidence persistence)
 - `pair-semantic-adversarial.test.ts` — 20/20 (H1–H20 seam probes: scope bleed,
   hint forgery, sync-boundary, snapshot staleness, context-only authority)
-- Planner/contract/coverage regression sweep: 244/244 green
+- Contract/coverage/context regression: 194/194; planner suites 141/141;
+  brain-context suites 121/121
+
+## K′ independent audit outcome
+
+Three-scope adversarial review (semantic correctness / canonical authority /
+production integration): **FIX-THEN-SHIP** — 3 HIGH (dead `đ`/`í`-initial VI
+lexemes → vacuous coverage; marker-path grouped-quantity truncation → floor
+collapse; deadline/year numbers minting and satisfying floors), 3 MED (VI
+clause-initial false anchors; unbounded render vs 4096 evidence bound;
+trailing-connective un-coverable obligations), 4 LOW. All remediated, each
+with a regression probe. Details:
+`docs/e2e-semantic-v1/SEMANTIC_V1_INDEPENDENT_AUDIT.md`.
 
 ## 5. Real-model E2E (`docs/e2e-semantic-v1/REAL_PLANNER_E2E_REPORT.*`)
 
@@ -164,6 +182,11 @@ counts stayed inside the existing envelope: 1 request for first-pass cases,
 - Outcome-vs-preparation classification is verb-class based; a task whose verb
   set mixes both is judged by its fulfillment verbs (preparation verbs alone
   never satisfy an outcome).
+- K′ residual (documented in the audit doc): a goal carrying NO requirement
+  evidence at all (no verb, quantity, or deadline marker) still mints an
+  empty contract — baseline conservative-incompleteness retained deliberately;
+  prohibition enforcement is action+term-level (a task naming the banned
+  object under the banned action violates even with a negating qualifier).
 
 ## 9. Merge status
 
