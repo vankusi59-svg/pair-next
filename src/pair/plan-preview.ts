@@ -58,6 +58,13 @@ export function beginPlannerRun(
     routes: string[];
     actor?: string;
     now?: () => string;
+    /** Semantic Planning V1 — digest of the PlanningContextEnvelope the
+     *  run's prompts were rendered against (evidence-class: advisory,
+     *  never bound into plan/effective-input digests). */
+    planning_context_digest?: string | null;
+    /** The bounded advisory context block actually rendered into the
+     *  prompts (≤4096 chars — evidence of what the planner saw). */
+    planning_context_block?: string | null;
   },
 ): Record<string, unknown> {
   return store.immediate(() => {
@@ -68,6 +75,11 @@ export function beginPlannerRun(
       project_id: args.project_id != null ? String(args.project_id) : null,
       operator_id: args.operator_id ?? null,
       routes: args.routes,
+      planning_context_digest: args.planning_context_digest ?? null,
+      planning_context_block:
+        typeof args.planning_context_block === "string"
+          ? args.planning_context_block.slice(0, 4096)
+          : null,
       attempts: 0,
       // AUDIT R1 F4 — provider requests PROVABLY initiated across all
       // attempts (transport-reported, never inferred from attempt rows).
@@ -87,7 +99,11 @@ export function beginPlannerRun(
       event_type: "PLANNER_RUN_STARTED",
       new_state: RUN_STATE.RUNNING,
       actor: args.actor ?? "PAIR_PLANNER",
-      metadata: { routes: args.routes, project_id: row.project_id },
+      metadata: {
+        routes: args.routes,
+        project_id: row.project_id,
+        planning_context_digest: row.planning_context_digest,
+      },
     });
     return row;
   });

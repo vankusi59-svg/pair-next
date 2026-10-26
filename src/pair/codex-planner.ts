@@ -126,6 +126,11 @@ export interface CodexPlannerInvokeConfig {
    *  rendered into the SAME canonical prompt builder every transport
    *  uses (drift between transports is a contract violation). */
   externalInputArtifacts?: LlmPlannerConfig["externalInputArtifacts"];
+  /** Semantic Planning V1 — the pre-rendered advisory planning-context
+   *  block, rendered by the SAME canonical prompt builder every
+   *  transport uses (drift between transports is a contract
+   *  violation). */
+  planningContextBlock?: LlmPlannerConfig["planningContextBlock"];
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -297,6 +302,7 @@ export function buildCodexPlannerPrompt(
     | "rejectionContext"
     | "authorityGoal"
     | "externalInputArtifacts"
+    | "planningContextBlock"
   >,
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -308,6 +314,7 @@ export function buildCodexPlannerPrompt(
     rejectionContext: cfg.rejectionContext,
     authorityGoal,
     externalInputArtifacts: cfg.externalInputArtifacts,
+    planningContextBlock: cfg.planningContextBlock,
   })}`;
 }
 

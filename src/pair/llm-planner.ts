@@ -589,6 +589,13 @@ export interface LlmPlannerConfig {
     source_mission_id?: string;
     source_task_id?: string;
   }>;
+  /** Semantic Planning V1 — the PRE-RENDERED advisory planning-context
+   *  block (renderPlanningContextBlock output, bounded). Advisory data
+   *  only: it informs planning but can never mint authority, widen
+   *  scope, or substitute for the Goal Contract. Assembled at the async
+   *  planner seams (or pinned on a durable replan_generation row) —
+   *  never inside the synchronous canonicalizer. */
+  planningContextBlock?: string;
 }
 
 export interface LlmPlanResult {
@@ -1042,6 +1049,8 @@ export function buildPlannerUserPrompt(
       source_mission_id?: string;
       source_task_id?: string;
     }>;
+    /** Pre-rendered advisory planning-context block (bounded). */
+    planningContextBlock?: string;
   },
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -1131,6 +1140,7 @@ export function buildPlannerUserPrompt(
           : "") +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
+    (cfg.planningContextBlock ? `\n${cfg.planningContextBlock}` : "") +
     `\nMISSION GOAL:\n${goal}`
   );
 }

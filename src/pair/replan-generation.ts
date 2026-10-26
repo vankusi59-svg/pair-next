@@ -49,6 +49,7 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
+import { missionOperatorGoalOf } from "./goal-contract.js";
 import {
   REPLAN_GENERATION_PENDING,
   ReplanAttemptLedger,
@@ -56,6 +57,11 @@ import {
 } from "./plan-feasibility.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { RuntimePlannerInput } from "./mission-runtime.js";
+import type {
+  PlanningContextEnvelope,
+  PlanningContextRequest,
+} from "./planning-context.js";
+import { renderPlanningContextBlock } from "./planning-context.js";
 
 export const REPLAN_GENERATION_CONTRACT = "pair-replan-generation.v1";
 export const REPLAN_GENERATION_ENTITY = "replan_generation";
@@ -148,6 +154,13 @@ export type ReplanGenerationRecord = {
   deadline_at: string;
   /** planner_run_id of the production planner_run evidence row. */
   planner_run_id: string | null;
+  /** Semantic Planning V1 — advisory PlanningContextEnvelope snapshot
+   *  minted at REQUEST time alongside replan_context: the exact bounded
+   *  prompt block the async generation must render verbatim (a live
+   *  re-fetch at generation time would silently change what this
+   *  durable record claims) plus the envelope's evidence-class digest.
+   *  Never authority — advisory context only. */
+  planning_context: { context_digest: string; block: string } | null;
   staged_candidate: {
     tasks: Array<Record<string, unknown>>;
     plan_source: string;
@@ -304,6 +317,13 @@ export class ReplanGenerationService {
   constructor(
     private readonly store: PairEvidenceStore,
     private readonly opts: { deadlineMs?: number } = {},
+    /** Semantic Planning V1 — optional envelope assembler for the
+     *  request-time planning-context snapshot. Structural seam: absent
+     *  → planning_context mints null, generation runs context-free
+     *  (identical prior behavior). */
+    private readonly planningContext?: {
+      envelopeFor(req: PlanningContextRequest): PlanningContextEnvelope;
+    },
   ) {}
 
   private ledger(): ReplanAttemptLedger {
@@ -367,6 +387,36 @@ export class ReplanGenerationService {
       const supersededPlanId =
         input.mission?.plan_id != null ? String(input.mission.plan_id) : null;
       const snapshot = snapshotReplanContext(ctx);
+      /* Semantic Planning V1 — pin the advisory context snapshot at
+         REQUEST time so the async generation renders exactly what this
+         durable record claimed. Scope resolution reuses the canonical
+         work-item lineage seam; a mission without objective binding
+         still records an honest scope-degraded envelope. Assembly is
+         sync-safe (canonical store reads only) and fail-open-by-design
+         at this seam: an assembly failure records null rather than
+         blocking the governed replan — the prompt stays advisory-free
+         exactly like the pre-upgrade path. */
+      let planningContext: ReplanGenerationRecord["planning_context"] = null;
+      if (this.planningContext) {
+        try {
+          const workItemId = replanWorkItemId(this.store, input.mission);
+          const env = this.planningContext.envelopeFor({
+            work_item_id: workItemId,
+            project_id:
+              input.mission?.project_id != null
+                ? String(input.mission.project_id)
+                : null,
+            authorityGoal: missionOperatorGoalOf(this.store, input.mission),
+            actor: "PAIR_REPLAN_GENERATION",
+          });
+          planningContext = {
+            context_digest: env.context_digest,
+            block: renderPlanningContextBlock(env).slice(0, 4096),
+          };
+        } catch {
+          planningContext = null;
+        }
+      }
       const deadlineMs = this.opts.deadlineMs ?? 1_800_000;
       const now = Date.now();
       const record: ReplanGenerationRecord = {
@@ -393,6 +443,7 @@ export class ReplanGenerationService {
         lease_count: 0,
         deadline_at: isoAfter(now, deadlineMs),
         planner_run_id: null,
+        planning_context: planningContext,
         staged_candidate: null,
         outcome: null,
         created_at: utcnow(),
