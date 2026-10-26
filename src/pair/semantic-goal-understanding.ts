@@ -711,6 +711,9 @@ export interface GoalIntentApproval {
     statement: string;
     issue_key: string;
     decision: "accepted_assumption" | "supplied_value";
+    /** Bounded operator text for supplied_value (null otherwise) —
+     *  re-verified against the amended-goal line at re-proof. */
+    supplied?: string | null;
   }>;
   base_goal_sha256: string;
   amended_goal: string;
@@ -868,6 +871,7 @@ export function approveGoalIntentItems(
         statement: item.statement,
         issue_key: issueKeyFor(item),
         decision,
+        supplied: supplied ?? null,
       });
       decisions.push({ item_id: id, decision, supplied: supplied ?? "" });
       // Accepted assumption = the owner acknowledges the issue's
@@ -1058,18 +1062,38 @@ export function verifyGoalIntentApproval(
       { statement: derived[i], issue_key: derivedIssues[i].issue_key },
     ]),
   );
-  if (
-    !Array.isArray(approval.resolutions) ||
-    approval.resolutions.length !== approval.item_ids.length ||
-    approval.resolutions.some(
-      (r) =>
-        r == null ||
-        !derivedById.has(String(r.item_id)) ||
-        String(r.statement) !== derivedById.get(String(r.item_id))!.statement ||
-        String(r.issue_key) !== derivedById.get(String(r.item_id))!.issue_key ||
-        (r.decision !== "accepted_assumption" && r.decision !== "supplied_value"),
-    )
-  ) {
+  const goalLines = new Set(
+    String(approval.amended_goal ?? "").split("\n"),
+  );
+  const seenResIds = new Set<string>();
+  let resolutionsOk =
+    Array.isArray(approval.resolutions) &&
+    approval.resolutions.length === approval.item_ids.length;
+  if (resolutionsOk) {
+    for (const r of approval.resolutions) {
+      const id = String(r?.item_id);
+      const d = r != null ? derivedById.get(id) : undefined;
+      // Bijection: each approved item appears exactly once.
+      if (!d || seenResIds.has(id)) { resolutionsOk = false; break; }
+      seenResIds.add(id);
+      // Decision evidence must match the amended-goal line the mint
+      // actually appended — a flipped decision or forged supplied text
+      // (with an intact pinned analysis) fails closed.
+      const lineOk =
+        String(r.statement) === d.statement &&
+        String(r.issue_key) === d.issue_key &&
+        (r.decision === "accepted_assumption"
+          ? r.supplied == null &&
+            goalLines.has(`Operator-approved: ${d.statement}`)
+          : r.decision === "supplied_value"
+            ? typeof r.supplied === "string" &&
+              r.supplied !== "" &&
+              goalLines.has(`Operator-supplied: ${r.supplied}`)
+            : false);
+      if (!lineOk) { resolutionsOk = false; break; }
+    }
+  }
+  if (!resolutionsOk) {
     throw new IntegrityError(
       "FAIL_CLOSED_GOAL_INTENT_APPROVAL",
       "approval resolutions inconsistent with the pinned analysis items",

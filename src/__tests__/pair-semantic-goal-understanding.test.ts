@@ -1361,6 +1361,23 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
     const resA = accepted.resolutions as Array<Record<string, unknown>>;
     expect(resA[0].decision).toBe("accepted_assumption");
     expect(resA[0].issue_key).toBe(res[0].issue_key); // same issue
+    // A supplied-value approval re-proves at confirm time — the
+    // Operator-supplied line in the amended goal satisfies the
+    // resolutions evidence check.
+    const reProof = verifyGoalIntentApproval(store, {
+      mission_input: {
+        operator_goal: supplied.amended_goal,
+        project_id: project.project_id, operator_id: "op1",
+        metadata: {
+          goal_intent_approval: {
+            approval_id: supplied.approval_id,
+            revision_digest: supplied.revision_digest,
+          },
+        },
+      },
+    });
+    expect(reProof.resolutions[0].decision).toBe("supplied_value");
+    expect(reProof.approved_issues[0].issue_key).toBe(String(res[0].issue_key));
     // Adversarial: supplied text for a non-approved id fails closed.
     expect(() =>
       approvePreview(store, control, project, GOALI, [itm], ["i1"], {
