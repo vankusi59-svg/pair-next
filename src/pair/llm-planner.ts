@@ -627,6 +627,13 @@ export interface LlmPlannerConfig {
    *  planner seams (or pinned on a durable replan_generation row) —
    *  never inside the synchronous canonicalizer. */
   planningContextBlock?: string;
+  /** P18.6 — the PRE-RENDERED advisory semantic goal-interpretation
+   *  block (renderGoalIntentBlock output, bounded). Same advisory
+   *  discipline: interpretation informs decomposition, never mints or
+   *  satisfies requirements — the GOAL CONTRACT remains sole
+   *  authority. Assembled at the async seams / pinned on the durable
+   *  replan_generation row alongside planning_context. */
+  semanticIntentBlock?: string;
 }
 
 export interface LlmPlanResult {
@@ -1082,6 +1089,9 @@ export function buildPlannerUserPrompt(
     }>;
     /** Pre-rendered advisory planning-context block (bounded). */
     planningContextBlock?: string;
+    /** Pre-rendered advisory semantic goal-interpretation block
+     *  (bounded). P18.6 — same advisory-only discipline. */
+    semanticIntentBlock?: string;
   },
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -1171,6 +1181,7 @@ export function buildPlannerUserPrompt(
           : "") +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
+    (cfg.semanticIntentBlock ? `\n${cfg.semanticIntentBlock}` : "") +
     (cfg.planningContextBlock ? `\n${cfg.planningContextBlock}` : "") +
     `\nMISSION GOAL:\n${goal}`
   );

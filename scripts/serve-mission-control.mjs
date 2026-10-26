@@ -136,6 +136,12 @@ import {
   PlanningContextService,
   BrainContextService,
   renderPlanningContextBlock,
+  semanticMode,
+  analyzeGoal,
+  renderGoalIntentBlock,
+  codexSemanticAnalyze,
+  pinPlannerRunGoalIntent,
+  latestGoalIntentSnapshot,
   operationalStatusMaxChars,
   OperationalQueryService,
   ConversationReadGrantService,
@@ -478,6 +484,34 @@ const replanGenerationEnabled = process.env.PAIR_ASYNC_REPLAN_PROVIDER === "1";
 const replanGeneration = replanGenerationEnabled
   ? new ReplanGenerationService(store, { deadlineMs: cfgReplanGenerationDeadlineMs }, {
       envelopeFor: (req) => resolvePlanningContext().envelopeFor(req),
+    },
+    // P18.6 — pin the SAME authorized goal revision's interpretation
+    // snapshot at request time: the newest analyzed planner_run for
+    // the mission's operator goal (server-side store read only). A
+    // replan must never silently reinterpret a failed mission.
+    (mission) => {
+      try {
+        const g = latestGoalIntentSnapshot(store, missionOperatorGoalOf(store, mission), {
+          project_id: mission.project_id != null ? String(mission.project_id) : null,
+        });
+        return g == null
+          ? null
+          : {
+              analysis_digest: String(g.analysis_digest ?? ""),
+              block: String(g.block ?? ""),
+              ambiguity_class: String(g.ambiguity_class ?? "HARMLESS"),
+              source_goal_sha: String(g.source_goal_sha ?? ""),
+              // The interpretation's OWN context snapshot + source mode —
+              // never the replan request's context/mode (provenance).
+              context_digest: g.context_digest != null ? String(g.context_digest) : null,
+              mode: String(g.mode ?? ""),
+              // Item-level evidence so replan-path previews keep the
+              // amendment/projection surface intact.
+              analysis: g.analysis ?? null,
+            };
+      } catch {
+        return null;
+      }
     })
   : null;
 console.log(`ASYNC_REPLAN_PROVIDER: ${replanGeneration ? `ENABLED (deadline=${cfgReplanGenerationDeadlineMs}ms)` : "disabled"}`);
@@ -1074,6 +1108,80 @@ const knownCapabilityIds = () =>
 // prompt builder; `externalInputArtifacts` binds cross-mission consume
 // edges at canonicalization for replan candidates (undefined for
 // initial planning — identical prior behavior).
+/* P18.6 — governed semantic goal analysis shared by both planning
+ * seams. ONE bounded provider request per invocation through the SAME
+ * codex-cli planner lane (same executable, model pin, scratch sandbox,
+ * provider request accounting, run deadline). Modes:
+ *   OFF     → no call, no evidence (byte-identical P18.5);
+ *   SHADOW  → analysis + pinned evidence, prompt UNCHANGED
+ *             (evidence-only comparison — the block never reaches the
+ *             model, so plan authority/digests are unaffected);
+ *   GUARDED → the bounded advisory interpretation block may reach the
+ *             planner prompt AND the confirm-time ambiguity gate
+ *             applies to the pinned evidence.
+ * Unavailable/malformed analysis → typed unavailable evidence — never
+ * a fabricated interpretation, never a planning failure. */
+const semanticAnalyzeForRun = async ({
+  authorityGoal,
+  contextDigest,
+  contextBlock,
+  scope,
+  candidates,
+  plannerRunId,
+  deadlineAt,
+  actor,
+}) => {
+  const mode = semanticMode();
+  if (mode === "off" || !candidates.length || !authorityGoal) return null;
+  const semanticModel = String(candidates[0].model);
+  const providerCounter = { requests: 0 };
+  const out = await analyzeGoal({
+    goal: authorityGoal,
+    context_digest: contextDigest ?? null,
+    contextBlock: contextBlock || null,
+    model: semanticModel,
+    scope,
+    analyze: () =>
+      codexSemanticAnalyze(authorityGoal, contextBlock || null, {
+        model: semanticModel,
+        timeoutMs: Math.max(
+          1_000,
+          Math.min(cfgCodexPlannerTimeoutMs, deadlineAt - Date.now()),
+        ),
+        scratchDir: codexPlannerScratch,
+        providerCounter,
+      }),
+  });
+  const analyzed = "unavailable" in out ? null : out;
+  const pinned = {
+    analysis_digest:
+      analyzed?.analysis_digest ??
+      digest({
+        schema: "pair.goal-intent-analysis.v1",
+        unavailable: out.unavailable,
+        goal: authorityGoal,
+      }),
+    block: analyzed ? renderGoalIntentBlock(analyzed) : "",
+    ambiguity_class: analyzed?.ambiguity?.class ?? "MATERIAL",
+    status: analyzed ? "analyzed" : "unavailable",
+    unavailable_reason: analyzed ? null : String(out.unavailable.join(",")),
+    model: semanticModel,
+    provider_id: String(candidates[0].provider ?? "codex-cli"),
+    provider_requests: providerCounter.requests,
+    analysis_ms: analyzed?.provider?.latency_ms ?? 0,
+    from_cache: providerCounter.requests === 0,
+    source_goal_sha: digest({ operator_goal: authorityGoal }),
+    context_digest: contextDigest ?? null,
+    mode,
+    analysis: analyzed ?? null,
+  };
+  pinPlannerRunGoalIntent(store, {
+    planner_run_id: plannerRunId,
+    goal_intent: pinned,
+    actor: actor ?? "PAIR_PLANNER",
+  });
+  return pinned;
+};
 const invokePlannerPool = ({
   goal,
   authorityGoal,
@@ -1085,6 +1193,7 @@ const invokePlannerPool = ({
   externalInputArtifacts,
   priorRejectionContext,
   planningContextBlock,
+  semanticIntentBlock,
 }) => {
   // Semantic Planning V1 (G′) — per-attempt coverage evidence slot.
   // onAttemptStart resets it (a stale report from a prior attempt can
@@ -1188,6 +1297,10 @@ const invokePlannerPool = ({
         // replan_generation row (replan path). Advisory only — never
         // authority.
         planningContextBlock: planningContextBlock ?? undefined,
+        // P18.6 — the advisory semantic interpretation block (GUARDED
+        // only; shadow evidence never reaches the prompt). Advisory
+        // only — never authority.
+        semanticIntentBlock: semanticIntentBlock ?? undefined,
       });
     },
     // P-REASK R3 — hard per-candidate latency ceiling, measured from
@@ -1340,13 +1453,46 @@ const planExpander = async (input, expandCtx) => {
         // plannerCandidateRequestBound encodes the structural bound in
         // lockstep with runPlannerFailover — never re-derive it here.
         return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
-      }, 0),
+      }, 0) +
+        // P18.6 — the ONE bounded semantic-analysis request counts in
+        // the monetary envelope (worst case, first candidate's bound).
+        (semanticMode() !== "off" && candidates.length
+          ? service.cost.plannerRequestBoundMicrousd(candidates[0]).per_request_microusd
+          : 0),
       unbounded_unknown: candidates.some(
         (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
       ),
       candidates: candidates.length,
       actor: "PAIR_PLANNER",
     });
+    /* P18.6 — ONE governed semantic-analysis request inside the
+       admitted envelope + run deadline; pinned on the run row as
+       advisory evidence. GUARDED injects the bounded interpretation
+       block into the same canonical prompt seam; SHADOW/OFF keep the
+       prompt byte-identical to P18.5 (shadow still persists evidence). */
+    let goalIntentPinned = null;
+    try {
+      goalIntentPinned = await semanticAnalyzeForRun({
+        authorityGoal,
+        contextDigest: planningEnvelope?.context_digest ?? null,
+        contextBlock: planningContextBlock,
+        scope: {
+          business_id: planningEnvelope?.scope?.business_id ?? null,
+          objective_id: planningEnvelope?.scope?.objective_id ?? null,
+          work_item_id:
+            expandCtx?.work_item_id != null
+              ? String(expandCtx.work_item_id)
+              : planningEnvelope?.scope?.work_item_id ?? null,
+          project_id: input.project_id != null ? String(input.project_id) : null,
+        },
+        candidates,
+        plannerRunId: String(run.planner_run_id),
+        deadlineAt,
+        actor: "PAIR_PLANNER",
+      });
+    } catch {
+      goalIntentPinned = null; // advisory seam — never blocks planning
+    }
     const res = await invokePlannerPool({
       goal,
       authorityGoal,
@@ -1357,6 +1503,10 @@ const planExpander = async (input, expandCtx) => {
       externalInputArtifacts,
       priorRejectionContext: expandCtx?.prior_rejection ?? undefined,
       planningContextBlock,
+      semanticIntentBlock:
+        goalIntentPinned?.status === "analyzed" && goalIntentPinned.mode === "guarded"
+          ? goalIntentPinned.block
+          : undefined,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
@@ -1474,6 +1624,41 @@ const runReplanPoolGeneration = async (gen) => {
     typeof gen.planning_context?.context_digest === "string"
       ? gen.planning_context.context_digest
       : null;
+  /* P18.6 — the replan replays the goal-interpretation snapshot PINNED
+     on the durable generation row (the SAME authorized goal revision's
+     interpretation — never a silent re-interpretation of a failed
+     mission). Absent snapshot (OFF / pre-upgrade lineage / stale-goal
+     snapshot whose source sha no longer binds this authority goal) →
+     null. The snapshot records its OWN context digest + source mode —
+     the analysis never saw the replan request's context. */
+  const semMode = semanticMode();
+  const genGoalIntent =
+    semMode !== "off" &&
+    gen.goal_intent &&
+    typeof gen.goal_intent.analysis_digest === "string" &&
+    String(gen.goal_intent.source_goal_sha ?? "") ===
+      digest({ operator_goal: authorityGoal })
+      ? {
+          analysis_digest: gen.goal_intent.analysis_digest,
+          block: String(gen.goal_intent.block ?? ""),
+          ambiguity_class: String(gen.goal_intent.ambiguity_class ?? "HARMLESS"),
+          status: "analyzed",
+          unavailable_reason: null,
+          model: "replan-pinned",
+          provider_id: "codex-cli",
+          provider_requests: 0,
+          analysis_ms: 0,
+          from_cache: true,
+          source_goal_sha: String(gen.goal_intent.source_goal_sha ?? ""),
+          context_digest:
+            gen.goal_intent.context_digest != null
+              ? String(gen.goal_intent.context_digest)
+              : null,
+          mode: semMode,
+          source_mode: String(gen.goal_intent.mode ?? ""),
+          analysis: gen.goal_intent.analysis ?? null,
+        }
+      : null;
   const run = beginPlannerRun(store, {
     project_id: mission.project_id != null ? String(mission.project_id) : undefined,
     operator_id: mission.operator_id,
@@ -1481,6 +1666,7 @@ const runReplanPoolGeneration = async (gen) => {
     actor: "PAIR_REPLAN_GENERATION",
     planning_context_digest: replanContextDigest,
     planning_context_block: replanContextBlock || null,
+    goal_intent: genGoalIntent,
   });
   // The generation row's durable deadline bounds this run; the env
   // planner-run deadline may tighten, never widen it.
@@ -1508,13 +1694,38 @@ const runReplanPoolGeneration = async (gen) => {
       est_microusd: candidates.reduce((sum, c) => {
         const bound = service.cost.plannerRequestBoundMicrousd(c);
         return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
-      }, 0),
+      }, 0) +
+        // P18.6 — a fresh bounded semantic-analysis request fires only
+        // when no pinned snapshot exists; the reservation must bound
+        // worst-case spend exactly like the initial-plan edge.
+        (genGoalIntent == null && semMode !== "off" && candidates.length
+          ? service.cost.plannerRequestBoundMicrousd(candidates[0]).per_request_microusd
+          : 0),
       unbounded_unknown: candidates.some(
         (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
       ),
       candidates: candidates.length,
       actor: "PAIR_REPLAN_GENERATION",
     });
+    // P18.6 — no pinned snapshot (fresh lineage / mode flip after
+    // request) → ONE bounded analysis at generation time, same seam.
+    const replanGoalIntent =
+      genGoalIntent ??
+      (await semanticAnalyzeForRun({
+        authorityGoal,
+        contextDigest: replanContextDigest,
+        contextBlock: replanContextBlock,
+        scope: {
+          business_id: null,
+          objective_id: null,
+          work_item_id: replanWi != null ? String(replanWi) : null,
+          project_id: mission.project_id != null ? String(mission.project_id) : null,
+        },
+        candidates,
+        plannerRunId: String(run.planner_run_id),
+        deadlineAt,
+        actor: "PAIR_REPLAN_GENERATION",
+      }).catch(() => null));
     const res = await invokePlannerPool({
       goal,
       authorityGoal,
@@ -1526,6 +1737,10 @@ const runReplanPoolGeneration = async (gen) => {
       externalInputArtifacts: externalInputs,
       priorRejectionContext: adaptive?.context ?? undefined,
       planningContextBlock: replanContextBlock,
+      semanticIntentBlock:
+        replanGoalIntent?.status === "analyzed" && semanticMode() === "guarded"
+          ? String(replanGoalIntent.block ?? "")
+          : undefined,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
