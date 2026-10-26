@@ -73,6 +73,15 @@ const VERB_CLASSES: Array<{ cls: string; re: RegExp }> = [
   { cls: "translate", re: /\b(?:translat|dịch)/iu },
   { cls: "deploy", re: /\b(?:deploy|publish|xuất bản)/iu },
   { cls: "list", re: /\b(?:list|rank|score|select|choose|screen|liệt kê|xếp hạng|chọn)/iu },
+  /* Semantic Planning V1 (D′) — outcome verbs: pursuing a measured
+   *  result ("grow subscribers", "đạt 1.000 người đăng ký", "attract
+   *  leads"). Distinct from preparation classes so a research-only task
+   *  can never claim to satisfy an outcome obligation. */
+  { cls: "outcome", re: /\b(?:grow|growth|grows|grew|grown|growing|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|expand|scal|improv|rais|driv|convert|recruit|onboard|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển dụng|tuyển)/iu },
+  /* Fulfillment verbs — direct goal-pursuing work that is neither pure
+   *  preparation nor the outcome verb itself: executing, delivering,
+   *  operating the thing that produces the outcome. */
+  { cls: "fulfill", re: /\b(?:execut|operat|deliver|run|launch|perform|conduct|carry out|roll out|triển khai|thực hiện|thực thi|vận hành|chạy|phát hành|phát sóng|đăng tải|đăng)/iu },
 ];
 
 function verbClasses(text: string): Set<string> {
@@ -185,13 +194,58 @@ function taskKeys(tasks: Array<Record<string, unknown>>): Map<string, Record<str
  *  task instruction: same verb class, the obligation's subject identity
  *  anchors are all bound, subject classes preserved when no anchors
  *  exist, and any stated quantity is preserved (never downgraded). */
+/** Preparation-only verb classes — a task whose work is ENTIRELY one of
+ *  these is groundwork, never goal fulfillment (Semantic Planning V1
+ *  D2): "research growth strategies" prepares for "grow subscribers"
+ *  but does not perform it. */
+const PREPARATION_ONLY = new Set([
+  "research", "analyze", "compare", "propose", "fetch", "summarize",
+  "list",
+]);
+
+function isPreparationOnly(taskVerbs: Set<string>): boolean {
+  if (!taskVerbs.size) return false;
+  for (const v of taskVerbs) if (!PREPARATION_ONLY.has(v)) return false;
+  return true;
+}
+
+/** Extract every quantity mention from task text — including
+ *  thousands-grouped forms ("1,000" EN / "1.000" VI) so a stated floor
+ *  of 1,000 is preserved against grouped task text and a bare "1" can
+ *  never satisfy it. */
+function quantityNums(text: string): number[] {
+  const out: number[] = [];
+  const re = /\b(\d{1,3}(?:[.,]\d{3})+|\d{1,9})\b/g;
+  re.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const raw = m[1];
+    out.push(raw.includes(",") || raw.includes(".")
+      ? Number(raw.replace(/[.,]/g, ""))
+      : Number(raw));
+  }
+  return out;
+}
+
 function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
   const t = instr.trim();
   if (!t) return false;
   const reqVerbs = verbClasses(req.text);
   const taskVerbs = verbClasses(t);
-  // The task must perform at least one verb class the requirement asked.
+  // The task must perform at least one verb class the requirement
+  // asked. Exception (Semantic Planning V1): an OUTCOME obligation is
+  // covered by fulfillment — the task needn't restate the outcome verb
+  // ("execute the growth campaign" covers "grow subscribers") — but a
+  // preparation-only task never does.
   if (reqVerbs.size && ![...reqVerbs].some((v) => taskVerbs.has(v))) {
+    const outcomeReq = reqVerbs.has("outcome");
+    if (!outcomeReq) return false;
+    if (!taskVerbs.has("outcome") && !taskVerbs.has("fulfill")) return false;
+  }
+  // Semantic Planning V1 (D2) — outcome obligations demand fulfillment
+  // evidence: a task whose verbs are ALL preparation-class can never
+  // satisfy "grow / increase / achieve", however topical it is.
+  if (reqVerbs.has("outcome") && isPreparationOnly(taskVerbs)) {
     return false;
   }
   const reqAnchors = subjectAnchors(req.text);
@@ -223,9 +277,10 @@ function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
     }
   }
   // Quantity preservation: a stated floor must appear in the task at
-  // the same or a larger magnitude — "20" can never become "5".
+  // the same or a larger magnitude — "20" can never become "5", and
+  // "1,000" / VI "1.000" count at their true magnitude, never as "1".
   if (req.quantity?.min !== undefined) {
-    const nums = [...t.matchAll(/\b(\d{1,6})\b/g)].map((m) => Number(m[1]));
+    const nums = quantityNums(t);
     if (!nums.length || Math.max(...nums) < req.quantity.min) return false;
   }
   return true;

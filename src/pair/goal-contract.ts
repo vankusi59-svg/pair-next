@@ -274,6 +274,17 @@ function splitSegGuarded(seg: string): string[] {
     ) {
       continue;
     }
+    /* Semantic Planning V1 (C′) — a comma inside a grouped-thousands
+       number ("1,000 subscribers") is numeric punctuation, never a
+       clause separator. Bounded guard: digit before + exactly-3-digit
+       group after. */
+    if (
+      m[0].includes(",") &&
+      /\d$/.test(seg.slice(0, m.index)) &&
+      /^\d{3}\b/.test(seg.slice(m.index + m[0].length))
+    ) {
+      continue;
+    }
     out.push(seg.slice(last, m.index));
     last = m.index + m[0].length;
   }
@@ -345,7 +356,14 @@ const ACTION_TAIL_RE = new RegExp(`(?:${ALL_ACTION_FORMS})$`, "iu");
  *  lookarounds — JS `\b` is ASCII-only and can never see `đừng`/`ế`-
  *  edged words. */
 const PROHIBITION_RE = new RegExp(
-  `(?<![\\p{L}\\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))(?![\\p{L}\\p{N}])`,
+  `(?<![\\p{L}\\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))` +
+    /* Semantic Planning V1 (C′) — "without X" bans X inside the goal:
+       bounded to a following bounded noun-phrase so an innocuous
+       "a world without borders" idiom is read the same way — as an
+       exclusion the operator stated. VI equivalents keep structural
+       action evidence (`không` needs a forbidden action after it). */
+    `|(?<![\\p{L}\\p{N}])without(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])` +
+    `|(?<![\\p{L}\\p{N}])(?:mà không|và không|không cần)(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])`,
   "iu",
 );
 
@@ -380,7 +398,7 @@ function prohibitionHead(clause: string): string {
 }
 
 const DEADLINE_RE =
-  /\bdeadline\b|\bdue\b|\bhạn\b|\btrước ngày\b|\btrước\b.{0,12}\b(?:giờ|ngày)\b|\bby\s+\d{1,2}[/-]\d{1,2}/iu;
+  /\bdeadline\b|\bdue\b|\bhạn\b|\btrước ngày\b|\btrước\b.{0,12}\b(?:giờ|ngày)\b|\bby\s+\d{1,2}[/-]\d{1,2}|\bwithin\s+\d+\s*(?:days?|weeks?|months?|hours?)\b|\bin\s+\d+\s*(?:days?|weeks?|months?)\b|\btrong\s+vòng\s+\d+\s*(?:ngày|tuần|tháng|giờ)\b|\btrong\s+khoảng\s+\d+\s*(?:ngày|tuần|tháng|giờ)\b|\btrong\s+\d+\s*(?:ngày|tuần|tháng)\b/iu;
 
 const CONSTRAINT_RE =
   /\bbudget\b|\bngân sách\b|\btối đa\b|\bkhông quá\b|\bonly\b|\bchỉ\b|\bchỉ được\b|\bngoại trừ\b|\bexcept\b|\bin (?:english|vietnamese|spanish|french|japanese)\b|\bbằng tiếng\b|\b(?:max|maximum|up to|at most)\s+\d|\b(?:<=|≤)\s*\$?\s*\d/i;
@@ -576,8 +594,14 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
 const LEADING_FILLER_RE =
   /^(?:please|hãy|xin|first(?:ly)?|also|then|next|finally|lastly|đầu tiên|tiếp(?: theo)?|sau đó|rồi|bây giờ|sau khi|ok(?:ay)?|and|và|\d{1,2}[.)]|[•\-–—*])\s*/iu;
 
+/* Semantic Planning V1 (C′) — outcome/growth verbs: a goal like "Grow
+ * the channel by 1,000 subscribers" or "đạt 1.000 người đăng ký" is a
+ * genuine operator obligation even though no classical work verb leads
+ * it. The class is deliberately bound to OUTCOME verbs only — platform
+ * nouns and metric nouns stay object-identity, never obligations
+ * themselves. */
 const OBLIGATION_VERB_RE =
-  /\b(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn)/iu;
+  /\b(?:research|analy[sz]e|analyse|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identify|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver(?:ing|ed)?|convert|recruit|onboard|nghiên cứu|phân tích|đánh giá|xem xét|khảo sát|so sánh|đối chiếu|đề xuất|xác định|lấy|tải|thu thập|tra cứu|tìm|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai|tính|ước tính|dự báo|vẽ|tóm tắt|kiểm tra|kiểm|theo dõi|giám sát|dịch|liệt kê|xếp hạng|chọn|tăng trưởng|tăng|gia tăng|đạt được|đạt|thu hút|mở rộng|nâng cao|nâng|cải thiện|thúc đẩy|chuyển đổi|tuyển)/iu;
 
 const QUANTITY_MIN_RE =
   /\b(?:at least|minimum of|min(?:imum)?|no fewer than|ít nhất|tối thiểu|>=|≥)\s*(\d+)/iu;
@@ -585,7 +609,17 @@ const QUANTITY_MAX_RE =
   /\b(?:at most|up to|maximum of|no more than|tối đa|không quá|<=|≤)\s*(\d+)/iu;
 const QUANTITY_EXACT_RE =
   /\b(?:exactly|đúng|chính xác)\s+(\d+)/iu;
-const BARE_NUM_RE = /\b(\d{1,6})\b/;
+/* Semantic Planning V1 (C′) — grouped-thousand forms: `1,000` (EN) is
+ *  unambiguous thousands grouping; VI `1.000` is accepted only with a
+ *  VI-unit lookahead so a version/decimals token ("1.000.2") never
+ *  mints a quantity. */
+const BARE_NUM_RE = /\b(\d{1,3}(?:,\d{3})+|\d{1,6})\b/;
+const BARE_NUM_VI_DOT_RE =
+  /\b(\d{1,3}(?:\.\d{3})+)(?=\s*(?:người|ngày|tháng|tuần|giờ|đăng ký|đơn|lượt|tài khoản|thành viên|khách|đơn hàng|bài|file|video|sản phẩm|usd|vnd|đồng))\b/iu;
+
+function parseNum(raw: string): number {
+  return Number(raw.replace(/[,.]/g, ""));
+}
 
 /** Tokens that may appear inside a prohibition clause but are not the
  *  prohibited thing itself (verbs, articles, negation words). */
@@ -625,9 +659,17 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
     if (maxM) q.max = Number(maxM[1]);
     if (q.min === undefined && q.max === undefined) {
       // A bare quantity in a work clause is the operator's stated floor —
-      // "propose 3 strategies" means at least 3, never "some".
+      // "propose 3 strategies" means at least 3, never "some". Grouped
+      // thousands ("1,000" / VI "1.000 người") resolve to the same floor;
+      // the VI dot form must win before bare digits can mint a wrong
+      // "1" out of "1.000".
+      const viDot = BARE_NUM_VI_DOT_RE.exec(clause);
       const bare = BARE_NUM_RE.exec(clause);
-      if (bare) q.min = Number(bare[1]);
+      if (viDot && (!bare || viDot.index <= bare.index)) {
+        q.min = parseNum(viDot[1]);
+      } else if (bare) {
+        q.min = parseNum(bare[1]);
+      }
     }
   }
   return q.min !== undefined || q.max !== undefined ? q : undefined;
@@ -857,7 +899,7 @@ export function extractGoalContract(goal: string): GoalContract {
       if (
         first &&
         OBLIGATION_VERB_RE.test(rest.slice(0, first[0].length + 8)) &&
-        /^(?:research|analy|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identif|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|nghiên|phân|đánh|xem|khảo|so|đối|đề|xác|lấy|tải|thu|tra|tìm|tạo|viết|soạn|lưu|xuất|xây|phát|thiết|triển|tính|ước|dự|vẽ|tóm|kiểm|theo|giám|dịch|liệt|xếp|chọn)/iu.test(rest)
+        /^(?:research|analy|assess|evaluat|review|study|investigat|survey|compar|benchmark|contrast|propos|recommend|suggest|deriv|identif|fetch|retriev|collect|gather|download|scrape|extract|creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|comput|calculat|measure|quantif|estimat|forecast|plot|draw|chart|graph|summar|digest|test|verif|validat|check|monitor|track|translat|deploy|publish|list|rank|score|select|choose|screen|grow|growth|increas|boost|gain|achiev|reach|attain|acquir|attract|earn|improv|expand|scal|rais|drive|deliver|convert|recruit|onboard|nghiên|phân|đánh|xem|khảo|so|đối|đề|xác|lấy|tải|thu|tra|tìm|tạo|viết|soạn|lưu|xuất|xây|phát|thiết|triển|tính|ước|dự|vẽ|tóm|kiểm|theo|giám|dịch|liệt|xếp|chọn|tăng|gia|đạt|thu|mở|nâng|cải|thúc|chuyển|tuyển)/iu.test(rest)
       ) {
         push(obligations, "OBL", clause, {
           quantity: extractQuantity(clause),

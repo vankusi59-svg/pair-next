@@ -371,6 +371,20 @@ const ANCHOR_STOP = new Set([
   "computes", "evaluate", "evaluates", "predict", "parse", "parses",
   "validate", "verify", "describe", "explain", "plot", "plots",
   "visualize", "recommend", "suggest", "analyze",
+  // outcome/fulfillment verbs (Semantic Planning V1) — an action word
+  // sentence-initially capitalized ("Grow my channel") is never a
+  // subject identity anchor
+  "grow", "grows", "grew", "grown", "growing", "growth", "increase",
+  "increases", "increased", "increasing", "boost", "boosts", "gain",
+  "gains", "achieve", "achieves", "reach", "reaches", "attain",
+  "acquire", "acquires", "attract", "attracts", "earn", "earns",
+  "expand", "expands", "scale", "scales", "improve", "improves",
+  "raise", "raises", "drive", "drives", "convert", "converts",
+  "recruit", "recruits", "onboard", "onboards", "execute", "executes",
+  "operate", "operates", "deliver", "delivers", "launch", "launches",
+  "perform", "performs", "conduct", "conducts", "measure", "measures",
+  "quantify", "estimate", "estimates", "forecast", "forecasts",
+  "monitor", "monitors", "track", "tracks",
   // recency / shape words
   "today", "tonight", "latest", "newest", "live", "breaking", "current",
   "currently", "online", "recent", "new", "real", "time", "up", "date",
