@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -35,7 +36,7 @@ import {
   utcnow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11r6-"));
+const ROOT = mkTmpDir("pair-p11r6-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

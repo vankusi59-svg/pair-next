@@ -16,6 +16,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import type { RuntimePlannerInput } from "../pair/mission-runtime.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   canonicalPlanSemanticDigest,
@@ -36,7 +37,7 @@ import {
   TRANSPORT_IN_PROCESS,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f3-rc-"));
+const ROOT = mkTmpDir("pair-f3-rc-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

@@ -3,6 +3,7 @@
  */
 
 import { createDatabase } from "../state/database.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import type {
   InferenceClient,
   InferenceResponse,
@@ -318,7 +319,7 @@ export class MockLogger {
 // ─── Test Helpers ───────────────────────────────────────────────
 
 export function createTestDb(): AutomatonDatabase {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-test-"));
+  const tmpDir = mkTmpDir("automaton-test-");
   const dbPath = path.join(tmpDir, "test.db");
   return createDatabase(dbPath);
 }

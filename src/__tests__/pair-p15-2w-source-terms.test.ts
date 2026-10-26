@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   BusinessLayer,
   IntegrityError,
@@ -35,7 +36,7 @@ import {
   normalizeObjectiveWorkstreamProposal,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p152w-"));
+const ROOT = mkTmpDir("pair-p152w-");
 let counter = 0;
 
 function freshStack(name: string) {

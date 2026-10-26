@@ -10,6 +10,7 @@ import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { getTaskById } from "../../state/database.js";
 import { createInMemoryDb } from "./test-db.js";
 import { createTestConfig, createTestIdentity, MockComputeClient } from "../mocks.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 class SuccessHarness implements AgentHarness {
   readonly id = "success";
@@ -137,7 +138,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     SuccessHarness.capturedContext = null;
     SlowHarness.release = null;
     OrchestratorBudgetHarness.capturedBudget = null;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "local-worker-harness-home-"));
+    tempHome = mkTmpDir("local-worker-harness-home-");
   });
 
   afterEach(() => {

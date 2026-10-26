@@ -13,6 +13,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactProvenanceValidator,
   CodexCliExecutorAdapter,
@@ -41,7 +42,7 @@ const FAKE_ACP = path.resolve(__dirname, "fixtures", "fake-acp-agent.mjs");
 const FAKE_CODEX = path.resolve(__dirname, "fixtures", "fake-codex.mjs");
 const FAKE_SECRET = "P5_TEST_SECRET_VALUE_XYZ";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p5-"));
+const ROOT = mkTmpDir("pair-p5-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

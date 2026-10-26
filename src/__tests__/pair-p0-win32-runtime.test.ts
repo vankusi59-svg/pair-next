@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactDependencyResolver,
   ArtifactProvenanceValidator,
@@ -96,7 +97,7 @@ vi.mock("../pair/win32-object-io.js", async (importOriginal) => {
   };
 });
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p0-win32-"));
+const ROOT = mkTmpDir("pair-p0-win32-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

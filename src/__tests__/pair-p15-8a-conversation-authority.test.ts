@@ -19,6 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CONVERSATION_MAX_BODY_CHARS,
   CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS,
@@ -38,7 +39,7 @@ import {
   digest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158a-"));
+const ROOT = mkTmpDir("pair-p158a-");
 let counter = 0;
 const OWNER = "operator:owner-1";
 const OTHER = "operator:owner-2";

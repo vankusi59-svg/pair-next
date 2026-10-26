@@ -12,6 +12,7 @@ import { createDatabase } from "../state/database.js";
 import { getTaskById } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   AUTOMATON_HARNESS_DENIED_OPS,
   AUTOMATON_HARNESS_WORKER_KIND,
@@ -35,7 +36,7 @@ import {
 } from "../pair/index.js";
 import type { WorkerSpec } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p2-"));
+const ROOT = mkTmpDir("pair-p2-");
 
 let tmpCounter = 0;
 function freshDir(name: string): string {

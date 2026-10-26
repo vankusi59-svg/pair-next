@@ -36,6 +36,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactDependencyResolver,
   ArtifactProvenanceValidator,
@@ -66,7 +67,7 @@ import {
 } from "../pair/index.js";
 import { DeliveryProvenanceBinding } from "../pair/artifact-handoff.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-dsn1-"));
+const ROOT = mkTmpDir("pair-dsn1-");
 let dirSeq = 0;
 const freshDir = (name: string) => {
   const p = path.join(ROOT, `${dirSeq++}-${name}`);

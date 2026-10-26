@@ -25,6 +25,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -67,7 +68,7 @@ const plannerCandidateRequestBound =
     | ((c: { transport?: string }) => number)
     | undefined;
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phasec-r2-"));
+const ROOT = mkTmpDir("pair-phasec-r2-");
 let counter = 0;
 const OP = "1882810918";
 

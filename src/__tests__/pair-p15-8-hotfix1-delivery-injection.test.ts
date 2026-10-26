@@ -28,6 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   makeServeCanonicalizer,
   SERVE_LLM_PLANNER_CAPS,
@@ -403,7 +404,7 @@ describe("P15.8-HF1 delivery injection", () => {
 
 /* ============================ E2E through MissionControl ============================ */
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158hf1-"));
+const ROOT = mkTmpDir("pair-p158hf1-");
 let counter = 0;
 const OP = "1882810918";
 

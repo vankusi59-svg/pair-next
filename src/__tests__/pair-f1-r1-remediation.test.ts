@@ -17,6 +17,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactAuthority,
   ArtifactProvenanceValidator,
@@ -38,7 +39,7 @@ import {
 import { createMissionControlServer } from "../pair/mission-control-server.js";
 import type { Server } from "node:http";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f1-r1-"));
+const ROOT = mkTmpDir("pair-f1-r1-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

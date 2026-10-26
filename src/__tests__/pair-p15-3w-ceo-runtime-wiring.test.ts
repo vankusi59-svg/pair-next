@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   assignModelRole,
   BusinessLayer,
@@ -38,7 +39,7 @@ import {
   type CeoInvokeResult,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p153w-"));
+const ROOT = mkTmpDir("pair-p153w-");
 let counter = 0;
 const OP = "1882810918";
 

@@ -19,6 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 
 const REPO = path.resolve(__dirname, "../..");
 const SCRIPT = path.join(REPO, "scripts/pair-bootstrap.sh");
@@ -72,7 +73,7 @@ interface Opts {
 }
 
 function mkEnv(o: Opts): Env {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pair-boot-"));
+  const home = mkTmpDir("pair-boot-");
   const fakebin = path.join(home, "fakebin");
   const npmRoot = path.join(home, "npm-global");
   const npmBin = path.join(home, "npm-bin"); // npm global bin — separate PATH entry

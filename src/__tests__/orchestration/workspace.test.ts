@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentWorkspace, createWorkspace } from "../../orchestration/workspace.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 describe("orchestration/workspace", () => {
   const tmpRoots: string[] = [];
@@ -11,7 +12,7 @@ describe("orchestration/workspace", () => {
   let workspace: AgentWorkspace;
 
   beforeEach(() => {
-    basePath = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-test-"));
+    basePath = mkTmpDir("workspace-test-");
     tmpRoots.push(basePath);
     workspace = new AgentWorkspace("goal-1", basePath);
   });
@@ -171,7 +172,7 @@ describe("orchestration/workspace", () => {
   });
 
   it("createWorkspace uses homedir-based default path", () => {
-    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-home-"));
+    const fakeHome = mkTmpDir("workspace-home-");
     tmpRoots.push(fakeHome);
 
     vi.spyOn(os, "homedir").mockReturnValue(fakeHome);

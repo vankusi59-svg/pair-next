@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { createDatabase } from "../state/database.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   claimInboxMessages,
   markInboxProcessed,
@@ -22,7 +23,7 @@ import {
 import type { AutomatonDatabase } from "../types.js";
 
 function makeTmpDbPath(): string {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-inbox-test-"));
+  const tmpDir = mkTmpDir("automaton-inbox-test-");
   return path.join(tmpDir, "test.db");
 }
 

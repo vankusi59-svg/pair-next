@@ -13,9 +13,10 @@ import os from "os";
 import { createDatabase } from "../state/database.js";
 import { withTransaction, checkpointWAL } from "../state/database.js";
 import type { AutomatonDatabase, AgentTurn, ToolCallResult } from "../types.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 
 function makeTmpDbPath(): string {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-txn-test-"));
+  const tmpDir = mkTmpDir("automaton-txn-test-");
   return path.join(tmpDir, "test.db");
 }
 

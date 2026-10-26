@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   StructuredLogger,
   createLogger,
@@ -941,9 +942,7 @@ import {
 import type { MetricSnapshotRow } from "../types.js";
 
 function makeTmpDbPath(): string {
-  const tmpDir = fs.mkdtempSync(
-    path.join(os.tmpdir(), "automaton-observability-test-"),
-  );
+  const tmpDir = mkTmpDir("automaton-observability-test-");
   return path.join(tmpDir, "test.db");
 }
 

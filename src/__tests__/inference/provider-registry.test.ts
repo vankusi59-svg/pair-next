@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 const { openAiCtor } = vi.hoisted(() => {
   const ctor = vi.fn().mockImplementation(function MockOpenAI(this: any, options: unknown) {
@@ -31,14 +32,14 @@ import {
 const ORIGINAL_ENV = { ...process.env };
 
 function makeTempConfigFile(payload: unknown): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-registry-test-"));
+  const dir = mkTmpDir("provider-registry-test-");
   const filePath = path.join(dir, "providers.json");
   fs.writeFileSync(filePath, JSON.stringify(payload), "utf8");
   return filePath;
 }
 
 function makeMissingPath(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-registry-missing-"));
+  const dir = mkTmpDir("provider-registry-missing-");
   return path.join(dir, "does-not-exist.json");
 }
 
@@ -78,7 +79,7 @@ describe("ProviderRegistry", () => {
   });
 
   it("fromConfig keeps defaults when JSON is invalid", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-registry-invalid-"));
+    const dir = mkTmpDir("provider-registry-invalid-");
     const filePath = path.join(dir, "invalid.json");
     fs.writeFileSync(filePath, "{ not json", "utf8");
 

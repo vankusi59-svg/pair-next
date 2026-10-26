@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactProvenanceValidator,
@@ -69,7 +70,7 @@ import type {
   TelegramDeliveryIntent,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f4-"));
+const ROOT = mkTmpDir("pair-f4-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

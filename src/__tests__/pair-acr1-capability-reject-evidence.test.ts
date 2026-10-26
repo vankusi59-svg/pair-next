@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactAuthority,
   IntegrityError,
@@ -26,7 +27,7 @@ import {
   workerExecutionId,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-acr1-"));
+const ROOT = mkTmpDir("pair-acr1-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

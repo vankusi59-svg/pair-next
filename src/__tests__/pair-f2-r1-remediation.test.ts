@@ -33,6 +33,7 @@ import path from "node:path";
 import type { Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactDependencyResolver,
@@ -73,7 +74,7 @@ import {
 } from "../pair/index.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f2-r1-"));
+const ROOT = mkTmpDir("pair-f2-r1-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

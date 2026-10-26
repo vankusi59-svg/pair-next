@@ -16,6 +16,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   acpRunRoot,
   ArtifactProvenanceValidator,
@@ -54,7 +55,7 @@ const noopCompute = {
   },
 } as unknown as ComputeClient;
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p8-live-"));
+const ROOT = mkTmpDir("pair-p8-live-");
 
 // Live suite requires real DSH runtime; skip (not fail) on CI.
 const describeLive = Boolean(process.env.PAIR_DSH_HOME) ? describe : describe.skip;

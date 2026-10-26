@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   episodicSearch,
   episodicInsert,
@@ -25,7 +26,7 @@ let db: ReturnType<typeof Database>;
 let automatonDb: ReturnType<typeof createDatabase>;
 
 function makeTmpDbPath(): string {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-wildcard-test-"));
+  const tmpDir = mkTmpDir("automaton-wildcard-test-");
   return path.join(tmpDir, "test.db");
 }
 

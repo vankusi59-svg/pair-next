@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   analyzePlanFeasibility,
   canonicalPlanSemanticDigest,
@@ -16,7 +17,7 @@ import {
   PairEvidenceStore,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f3-feas-"));
+const ROOT = mkTmpDir("pair-f3-feas-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

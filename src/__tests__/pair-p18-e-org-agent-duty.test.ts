@@ -31,6 +31,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   digest,
   dutyDigest,
@@ -41,7 +42,7 @@ import {
   utcnow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p18e-duty-"));
+const ROOT = mkTmpDir("pair-p18e-duty-");
 let n = 0;
 const OP = "op:test";
 const OWNER = `operator:${OP}`;

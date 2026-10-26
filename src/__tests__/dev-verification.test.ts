@@ -6,8 +6,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
-  existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -150,7 +151,7 @@ describe("dev-verification harness V1", () => {
   });
 
   it("H. missing declared patch test → NOT_READY", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/__tests__/dev-verification.test.ts"], {
         claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
@@ -169,7 +170,7 @@ describe("dev-verification harness V1", () => {
   });
 
   it("I. failed patch-specific test → NOT_READY even when tsc/build pass", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/__tests__/dev-verification.test.ts"], {
         claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
@@ -193,7 +194,7 @@ describe("dev-verification harness V1", () => {
   });
 
   it("J. failed invariant test → NOT_READY", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/pair/serve-planner.ts"]);
       const invFiles = plan.invariantTests.map((s) =>
@@ -212,7 +213,7 @@ describe("dev-verification harness V1", () => {
   });
 
   it("K. all-required green → READY_FOR_INDEPENDENT_AUDIT", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/__tests__/dev-verification.test.ts"], {
         claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
@@ -236,7 +237,7 @@ describe("dev-verification harness V1", () => {
   });
 
   it("M. report reflects executed results — claim status comes from exit data", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/__tests__/dev-verification.test.ts"], {
         claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
@@ -337,7 +338,7 @@ describe("dev-verification harness V1 R1", () => {
     executePlan({ plan: plan as never, exec: exec as never, root });
 
   it("R1-A1. zero-match -t pattern → FAIL (never vacuous PASS)", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor([`${T}dev-verification.test.ts`], claimFor(
         [`${T}dev-verification.test.ts#NO_SUCH_TEST_PATTERN`]));
@@ -354,7 +355,7 @@ describe("dev-verification harness V1 R1", () => {
   });
 
   it("R1-A2. stale JSON from a previous selector can never be reused", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       let vitestCalls = 0;
       const exec = (_b: string, argv: string[]) => {
@@ -389,7 +390,7 @@ describe("dev-verification harness V1 R1", () => {
   });
 
   it("R1-A3. result JSON with zero executed assertions → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor([`${T}dev-verification.test.ts`],
         claimFor([`${T}dev-verification.test.ts`]));
@@ -403,7 +404,7 @@ describe("dev-verification harness V1 R1", () => {
   });
 
   it("R1-A4. non-zero exit with zero recorded failed assertions → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor([`${T}dev-verification.test.ts`],
         claimFor([`${T}dev-verification.test.ts`]));
@@ -422,7 +423,7 @@ describe("dev-verification harness V1 R1", () => {
   });
 
   it("R1-A5. malformed result JSON → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const exec = (_b: string, argv: string[]) => {
         const oi = argv.findIndex((a) =>
@@ -454,7 +455,7 @@ describe("dev-verification harness V1 R1", () => {
 
   it("R1-C1. non-empty diff without patch claim → VERIFY_PATCH_CLAIM_REQUIRED",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         expect(() =>
           verify({
@@ -470,7 +471,7 @@ describe("dev-verification harness V1 R1", () => {
 
   it("R1-C2. zero diff → typed VERIFY_EMPTY_DIFF (never certifies nothing)",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         expect(() =>
           verify({
@@ -518,7 +519,7 @@ describe("dev-verification harness V1 R1", () => {
   });
 
   it("R1-E. renamed/no-match invariant selector cannot pass vacuously", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const plan = planFor(["src/pair/plan-dataflow.ts"]); // selects -t patterns
       const { groups, verdict } = runPlan(plan,
@@ -534,7 +535,7 @@ describe("dev-verification harness V1 R1", () => {
 
   it("R1-B1. full suite requires fresh result — no JSON after run → FAIL",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         // stale leftover from a previous full run must not be reused
         writeFileSync(join(root, ".vitest-result-full.json"),
@@ -565,7 +566,7 @@ describe("dev-verification harness V1 R1", () => {
 
   it("R1-B2. registered known-baseline failure → PASS_WITH_KNOWN_BASELINE",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         const plan = planFor([`${T}dev-verification.test.ts`], claimFor(
           [`${T}pair-f4-delivery-provenance.test.ts`]));
@@ -621,7 +622,7 @@ describe("dev-verification harness V1 R2", () => {
       a[0] === "rev-parse" ? "a".repeat(40) : a[0] === "diff" ? out : "";
 
   it("R2-1. stale tracked claim from BASE → VERIFY_PATCH_CLAIM_STALE", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       writeClaim(root); // valid claim exists but NOT in the diff
       expect(() =>
@@ -636,7 +637,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-2. claim modified inside BASE..HEAD → accepted as current", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       writeClaim(root);
       const res = verify({
@@ -653,7 +654,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-3. custom --claim path not in diff → VERIFY_PATCH_CLAIM_STALE", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       writeClaim(root, "custom-claim.json");
       expect(() =>
@@ -669,7 +670,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-4. custom repo-local claim in diff → accepted", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       writeClaim(root, "custom-claim.json");
       const res = verify({
@@ -685,7 +686,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-5. outside-repo / traversal claim path → typed failure", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       for (const p of ["../evil.json", "/tmp/evil.json", "sub/../../x.json"]) {
         expect(() =>
@@ -745,7 +746,7 @@ describe("dev-verification harness V1 R2", () => {
   const CRASH = "R5.1-crash: a fault between evidence append and row write";
 
   it("R2-11. known baseline + unrelated failed assertion → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planForF4(),
@@ -763,7 +764,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-12. baseline + unaccounted suite-level failure → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planForF4(),
@@ -782,7 +783,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-13. baseline multiplicity above registered max → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planForF4(),
@@ -801,7 +802,7 @@ describe("dev-verification harness V1 R2", () => {
   });
 
   it("R2-14. baseline disappears → normal PASS (no phantom tolerance)", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planForF4(),
@@ -860,7 +861,7 @@ describe("dev-verification harness V1 R3", () => {
 
   it("R3-1. baseline + proc.status=1 (ordinary vitest fail exit) reconciles",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         const { groups, verdict } = executePlan({
           plan: planF4(),
@@ -877,7 +878,7 @@ describe("dev-verification harness V1 R3", () => {
     });
 
   it("R3-2. baseline + proc.status=2 → FAIL (abnormal exit)", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planF4(),
@@ -895,7 +896,7 @@ describe("dev-verification harness V1 R3", () => {
   });
 
   it("R3-3. baseline + proc.status=null (signal/spawn kill) → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planF4(),
@@ -911,7 +912,7 @@ describe("dev-verification harness V1 R3", () => {
   });
 
   it("R3-4. numFailedTests > parsed failures → FAIL", () => {
-    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    const root = mkTmpDir("dv-");
     try {
       const { groups, verdict } = executePlan({
         plan: planF4(),
@@ -928,7 +929,7 @@ describe("dev-verification harness V1 R3", () => {
 
   it("R3-5. numFailedTests < parsed failures → FAIL (both directions)",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      const root = mkTmpDir("dv-");
       try {
         const { groups, verdict } = executePlan({
           plan: planF4(),

@@ -18,6 +18,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   CodexCliExecutorAdapter,
@@ -65,7 +66,7 @@ const noopCompute = {
   },
 } as unknown as ComputeClient;
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p9-live-"));
+const ROOT = mkTmpDir("pair-p9-live-");
 
 // Live suite requires real vendor runtimes + credentials; skip (not fail) on CI.
 const liveEnv =

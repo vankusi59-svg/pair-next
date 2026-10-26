@@ -21,6 +21,7 @@ import path from "node:path";
 import { llmPlan, repairNetworkCapabilityBinding } from "../pair/llm-planner.js";
 import { codexPlannerPlan } from "../pair/codex-planner.js";
 import { makeServeCanonicalizer } from "../pair/serve-planner.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   extractGoalHosts,
   goalAuthorizesHost,
@@ -160,7 +161,7 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
 
     // codex transport parity
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-r3a-"));
+    const dir = mkTmpDir("pair-r3a-");
     const exe = fakeCodex(dir, [
       emitFetchTask(
         "https://144.attacker.example",

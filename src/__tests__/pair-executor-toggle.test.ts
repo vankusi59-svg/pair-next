@@ -26,6 +26,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CODEX_EXECUTOR_ID,
   DEVIN_EXECUTOR_ID,
@@ -46,7 +47,7 @@ import {
   type ExecutorAdapter,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-exec-toggle-"));
+const ROOT = mkTmpDir("pair-exec-toggle-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

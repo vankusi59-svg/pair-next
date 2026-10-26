@@ -13,6 +13,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   acpRunRoot,
   ArtifactProvenanceValidator,
@@ -53,7 +54,7 @@ const noopCompute = {
   },
 } as unknown as ComputeClient;
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p51-live-"));
+const ROOT = mkTmpDir("pair-p51-live-");
 let counter = 0;
 
 // Live suite requires real vendor runtimes + credentials; skip (not fail) on CI.

@@ -14,6 +14,7 @@ import { rememberFact } from "../memory/tools.js";
 import { SemanticMemoryManager } from "../memory/semantic.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactProvenanceValidator,
   ExperienceService,
@@ -35,7 +36,7 @@ import {
   workerFilePaths,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p4-"));
+const ROOT = mkTmpDir("pair-p4-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import type { ComputeClient } from "../../types.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
 import { createTestConfig, createTestIdentity } from "../mocks.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 function createConwayStub(overrides?: Partial<ComputeClient>): ComputeClient {
   return {
@@ -41,7 +42,7 @@ describe("agent/CodingHarness confinement", () => {
 
   beforeEach(() => {
     db = createInMemoryDb();
-    testRoot = mkdtempSync(path.join(os.tmpdir(), "coding-harness-"));
+    testRoot = mkTmpDir("coding-harness-");
   });
 
   afterEach(() => {

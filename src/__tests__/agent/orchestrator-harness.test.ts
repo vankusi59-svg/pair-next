@@ -10,6 +10,7 @@ import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { getTaskById, getTasksByGoal } from "../../state/database.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
 import { createTestConfig, createTestIdentity, MockComputeClient } from "../mocks.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 class PlannerAwareInference implements WorkerInferenceClient {
   private plannerIndex = 0;
@@ -44,7 +45,7 @@ describe("agent/OrchestratorHarness", () => {
 
   beforeEach(() => {
     db = createInMemoryDb();
-    workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "orchestrator-harness-"));
+    workspaceRoot = mkTmpDir("orchestrator-harness-");
     db.prepare(
       "INSERT INTO goals (id, title, description, status, created_at) VALUES (?, ?, ?, ?, ?)",
     ).run("goal-1", "Goal", "Goal description", "active", new Date().toISOString());

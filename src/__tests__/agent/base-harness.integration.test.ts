@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
 import { createTestConfig, createTestIdentity, MockComputeClient } from "../mocks.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 class TestHarness extends BaseHarness {
   readonly id = "test";
@@ -81,7 +82,7 @@ describe("agent/BaseHarness integration", () => {
   }
 
   function createContext(): HarnessContext {
-    tempDir = mkdtempSync(path.join(os.tmpdir(), "base-harness-"));
+    tempDir = mkTmpDir("base-harness-");
     const workspace = new AgentWorkspace("goal-1", path.join(tempDir, "workspace"));
     const db = createInMemoryDb();
     return {

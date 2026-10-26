@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { createMissionControlServer } from "../pair/mission-control-server.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -60,7 +61,7 @@ import {
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p15a2-"));
+const ROOT = mkTmpDir("pair-p15a2-");
 let counter = 0;
 const OP = "1882810918";
 const OWNER = `operator:${OP}`;

@@ -9,6 +9,7 @@
 
 import { describe, expect, it, beforeAll } from "vitest";
 import { PairEvidenceStore, PairControlPlane } from "../pair/index.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CredentialEnvSource,
   DshConfigSource,
@@ -51,7 +52,7 @@ let dir: string;
 describeLive("P6 live qualification", () => {
   beforeAll(() => {
     expect(process.env.GROQ_API_KEY).toBeTruthy();
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p6-live-"));
+    dir = mkTmpDir("pair-p6-live-");
     store = new PairEvidenceStore(path.join(dir, "pair.db"));
     service = new PairControlPlane(store);
   });

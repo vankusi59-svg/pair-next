@@ -15,6 +15,7 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   artifactDependencySetDigest,
   ArtifactProvenanceValidator,
@@ -55,7 +56,7 @@ import {
   type ExternalInputArtifactSource,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-hotfixa-"));
+const ROOT = mkTmpDir("pair-hotfixa-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

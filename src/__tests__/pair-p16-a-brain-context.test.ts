@@ -31,6 +31,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -59,7 +60,7 @@ import {
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p16a-brain-"));
+const ROOT = mkTmpDir("pair-p16a-brain-");
 let counter = 0;
 const OP = "p16a-owner";
 const OTHER = "operator:999999";

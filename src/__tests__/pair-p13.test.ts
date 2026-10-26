@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -42,7 +43,7 @@ import {
   utcnow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p13-"));
+const ROOT = mkTmpDir("pair-p13-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

@@ -17,11 +17,12 @@ import fs from "fs";
 import { SpendTracker } from "../agent/spend-tracker.js";
 import type { TreasuryPolicy, LimitCheckResult } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 
 // ─── Test Helpers ───────────────────────────────────────────────
 
 function createTestSpendDb(): Database.Database {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spend-test-"));
+  const tmpDir = mkTmpDir("spend-test-");
   const dbPath = path.join(tmpDir, "test.db");
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");

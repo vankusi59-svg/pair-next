@@ -12,6 +12,7 @@ import { createDatabase, getTaskById } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactProvenanceValidator,
   ExecutorRegistry,
@@ -34,7 +35,7 @@ import {
 } from "../pair/index.js";
 import { projectRoutableExecutors } from "../pair/routing-projection.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p3-"));
+const ROOT = mkTmpDir("pair-p3-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CodexCliExecutorAdapter,
   codexRunRoot,
@@ -42,7 +43,7 @@ import {
 } from "../pair/index.js";
 import { createMissionControlServer } from "../pair/mission-control-server.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p184-e2e-"));
+const ROOT = mkTmpDir("pair-p184-e2e-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);
