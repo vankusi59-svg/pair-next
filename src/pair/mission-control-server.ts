@@ -1102,9 +1102,12 @@ export function createMissionControlServer(
       }
       // P18.6 — approve material interpretation items minted by a
       // preview's pinned run: server-side only, bound to the pinned
-      // analysis + persisted goal text. Returns the approval row;
-      // the operator then previews the amended revision via
-      // goal_intent_approval_id.
+      // analysis + persisted goal text. The mint enforces the
+      // authenticated actor's authority over the referenced preview
+      // (READY lifecycle + operator ownership) inside the store seam.
+      // `supplied` distinguishes supplying missing information from
+      // accepting an assumption. Returns the approval row; the operator
+      // then previews the amended revision via goal_intent_approval_id.
       if (method === "POST" && p === "/api/goal-intent/approve") {
         const previewId = String(body.preview_id ?? "");
         const preview = deps.store?.tryGet("mission_plan_preview", previewId) as
@@ -1120,6 +1123,10 @@ export function createMissionControlServer(
           preview_id: previewId,
           base_goal: baseGoal,
           item_ids: Array.isArray(body.item_ids) ? body.item_ids.map(String) : [],
+          supplied:
+            body.supplied != null && typeof body.supplied === "object" && !Array.isArray(body.supplied)
+              ? (body.supplied as Record<string, unknown>)
+              : null,
           operator_id: operator ?? null,
           actor: `operator:${operatorRef(operator, p)}`,
         });
@@ -1129,6 +1136,7 @@ export function createMissionControlServer(
           analysis_digest: approval.analysis_digest,
           item_ids: approval.item_ids,
           item_statements: approval.item_statements,
+          resolutions: approval.resolutions,
           amended_goal_sha256: approval.amended_goal_sha256,
         });
       }

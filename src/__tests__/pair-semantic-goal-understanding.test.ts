@@ -9,6 +9,8 @@
  * advisory prompt block is bounded and clearly non-authoritative.
  */
 import { describe, expect, it } from "vitest";
+import http from "node:http";
+import type { Server } from "node:http";
 import path from "node:path";
 import { mkTmpDir } from "../test-utils/tmpdir.js";
 import { PairEvidenceStore } from "../pair/store.js";
@@ -27,6 +29,7 @@ import {
   verifyGoalIntentApproval,
   assertGuardedIntentConfirmed,
   latestGoalIntentSnapshot,
+  issueKeyFor,
   INTENT_BLOCK_MAX,
   type GoalIntentAnalysis,
   type IntentItem,
@@ -418,6 +421,10 @@ describe("P18.6 — GUARDED confirm gate", () => {
       [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
       goal,
     ) as unknown as Record<string, unknown>;
+  const kpiIssue = {
+    category: "missing_information",
+    issue_key: issueKeyFor({ category: "missing_information", statement: "no KPI specified" }),
+  };
   it("guarded MATERIAL/AUTHORITY_CRITICAL → fail closed; covered approval → pass", () => {
     expect(() => assertGuardedIntentConfirmed(run({ ambiguity_class: "MATERIAL" }), null)).toThrow(
       IntegrityError,
@@ -427,19 +434,24 @@ describe("P18.6 — GUARDED confirm gate", () => {
     );
     // A verified owner amendment IS the review act — but only for the
     // ambiguity it reviewed: the revision's material items must be
-    // covered by the approved statements.
+    // covered by the approved ISSUE IDENTITIES (same category + key).
     expect(() =>
       assertGuardedIntentConfirmed(
         run({ ambiguity_class: "MATERIAL", analysis: coveredAnalysis() }),
-        { approved_statements: ["no KPI specified"] },
+        { approved_issues: [kpiIssue] },
       ),
     ).not.toThrow();
-    // An approval covering a DIFFERENT concern leaves this revision's
-    // new ambiguity unresolved — approval is not generic review proof.
+    // An approval covering a DIFFERENT issue leaves this revision's
+    // ambiguity unresolved — approval is not generic review proof.
     expect(() =>
       assertGuardedIntentConfirmed(
         run({ ambiguity_class: "MATERIAL", analysis: coveredAnalysis() }),
-        { approved_statements: ["deadline extension approved"] },
+        {
+          approved_issues: [{
+            category: "missing_information",
+            issue_key: issueKeyFor({ category: "missing_information", statement: "deadline extension approved" }),
+          }],
+        },
       ),
     ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
     // AUTHORITY_CRITICAL = a live contradiction — item approval is not
@@ -447,7 +459,7 @@ describe("P18.6 — GUARDED confirm gate", () => {
     expect(() =>
       assertGuardedIntentConfirmed(
         run({ ambiguity_class: "AUTHORITY_CRITICAL" }),
-        { approved_statements: ["anything"] },
+        { approved_issues: [kpiIssue] },
       ),
     ).toThrow(IntegrityError);
   });
@@ -469,7 +481,7 @@ describe("P18.6 — GUARDED confirm gate", () => {
     expect(() =>
       assertGuardedIntentConfirmed(
         run({ ambiguity_class: "MATERIAL", analysis: null }),
-        { approved_statements: ["no KPI specified"] },
+        { approved_issues: [kpiIssue] },
       ),
     ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
   });
@@ -601,6 +613,7 @@ describe("P18.6 — replan snapshot pinning", () => {
  * owner amendment produces a new authorized revision whose preview
  * passes the same canonical gates.
  * ================================================================== */
+import { createMissionControlServer } from "../pair/mission-control-server.js";
 import {
   MissionControl,
   MissionRuntime,
@@ -1173,5 +1186,304 @@ describe("P18.6-FINAL F3 — cross-scope replan snapshot reuse", () => {
     expect(latestGoalIntentSnapshot(store, GOAL3, { project_id: "P1" })).toBeNull();
     expect(latestGoalIntentSnapshot(store, GOAL3, { work_item_id: "WI1" })).toBeNull();
     expect(latestGoalIntentSnapshot(store, GOAL3, null)).toBeNull();
+  });
+});
+
+/* ==================================================================
+ * P18.6-IDENTITY — F2 closure: false equivalence in reviewed
+ * ambiguities. Reproduces the bug class (token-overlap accepted
+ * entity/channel/quantity/project swaps as "reviewed") and pins the
+ * remediated contract: structured issue identity + explicit owner
+ * decisions + endpoint authority.
+ * ================================================================== */
+describe("P18.6-IDENTITY — issue-identity binding", () => {
+  const GOALI = "grow subscribers for the launch";
+
+  const mkGuardedRun = (
+    store: PairEvidenceStore,
+    goal: string,
+    items: IntentItem[],
+    projectId?: string,
+  ): string => {
+    const a = fakeAnalysis(items, goal);
+    if (projectId != null) a.scope = { ...a.scope, project_id: projectId };
+    const run = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a.analysis_digest, block: "b",
+        ambiguity_class: a.ambiguity.class, status: "analyzed",
+        unavailable_reason: null, model: "m", provider_id: "codex-cli",
+        provider_requests: 1, analysis_ms: 1, from_cache: false,
+        source_goal_sha: digest({ operator_goal: goal }),
+        context_digest: null, mode: "guarded",
+        analysis: a as unknown as Record<string, unknown>,
+      },
+    });
+    return String(run.planner_run_id);
+  };
+
+  const approvePreview = (
+    store: PairEvidenceStore,
+    control: MissionControl,
+    project: { project_id: unknown },
+    goal: string,
+    items: IntentItem[],
+    itemIds: string[],
+    extra: Record<string, unknown> = {},
+  ) => {
+    const runId = mkGuardedRun(store, goal, items, String(project.project_id));
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal, operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+        ...extra,
+      },
+      { planner_run_id: runId, attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: goal,
+      item_ids: itemIds, operator_id: "op1",
+      ...(extra as { supplied?: Record<string, string> }),
+    });
+    return { approval, pv };
+  };
+
+  it("identity: entity/channel/quantity/project swaps are NOT the reviewed issue", () => {
+    const { store, control, project } = makeControlCtx();
+    const approvedItem = item({
+      id: "i1", category: "missing_information",
+      statement: "no telegram subscriber target specified", confidence: "high",
+    });
+    const { approval } = approvePreview(store, control, project, GOALI, [approvedItem], ["i1"]);
+    // Every variant shares the generic "no … target specified" wording
+    // but names a DIFFERENT entity/dimension — none was reviewed.
+    const variants = [
+      "no email subscriber target specified",
+      "no youtube subscriber target specified",
+      "no telegram subscriber target of 500 specified",
+      "no telegram follower target specified",
+      "no subscriber target specified for project beta",
+    ];
+    for (const v of variants) {
+      const a2 = fakeAnalysis(
+        [item({ id: "i1", category: "missing_information", statement: v, confidence: "high" })],
+        approval.amended_goal,
+      );
+      const run2 = beginPlannerRun(store, {
+        routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+        goal_intent: {
+          analysis_digest: a2.analysis_digest, block: "b",
+          ambiguity_class: a2.ambiguity.class, status: "analyzed",
+          unavailable_reason: null, model: "m", provider_id: "codex-cli",
+          provider_requests: 1, analysis_ms: 1, from_cache: false,
+          source_goal_sha: digest({ operator_goal: approval.amended_goal }),
+          context_digest: null, mode: "guarded",
+          analysis: a2 as unknown as Record<string, unknown>,
+        },
+      });
+      const pv2 = control.createPlanPreview(
+        {
+          project_id: project.project_id, goal: GOALI,
+          operator_goal: approval.amended_goal, operator_id: "op1",
+          metadata: {
+            goal_intent_approval: {
+              approval_id: approval.approval_id,
+              revision_digest: approval.revision_digest,
+            },
+          },
+          granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+        },
+        { planner_run_id: String(run2.planner_run_id), attempts: [], winner: null, warnings: [] },
+      );
+      expect(() =>
+        control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: String(pv2.plan_digest) }),
+      ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
+    }
+    // SAME issue, generically rephrased → still covered (genuine flow).
+    const a3 = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "telegram subscriber target missing", confidence: "high" })],
+      approval.amended_goal,
+    );
+    const run3 = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a3.analysis_digest, block: "b",
+        ambiguity_class: a3.ambiguity.class, status: "analyzed",
+        unavailable_reason: null, model: "m", provider_id: "codex-cli",
+        provider_requests: 1, analysis_ms: 1, from_cache: false,
+        source_goal_sha: digest({ operator_goal: approval.amended_goal }),
+        context_digest: null, mode: "guarded",
+        analysis: a3 as unknown as Record<string, unknown>,
+      },
+    });
+    const pv3 = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOALI,
+        operator_goal: approval.amended_goal, operator_id: "op1",
+        metadata: {
+          goal_intent_approval: {
+            approval_id: approval.approval_id,
+            revision_digest: approval.revision_digest,
+          },
+        },
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(run3.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    const mission = control.confirmPlanPreview({
+      preview_id: String(pv3.preview_id), plan_digest: String(pv3.plan_digest),
+    });
+    expect(String(mission.mission_id)).toMatch(/^MSN_/);
+  });
+
+  it("decision kinds: accept-assumption vs supplied-information are distinct evidence", () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    const accepted = approvePreview(store, control, project, GOALI, [itm], ["i1"]).approval;
+    expect(accepted.amended_goal).toContain("Operator-approved: no KPI specified");
+    // A supplied decision appends the operator's OWN bounded text.
+    const supplied = approvePreview(store, control, project, GOALI, [itm], ["i1"], {
+      supplied: { i1: "KPI: 500 subscribers per week" },
+    }).approval;
+    expect(supplied.amended_goal).toContain("Operator-supplied: KPI: 500 subscribers per week");
+    expect(supplied.amended_goal).not.toContain("Operator-approved: no KPI specified");
+    // Different decision → different revision (idempotence cannot
+    // silently return the other amendment's row).
+    expect(supplied.approval_id).not.toBe(accepted.approval_id);
+    expect(supplied.revision_digest).not.toBe(accepted.revision_digest);
+    // Resolutions record the decision kind + stable issue identity.
+    const res = supplied.resolutions as Array<Record<string, unknown>>;
+    expect(res[0].decision).toBe("supplied_value");
+    expect(String(res[0].issue_key)).toContain("missing_information|");
+    const resA = accepted.resolutions as Array<Record<string, unknown>>;
+    expect(resA[0].decision).toBe("accepted_assumption");
+    expect(resA[0].issue_key).toBe(res[0].issue_key); // same issue
+    // Adversarial: supplied text for a non-approved id fails closed.
+    expect(() =>
+      approvePreview(store, control, project, GOALI, [itm], ["i1"], {
+        supplied: { i7: "smuggled value" },
+      }),
+    ).toThrow(IntegrityError);
+  });
+
+  it("endpoint authority: approval requires READY preview + bound operator", () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    // Ownership: the preview binds operator op1 — a different actor
+    // cannot approve its items.
+    const { pv } = approvePreview(store, control, project, GOALI, [itm], ["i1"]);
+    expect(() =>
+      approveGoalIntentItems(store, {
+        preview_id: String(pv.preview_id), base_goal: GOALI,
+        item_ids: ["i1"], operator_id: "op2",
+      }),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_OPERATOR/);
+    expect(() =>
+      approveGoalIntentItems(store, {
+        preview_id: String(pv.preview_id), base_goal: GOALI,
+        item_ids: ["i1"], operator_id: null,
+      }),
+    ).toThrow(/FAIL_CLOSED_OPERATOR_ID_REQUIRED/);
+    // Lifecycle: a CONSUMED preview cannot mint amendments.
+    const aHarmless = fakeAnalysis(
+      [item({ id: "i1", category: "primary_outcome", statement: GOALI })],
+      GOALI,
+    );
+    const runH = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: aHarmless.analysis_digest, block: "b",
+        ambiguity_class: "HARMLESS", status: "analyzed",
+        unavailable_reason: null, model: "m", provider_id: "codex-cli",
+        provider_requests: 1, analysis_ms: 1, from_cache: false,
+        source_goal_sha: digest({ operator_goal: GOALI }),
+        context_digest: null, mode: "guarded",
+        analysis: aHarmless as unknown as Record<string, unknown>,
+      },
+    });
+    const pvH = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOALI, operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(runH.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    control.confirmPlanPreview({ preview_id: String(pvH.preview_id), plan_digest: String(pvH.plan_digest) });
+    expect(() =>
+      approveGoalIntentItems(store, {
+        preview_id: String(pvH.preview_id), base_goal: GOALI,
+        item_ids: ["i1"], operator_id: "op1",
+      }),
+    ).toThrow(/FAIL_CLOSED_PREVIEW_STATE/);
+  });
+
+  it("endpoint /api/goal-intent/approve over HTTP: ownership + lifecycle + supplied decision", async () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    const runId = mkGuardedRun(store, GOALI, [itm], String(project.project_id));
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOALI, operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: runId, attempts: [], winner: null, warnings: [] },
+    );
+    const server: Server = createMissionControlServer({
+      control, store,
+    } as never);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    const post = (body: Record<string, unknown>, headers: Record<string, string> = {}) =>
+      new Promise<{ status: number; json: Record<string, unknown> }>((resolve, reject) => {
+        const rq = http.request(
+          { host: "127.0.0.1", port, path: "/api/goal-intent/approve", method: "POST",
+            headers: { "content-type": "application/json", ...headers } },
+          (rs) => {
+            const chunks: Buffer[] = [];
+            rs.on("data", (c: Buffer) => chunks.push(c));
+            rs.on("end", () =>
+              resolve({ status: rs.statusCode ?? 0, json: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") }),
+            );
+          },
+        );
+        rq.on("error", reject);
+        rq.end(JSON.stringify(body));
+      });
+    try {
+      // Foreign operator → 409 (preview binds op1).
+      const foreign = await post(
+        { preview_id: String(pv.preview_id), item_ids: ["i1"] },
+        { "x-operator-id": "op2" },
+      );
+      expect(foreign.status).toBe(409);
+      // Absent operator → 403 (authenticated actor required).
+      const anon = await post({ preview_id: String(pv.preview_id), item_ids: ["i1"] });
+      expect(anon.status).toBe(403);
+      // Owner + supplied decision → 200 with structured resolutions.
+      const ok = await post(
+        {
+          preview_id: String(pv.preview_id), item_ids: ["i1"],
+          supplied: { i1: "KPI: 500 subscribers per week" },
+        },
+        { "x-operator-id": "op1" },
+      );
+      expect(ok.status).toBe(200);
+      const res = ok.json.resolutions as Array<Record<string, unknown>>;
+      expect(res[0].decision).toBe("supplied_value");
+      expect(String(res[0].issue_key)).toBe(
+        issueKeyFor({ category: "missing_information", statement: "no KPI specified" }),
+      );
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 });

@@ -603,6 +603,75 @@ const APPROVABLE_AUTHORITIES = new Set<IntentAuthorityClass>([
   "UNRESOLVED",
 ]);
 
+/* ------------------------------------------------------------------
+ * P18.6-IDENTITY — stable structured issue identity.
+ *
+ * An approval must bind THE SAME material issue — same entity,
+ * dimension, quantity, scope — not merely similar wording. Token
+ * overlap alone cannot establish that: "no telegram subscriber
+ * target" and "no email subscriber target" share every generic word
+ * yet are different issues. The issue key = category + the exact
+ * discriminating token set (all content tokens minus issue-SHAPE
+ * generic words). Generic-issue vocabulary is intentionally small:
+ * words that describe the form of an ambiguity, never its subject.
+ * ------------------------------------------------------------------ */
+const ISSUE_GENERIC_TOKENS = new Set<string>([
+  // english issue-shape words
+  "no","not","missing","unspecified","specified","given","information",
+  "info","required","requirement","requirements","unclear","ambiguous",
+  "defined","provided","lack","lacks","lacking","absent","none",
+  "without","any","what","which","who","how","when","where","why",
+  "is","are","be","the","a","an","for","of","to","in","on","at","by",
+  "per","and","or","with","value","amount","detail","details","exact",
+  "specific","needed","need","must","should","would","could","can",
+  "will","target","goal","scope","set","number","count","total",
+  "current","currently","appropriate","stated","mentioned","enough",
+  // vietnamese issue-shape words (accented + unaccented forms)
+  "không","khong","chưa","chua","thiếu","thieu","thông","thong","tin",
+  "cần","can","phải","phai","được","duoc","của","cua","và","va","hoặc",
+  "hoac","cho","với","voi","trong","trên","tren","là","la","có","co",
+  "một","mot","các","cac","những","nhung","nào","nao","gì","gi","bao",
+  "nhiêu","nhieu","rõ","ro","đủ","du","xác","xac","định","dinh",
+]);
+
+/** The deterministic identity of an interpretation item's ISSUE —
+ *  `category|sorted discriminating tokens`. Two items are the same
+ *  issue iff category AND discriminating-token SET are equal; generic
+ *  rephrasing ("no KPI specified" ↔ "KPI missing") collapses to the
+ *  same key, while entity/channel/quantity/project swaps cannot. */
+export function issueKeyFor(item: {
+  category: string;
+  statement: string;
+}): string {
+  const disc = [...tokens(item.statement)]
+    .filter((t) => !ISSUE_GENERIC_TOKENS.has(t))
+    .sort();
+  return `${item.category}|${disc.join(",")}`.slice(0, 640);
+}
+
+/** An approved issue identity — the reviewable unit a resolution
+ *  binds. Derived from the pinned analysis item at verify time
+ *  (never trusted from mutable row fields). */
+export interface ApprovedIssue {
+  category: string;
+  issue_key: string;
+}
+
+/** Coverage check: a material item was reviewed iff an approved issue
+ *  carries the SAME category AND identical issue key. */
+function issueCoveredBy(
+  item: IntentItem,
+  approved: ReadonlyArray<ApprovedIssue | null | undefined>,
+): boolean {
+  const key = issueKeyFor(item);
+  return approved.some(
+    (a) =>
+      a != null &&
+      String(a.category) === item.category &&
+      String(a.issue_key) === key,
+  );
+}
+
 export interface GoalIntentApproval {
   approval_id: string;
   preview_id: string;
@@ -610,6 +679,15 @@ export interface GoalIntentApproval {
   analysis_digest: string;
   item_ids: string[];
   item_statements: string[];
+  /** Structured per-item resolutions — evidence of WHAT was decided:
+   *  `accepted_assumption` (owner acknowledges the gap persists) vs
+   *  `supplied_value` (owner provided the missing information). */
+  resolutions: Array<{
+    item_id: string;
+    statement: string;
+    issue_key: string;
+    decision: "accepted_assumption" | "supplied_value";
+  }>;
   base_goal_sha256: string;
   amended_goal: string;
   amended_goal_sha256: string;
@@ -623,12 +701,19 @@ function approvalDigest(args: {
   analysis_digest: string;
   item_ids: string[];
   base_goal_sha256: string;
+  decisions: Array<{ item_id: string; decision: string; supplied: string }>;
 }): string {
   return digest({
     schema: "pair.goal-intent-approval.v1",
     analysis_digest: args.analysis_digest,
     item_ids: [...args.item_ids].sort(),
     base_goal_sha256: args.base_goal_sha256,
+    // Decisions are part of the amendment identity — the same item set
+    // approved with a different decision/supplied text is a DIFFERENT
+    // revision (idempotent lookup can never return the wrong row).
+    decisions: args.decisions
+      .map((d) => `${d.item_id}:${d.decision}:${d.supplied}`)
+      .sort(),
   });
 }
 
@@ -642,17 +727,51 @@ export function approveGoalIntentItems(
     /** Persisted mission_input.operator_goal for the preview. */
     base_goal: string;
     item_ids: string[];
+    /** P18.6-IDENTITY — explicit owner decisions: items listed here
+     *  are resolved by SUPPLYING the missing information (the supplied
+     *  text enters the amended goal verbatim-bounded); every other
+     *  item is an ACCEPTED ASSUMPTION (owner acknowledges the gap). */
+    supplied?: Record<string, unknown> | null;
     operator_id?: string | null;
     actor?: string;
     now?: () => string;
   },
 ): GoalIntentApproval {
   return store.immediate(() => {
+    // Authenticated-actor authority (P18.6-IDENTITY): an approval is an
+    // owner decision — the actor identity is mandatory, and when the
+    // preview itself binds an operator the actor must BE that operator.
+    const operator = args.operator_id != null ? String(args.operator_id).trim() : "";
+    if (!operator) {
+      throw new PolicyError(
+        "FAIL_CLOSED_OPERATOR_ID_REQUIRED",
+        "goal-intent approval requires an authenticated operator",
+      );
+    }
     const preview = store.tryGet("mission_plan_preview", String(args.preview_id)) as
       | Record<string, unknown>
       | undefined;
     if (!preview) {
       throw new IntegrityError("FAIL_CLOSED_PREVIEW_MISSING", `preview ${args.preview_id}`);
+    }
+    // Lifecycle: only a READY preview can mint amendments — a consumed
+    // or otherwise terminal preview's evidence is settled history.
+    if (String(preview.state) !== "READY") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PREVIEW_STATE",
+        `preview ${args.preview_id} state ${String(preview.state)} is not READY`,
+      );
+    }
+    const mi = (preview.mission_input ?? {}) as Record<string, unknown>;
+    if (
+      mi.operator_id != null &&
+      String(mi.operator_id) !== "" &&
+      String(mi.operator_id) !== operator
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOAL_INTENT_OPERATOR",
+        "preview binds a different operator — approval requires the owner of the referenced preview",
+      );
     }
     const runId = preview.planner_run_id;
     if (runId == null) {
@@ -691,7 +810,19 @@ export function approveGoalIntentItems(
       );
     }
     const byId = new Map(analysis.items.map((i) => [i.id, i]));
+    const suppliedMap = (args.supplied ?? {}) as Record<string, unknown>;
+    for (const k of Object.keys(suppliedMap)) {
+      if (!itemIds.includes(k)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_GOAL_INTENT_ITEMS",
+          `supplied text references non-approved item ${k}`,
+        );
+      }
+    }
     const statements: string[] = [];
+    const resolutions: GoalIntentApproval["resolutions"] = [];
+    const amendmentLines: string[] = [];
+    const decisions: Array<{ item_id: string; decision: string; supplied: string }> = [];
     for (const id of itemIds) {
       const item = byId.get(id);
       if (!item) {
@@ -706,15 +837,40 @@ export function approveGoalIntentItems(
           `item ${id} (${item.authority}) is not an advisory interpretation`,
         );
       }
+      const suppliedRaw = suppliedMap[id];
+      const supplied = suppliedRaw != null ? clampText(suppliedRaw, INTENT_MAX_TEXT) : null;
+      if (suppliedRaw != null && (supplied == null || supplied.trim() === "")) {
+        throw new PolicyError(
+          "FAIL_CLOSED_GOAL_INTENT_ITEMS",
+          `supplied decision for ${id} requires non-empty text`,
+        );
+      }
+      const decision = supplied != null ? "supplied_value" : "accepted_assumption";
       statements.push(item.statement);
+      resolutions.push({
+        item_id: id,
+        statement: item.statement,
+        issue_key: issueKeyFor(item),
+        decision,
+      });
+      decisions.push({ item_id: id, decision, supplied: supplied ?? "" });
+      // Accepted assumption = the owner acknowledges the issue's
+      // statement; supplied value = the owner's own bounded text.
+      amendmentLines.push(
+        supplied != null
+          ? `Operator-supplied: ${supplied}`
+          : `Operator-approved: ${item.statement}`,
+      );
     }
     const revisionDigest = approvalDigest({
       analysis_digest: analysis.analysis_digest,
       item_ids: itemIds,
       base_goal_sha256: baseSha,
+      decisions,
     });
-    // Idempotent mint — the same preview + analysis + item set resolves
-    // to the same approval (no duplicate events on retry).
+    // Idempotent mint — the same preview + analysis + item set AND the
+    // same decisions resolve to the same approval (a different
+    // decision/supplied text is a DIFFERENT revision by digest).
     for (const row of store.list(GOAL_INTENT_APPROVAL_ENTITY)) {
       const r = row as unknown as GoalIntentApproval;
       if (r.revision_digest === revisionDigest && r.preview_id === args.preview_id) {
@@ -722,8 +878,7 @@ export function approveGoalIntentItems(
       }
     }
     const amended_goal =
-      `${args.base_goal.trim()}\n` +
-      statements.map((s) => `Operator-approved: ${s}`).join("\n");
+      `${args.base_goal.trim()}\n` + amendmentLines.join("\n");
     const approval: GoalIntentApproval = {
       approval_id: newId("GIA"),
       preview_id: String(args.preview_id),
@@ -731,11 +886,12 @@ export function approveGoalIntentItems(
       analysis_digest: analysis.analysis_digest,
       item_ids: itemIds,
       item_statements: statements,
+      resolutions,
       base_goal_sha256: baseSha,
       amended_goal,
       amended_goal_sha256: digest({ operator_goal: amended_goal }),
       revision_digest: revisionDigest,
-      operator_id: args.operator_id != null ? String(args.operator_id) : null,
+      operator_id: operator,
       scope: analysis.scope,
       created_at: (args.now ?? utcnow)(),
     };
@@ -769,7 +925,7 @@ export function approveGoalIntentItems(
 export function verifyGoalIntentApproval(
   store: PairEvidenceStore,
   args: { mission_input: Record<string, unknown> },
-): GoalIntentApproval {
+): GoalIntentApproval & { approved_issues: ApprovedIssue[] } {
   const mi = args.mission_input;
   const meta = (mi.metadata ?? {}) as Record<string, unknown>;
   const ref = meta.goal_intent_approval as Record<string, unknown> | undefined;
@@ -846,10 +1002,11 @@ export function verifyGoalIntentApproval(
       "approval references items absent from the pinned analysis",
     );
   }
-  // P18.6 closure — the statements the confirm gate consumes are
-  // RE-DERIVED from the pinned analysis items, never trusted from the
-  // mutable approval row: post-mint tampering of `item_statements`
-  // cannot smuggle coverage for ambiguity the owner never reviewed.
+  // P18.6 closure — the statements AND issue identities the confirm
+  // gate consumes are RE-DERIVED from the pinned analysis items, never
+  // trusted from the mutable approval row: post-mint tampering of
+  // `item_statements`/`resolutions` cannot smuggle coverage for
+  // ambiguity the owner never reviewed.
   const byId = new Map(analysis.items.map((i) => [i.id, i]));
   const derived = approval.item_ids.map((id) => String(byId.get(id)!.statement));
   if (
@@ -862,7 +1019,11 @@ export function verifyGoalIntentApproval(
       "approval item_statements inconsistent with the pinned analysis items",
     );
   }
-  return { ...approval, item_statements: derived };
+  const derivedIssues: ApprovedIssue[] = approval.item_ids.map((id) => {
+    const it = byId.get(id)!;
+    return { category: it.category, issue_key: issueKeyFor(it) };
+  });
+  return { ...approval, item_statements: derived, approved_issues: derivedIssues };
 }
 
 /** The UNRESOLVED items that drive a MATERIAL ambiguity class — the
@@ -882,21 +1043,9 @@ export function materialAmbiguityItems(
   );
 }
 
-/** Deterministic statement coverage — an item's statement is "covered"
- *  by an approved statement when it shares the reconcile threshold of
- *  content-token overlap (≥60%). Item ids are positional per-analysis,
- *  so statements are the only stable cross-revision binding. */
-function statementCoveredBy(statement: string, approvedStatements: string[]): boolean {
-  const it = tokens(statement);
-  if (!it.size) return false;
-  for (const s of approvedStatements) {
-    const st = tokens(String(s));
-    let overlap = 0;
-    for (const t of it) if (st.has(t)) overlap++;
-    if (overlap / it.size >= 0.6) return true;
-  }
-  return false;
-}
+/* (statementCoveredBy removed — P18.6-IDENTITY replaced fuzzy
+ *  token-overlap coverage with structured issue-identity matching:
+ *  `issueCoveredBy`, declared above beside `issueKeyFor`.) */
 
 /** GUARDED-mode confirm gate — the deterministic rule the mission
  *  contract requires.
@@ -910,13 +1059,15 @@ function statementCoveredBy(statement: string, approvedStatements: string[]): bo
  *  pre-stamp OFF/SHADOW provenance) gate only on the evidence's own
  *  mode, preserving backward compatibility.
  *
- *  MATERIAL resolution (P18.6 closure): a verified owner-approved
- *  amendment resolves ONLY the ambiguity it reviewed — every material-
+ *  MATERIAL resolution (P18.6-IDENTITY): a verified owner-approved
+ *  amendment resolves ONLY the issues it reviewed — every material-
  *  driving unresolved item in THIS revision's pinned analysis must be
- *  covered by an approved statement (deterministic token-overlap
- *  match). Newly introduced or materially changed ambiguity stays
- *  blocked until separately resolved. AUTHORITY_CRITICAL always fails
- *  closed. */
+ *  covered by an approved ISSUE (same category + identical
+ *  discriminating-token issue key). Entity, channel, quantity,
+ *  currency, audience, project or scope swaps are different issues —
+ *  shared generic words can never establish equivalence. Newly
+ *  introduced or materially changed ambiguity stays blocked until
+ *  separately resolved. AUTHORITY_CRITICAL always fails closed. */
 export function assertGuardedIntentConfirmed(
   run:
     | {
@@ -925,7 +1076,7 @@ export function assertGuardedIntentConfirmed(
       }
     | null
     | undefined,
-  resolution: { approved_statements?: Array<unknown> | null } | null,
+  resolution: { approved_issues?: Array<ApprovedIssue | null> | null } | null,
 ): void {
   if (run == null) {
     // P18.6 closure — a preview with NO planner-run provenance cannot
@@ -1002,8 +1153,14 @@ export function assertGuardedIntentConfirmed(
     }
     return; // HARMLESS — never gates
   }
-  const approved = (resolution?.approved_statements ?? [])
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
+  const approved = (resolution?.approved_issues ?? [])
+    .filter(
+      (a): a is ApprovedIssue =>
+        a != null &&
+        typeof a.category === "string" &&
+        typeof a.issue_key === "string" &&
+        a.issue_key.length > 0,
+    )
     .slice(0, MAX_AMENDMENT_ITEMS);
   if (!approved.length) {
     throw new IntegrityError(
@@ -1020,9 +1177,7 @@ export function assertGuardedIntentConfirmed(
       "GUARDED: MATERIAL class without enumerable material items — malformed evidence",
     );
   }
-  const uncovered = material.filter(
-    (i) => !statementCoveredBy(i.statement, approved),
-  );
+  const uncovered = material.filter((i) => !issueCoveredBy(i, approved));
   if (uncovered.length) {
     throw new IntegrityError(
       "FAIL_CLOSED_GOAL_INTENT_AMBIGUITY",

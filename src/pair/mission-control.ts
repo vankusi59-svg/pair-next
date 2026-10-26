@@ -42,6 +42,7 @@ import { operatorGoalOf } from "./goal-contract.js";
 import {
   assertGuardedIntentConfirmed,
   verifyGoalIntentApproval,
+  type ApprovedIssue,
 } from "./semantic-goal-understanding.js";
 import {
   pendingTelegramDeliveries,
@@ -1046,7 +1047,7 @@ export class MissionControl {
               String(v.preview.planner_run_id),
             ) as Record<string, unknown> | null)
           : null;
-      let approvedAmendment: { approved_statements: string[] } | null = null;
+      let approvedAmendment: { approved_issues: ApprovedIssue[] } | null = null;
       if (
         ((mi.metadata as Record<string, unknown> | undefined) ?? {})
           .goal_intent_approval != null
@@ -1056,10 +1057,10 @@ export class MissionControl {
         // the persisted goal sha + the pinned analysis that minted it,
         // so a forged or replayed reference already threw above. The
         // gate still compares THIS revision's material items against
-        // the approved statements: ambiguity the owner never reviewed
-        // stays blocked.
+        // the approved issue identities: ambiguity the owner never
+        // reviewed stays blocked.
         const approval = verifyGoalIntentApproval(this.store, { mission_input: mi });
-        approvedAmendment = { approved_statements: approval.item_statements };
+        approvedAmendment = { approved_issues: approval.approved_issues };
       }
       // The run's durably-stamped semantic_mode decides whether evidence
       // is REQUIRED (guarded) or optional (off/shadow/legacy). An
