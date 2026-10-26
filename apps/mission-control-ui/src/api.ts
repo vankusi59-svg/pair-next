@@ -93,7 +93,7 @@ export const api = {
       body: JSON.stringify({ reason: reason ?? "", scope }),
     }, { noAuthPrompt: true }),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
-    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null; coverage_report?: { verdict: string; contractDigest: string | null; rows: Array<{ requirement_id: string; kind: string; state: string; task_keys: string[] }> } | null }>("/missions/preview", {
+    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null; coverage_report?: { verdict: string; contractDigest: string | null; rows: Array<{ requirement_id: string; kind: string; state: string; task_keys: string[] }> } | null; goal_interpretation?: { analysis_digest: string | null; ambiguity_class: string | null; status: string | null; unavailable_reason: string | null; mode: string | null; items: Array<{ id: string | null; category: string | null; statement: string | null; authority: string | null; confidence: string | null; source_span: string | null; alternatives?: string[] }> } | null }>("/missions/preview", {
       method: "POST",
       body: JSON.stringify(input),
     }),

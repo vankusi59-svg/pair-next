@@ -34,6 +34,21 @@ type Pinned = {
   /* Semantic Planning V1 (G′) — deterministic coverage report the
      winning plan proved; read-only review evidence, never authority. */
   coverage_report: { verdict: string; rows: CoverageRow[] } | null;
+  /* P18.6 — pinned semantic goal-interpretation evidence (advisory
+     read model: what PAIR understood — never authority). */
+  goal_interpretation: {
+    analysis_digest: string | null;
+    ambiguity_class: string | null;
+    status: string | null;
+    unavailable_reason: string | null;
+    mode: string | null;
+    items: Array<{
+      id: string | null; category: string | null;
+      statement: string | null; authority: string | null;
+      confidence: string | null; source_span: string | null;
+      alternatives?: string[];
+    }>;
+  } | null;
   /* effective inputs pinned at preview time — any change invalidates */
   project_id: string;
   goal: string;
@@ -171,6 +186,7 @@ export function MissionNew() {
         return;
       }
       const cov = (r as { coverage_report?: unknown }).coverage_report;
+      const gi = (r as { goal_interpretation?: unknown }).goal_interpretation;
       const pinned: Pinned = {
         preview_id: String(r.preview_id),
         plan_digest: String(r.plan_digest),
@@ -183,6 +199,12 @@ export function MissionNew() {
           (cov as { verdict?: unknown }).verdict === "PASS" &&
           Array.isArray((cov as { rows?: unknown }).rows)
             ? (cov as Pinned["coverage_report"])
+            : null,
+        goal_interpretation:
+          gi &&
+          typeof gi === "object" &&
+          Array.isArray((gi as { items?: unknown }).items)
+            ? (gi as Pinned["goal_interpretation"])
             : null,
         project_id: projectId,
         goal: goal.trim(),
@@ -354,6 +376,33 @@ export function MissionNew() {
                   <span className="note mono" style={{ flex: 1 }}>
                     {r.task_keys.length ? `by ${r.task_keys.join(", ")}` : "—"}
                   </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {preview.goal_interpretation ? (
+            <div className="need">
+              <div className="nrow">
+                <span className="note mono">
+                  PairNext understood your goal — advisory interpretation evidence, never authority
+                  {preview.goal_interpretation.ambiguity_class
+                    ? ` · ambiguity: ${preview.goal_interpretation.ambiguity_class}`
+                    : ""}
+                  {preview.goal_interpretation.status === "unavailable"
+                    ? ` · unavailable: ${preview.goal_interpretation.unavailable_reason ?? "unknown"}`
+                    : ""}
+                </span>
+              </div>
+              {preview.goal_interpretation.items.map((i) => (
+                <div className="nrow" key={String(i.id)}>
+                  <code className="mono">{String(i.id ?? "")}</code>
+                  <span className="note mono">{String(i.category ?? "")}</span>
+                  <span className="note" style={{ flex: 1 }}>{String(i.statement ?? "")}</span>
+                  <StatusBadge
+                    tone={i.authority === "EXPLICIT_OPERATOR" || i.authority === "OWNER_APPROVED" ? "ok" : i.authority === "UNRESOLVED" ? "warn" : "unknown"}
+                    label={String(i.authority ?? "")}
+                  />
+                  <span className="note mono">{String(i.confidence ?? "")}</span>
                 </div>
               ))}
             </div>
