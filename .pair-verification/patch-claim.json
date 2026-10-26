@@ -1,23 +1,32 @@
 {
-  "claim_id": "SEMANTIC_V1_KPP_UNICODE_BOUNDARY_REMEDIATION",
-  "title": "K″ remediation — Unicode lookaround boundaries in DEADLINE_RE/TEMPORAL_NUM_RE/CONSTRAINT_RE/LOCAL_SOURCE_RE/output-language markers; VI durations ('trong vòng 30 giờ', 'trước 10 giờ') mint deadlines and are masked from quantity extraction — ceilings can no longer invert into floors",
+  "claim_id": "SEMANTIC_CONTEXT_PLANNING_V1_FULL",
+  "title": "Semantic & Context-Aware Planning V1 (full PR scope incl. K′/K″ remediation) — PlanningContextEnvelope advisory at async seams, deterministic EN/VI extraction + coverage, Unicode-boundary remediation, persisted coverage evidence, replan pinning",
   "affected_surfaces": [
     "PLANNER",
     "MISSION_DRAFT",
+    "RECOVERY_REPLAY",
+    "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
+    "UI",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-semantic-adversarial.test.ts",
-    "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-semantic-planning-context.test.ts",
+    "src/__tests__/pair-semantic-coverage.test.ts",
+    "src/__tests__/pair-semantic-adversarial.test.ts",
     "src/__tests__/pair-prv2b-goal-coverage.test.ts",
     "src/__tests__/pair-goal-contract-produce-binding.test.ts",
     "src/__tests__/pair-goal-context-authority.test.ts",
+    "src/__tests__/pair-planner-prompt-contract.test.ts",
     "src/__tests__/pair-planner-contract-simplify.test.ts",
-    "src/__tests__/pair-output-delivery-contract.test.ts",
+    "src/__tests__/pair-cpl1-codex-planner.test.ts",
+    "src/__tests__/pair-p18-2-planner-adaptive-retry.test.ts",
     "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-llm-planner.test.ts"
+    "src/__tests__/pair-p16-a-brain-context.test.ts",
+    "src/__tests__/pair-p16-b-reasoning-brief.test.ts",
+    "src/__tests__/pair-f3-plan-feasibility.test.ts",
+    "src/__tests__/pair-llm-planner.test.ts",
+    "src/__tests__/pair-output-delivery-contract.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
@@ -25,6 +34,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "Final independent K″ correctness audit on PR #154 HEAD 0a4e204. Root cause: JS \\b is ASCII-only, so every boundary adjacent to a non-ASCII-edged Vietnamese lexeme was dead. Fixed: (1) DEADLINE_RE — 'giờ' (ends ờ) dead in four alternations → 'trước 10 giờ'/'trong vòng 30 giờ' minted no deadline and leaked 10/30 into the bare-quantity scan (phantom floor); all \\b converted to Unicode lookarounds, phút/giây units added. (2) TEMPORAL_NUM_RE — same 'giờ' edge dead on both branches → durations masked neither on the contract side nor the task side (a task 'trong 30 giờ' could satisfy an unrelated floor); lookarounds + 'trước N <unit>' and 'ngày|tháng|day|month N' date-ordinal masks. (3) CONSTRAINT_RE — 'không quá'(á), 'chỉ'(ỉ), 'ngoại trừ'(ừ), and left-edge '<='/'≤' all dead → 'không quá 50 USD' minted no constraint and fell into the preserved-obligation backstop, inverting a ceiling into a floor. (4) LOCAL_SOURCE_RE — right-edge group 'cục bộ'(ộ)/'dữ liệu'(ệ) dead. (5) output-language markers — 'kết quả'(ả) and 'đọc'(left-edge) dead → VI source/output directive misclassification. (6) llm-planner connective counter — 'và'(à)/'sau đó'(ó) dead. Sweep script scripts/dev-verification/b-boundary-sweep.cjs audits every \\b-adjacent non-ASCII edge in src/pair; remaining flags classified as false positives (lookahead-bound digits, bare alternations by design). Adversarial probes H21–H30 prove duration numbers cannot mint quantity floors nor satisfy unrelated requirements, dead constraint/marker edges are live, and EN behavior is unchanged. Independent review follow-ups: ONLY_VI_RE auxiliary skip-chain + VI function-word stop-set so 'chỉ cần/muốn/được' no longer mint unsatisfiable onlyTerms (H31–H33); ordinal masks extended to thứ/tuần/quý/week/năm + dd/mm tails with per-unit digit bounds (H34–H36); 'giây' deadline-unit consistency (H35). Deterministic authority/fail-closed semantics preserved; no weakening of coverage checks; zero new provider invocations.",
+  "description": "Full PR #154 scope (46b05bf..HEAD) per docs/plans/2026-10-26-semantic-context-planning-v1.md + K′/K″ audit remediations. Core V1: PlanningContextEnvelope — advisory provenance-bound context snapshot (volatile-stripped digest) assembled only at the two async planner seams (planExpander + runReplanPoolGeneration), persisted as evidence, never bound into effective_input_digest/plan_digest, never a gate; deterministic EN/VI extraction + coverage extension (outcome verbs, grouped quantities, relative deadlines, prohibitions); PlanCoverageReport persisted on attempt/preview evidence + read-only UI; zero new provider invocations. K′ remediation: Unicode verb-boundary dead code (đ/í-edged lexemes → vacuous coverage), grouped-marker quantity collapse, temporal-number floors both directions, VI anchor stop-set, render-bound enforcement, trailing-connective trim, prohibition-term leak, reask staleness, UI guard. K″ remediation: ASCII \\b dead adjacent to non-ASCII-edged VI lexemes across DEADLINE_RE/TEMPORAL_NUM_RE ('trước 10 giờ'/'trong vòng 30 giờ' deadlines + duration masking both sides), CONSTRAINT_RE ('không quá'/'chỉ'/'ngoại trừ'/'<='/'≤' → ceilings can never invert into floors), LOCAL_SOURCE_RE ('cục bộ'/'dữ liệu'), output-language markers ('kết quả'/'đọc'), connective counter ('và'/'sau đó'); review follow-ups: ONLY_VI_RE auxiliary skip-chain + VI function-word stop-set ('chỉ cần/muốn/được' no longer mints unsatisfiable onlyTerms), ordinal masks (thứ/tuần/quý/week/năm + dd/mm tails, per-unit digit bounds). Adversarial probes H1–H37 + SC-1..19 + PC-1..11. Deterministic authority/fail-closed semantics preserved; no auto-merge.",
   "risk_override": "HIGH"
 }
