@@ -130,6 +130,11 @@ export function beginPlannerRun(
       source_mode?: string | null;
       analysis?: Record<string, unknown> | null;
     } | null;
+    /** P18.6 closure — the effective semantic mode durably bound at
+     *  run creation. Trustworthy provenance the swallowed-exception
+     *  path cannot lose: a "guarded"-stamped run with no pinned
+     *  goal_intent evidence fails closed at confirm. */
+    semantic_mode?: string | null;
   },
 ): Record<string, unknown> {
   return store.immediate(() => {
@@ -138,6 +143,8 @@ export function beginPlannerRun(
       planner_run_id: newId("PRN"),
       state: RUN_STATE.RUNNING,
       project_id: args.project_id != null ? String(args.project_id) : null,
+      semantic_mode:
+        args.semantic_mode != null ? String(args.semantic_mode).slice(0, 24) : null,
       operator_id: args.operator_id ?? null,
       routes: args.routes,
       planning_context_digest: args.planning_context_digest ?? null,

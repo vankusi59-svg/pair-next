@@ -480,6 +480,36 @@ const resolvePlanningContext = () => {
   });
   return planningContext;
 };
+/* P18.6 closure — the mission's FULL canonical scope lineage for
+ *  goal-intent snapshot binding: bound_open_id → work_open_binding →
+ *  work_item → {business, objective}. Strict dimension-for-dimension
+ *  equality against pinned analysis scope — a snapshot whose scope
+ *  lineage is unknown, partial or foreign is never reused. */
+const replanIntentScope = (mission) => {
+  const wi = replanWorkItemId(store, mission);
+  let business = null;
+  let objective = null;
+  if (wi != null) {
+    const row = store.tryGet("work_item", String(wi));
+    if (row != null) {
+      objective = row.objective_id != null ? String(row.objective_id) : null;
+      business = row.business_id != null ? String(row.business_id) : null;
+    }
+  }
+  return {
+    business_id: business,
+    objective_id: objective,
+    work_item_id: wi != null ? String(wi) : null,
+    project_id: mission.project_id != null ? String(mission.project_id) : null,
+  };
+};
+const normScopeDim = (v) => (v != null && String(v) !== "" ? String(v) : "");
+const intentScopeEqual = (a, b) =>
+  a != null && b != null &&
+  normScopeDim(a.business_id) === normScopeDim(b.business_id) &&
+  normScopeDim(a.objective_id) === normScopeDim(b.objective_id) &&
+  normScopeDim(a.work_item_id) === normScopeDim(b.work_item_id) &&
+  normScopeDim(a.project_id) === normScopeDim(b.project_id);
 const replanGenerationEnabled = process.env.PAIR_ASYNC_REPLAN_PROVIDER === "1";
 const replanGeneration = replanGenerationEnabled
   ? new ReplanGenerationService(store, { deadlineMs: cfgReplanGenerationDeadlineMs }, {
@@ -491,9 +521,8 @@ const replanGeneration = replanGenerationEnabled
     // replan must never silently reinterpret a failed mission.
     (mission) => {
       try {
-        const g = latestGoalIntentSnapshot(store, missionOperatorGoalOf(store, mission), {
-          project_id: mission.project_id != null ? String(mission.project_id) : null,
-        });
+        const g = latestGoalIntentSnapshot(store, missionOperatorGoalOf(store, mission),
+          replanIntentScope(mission));
         return g == null
           ? null
           : {
@@ -1402,6 +1431,11 @@ const planExpander = async (input, expandCtx) => {
     actor: "PAIR_PLANNER",
     planning_context_digest: planningEnvelope?.context_digest ?? null,
     planning_context_block: planningContextBlock || null,
+    // P18.6 closure — bind the effective semantic mode at run creation:
+    // a guarded-stamped run with no pinned evidence fails closed at
+    // confirm; a swallowed analysis/pin exception can never masquerade
+    // as a successfully-gated interpretation.
+    semantic_mode: semanticMode(),
   });
   // Phase C — the ONE run-level deadline: absolute epoch, spanning every
   // candidate's eligibility, INITIAL call, transport retries and REASK.
@@ -1630,11 +1664,24 @@ const runReplanPoolGeneration = async (gen) => {
      mission). Absent snapshot (OFF / pre-upgrade lineage / stale-goal
      snapshot whose source sha no longer binds this authority goal) →
      null. The snapshot records its OWN context digest + source mode —
-     the analysis never saw the replan request's context. */
+     the analysis never saw the replan request's context.
+     P18.6 closure — the snapshot's pinned analysis scope is re-verified
+     against the mission's canonical lineage HERE at generation time:
+     request-time binding alone never authorizes reuse — a scope that
+     drifted or was bound to another lineage forces a fresh authorized
+     analysis, never a silent replay. */
   const semMode = semanticMode();
+  const genScope = replanIntentScope(mission);
+  const genIntentScopeOk =
+    gen.goal_intent != null &&
+    intentScopeEqual(
+      (gen.goal_intent.analysis ?? {}).scope ?? null,
+      genScope,
+    );
   const genGoalIntent =
     semMode !== "off" &&
     gen.goal_intent &&
+    genIntentScopeOk &&
     typeof gen.goal_intent.analysis_digest === "string" &&
     String(gen.goal_intent.source_goal_sha ?? "") ===
       digest({ operator_goal: authorityGoal })
@@ -1667,6 +1714,7 @@ const runReplanPoolGeneration = async (gen) => {
     planning_context_digest: replanContextDigest,
     planning_context_block: replanContextBlock || null,
     goal_intent: genGoalIntent,
+    semantic_mode: semMode,
   });
   // The generation row's durable deadline bounds this run; the env
   // planner-run deadline may tighten, never widen it.
@@ -1715,12 +1763,9 @@ const runReplanPoolGeneration = async (gen) => {
         authorityGoal,
         contextDigest: replanContextDigest,
         contextBlock: replanContextBlock,
-        scope: {
-          business_id: null,
-          objective_id: null,
-          work_item_id: replanWi != null ? String(replanWi) : null,
-          project_id: mission.project_id != null ? String(mission.project_id) : null,
-        },
+        // The SAME canonical lineage the snapshot binding enforces —
+        // a fresh analysis stamps what a future replan must match.
+        scope: genScope,
         candidates,
         plannerRunId: String(run.planner_run_id),
         deadlineAt,

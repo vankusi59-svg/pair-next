@@ -409,30 +409,96 @@ describe("P18.6 — GUARDED confirm gate", () => {
   const gi = (over: Record<string, unknown>) => ({
     mode: "guarded", status: "analyzed", ambiguity_class: "HARMLESS", ...over,
   });
-  it("guarded MATERIAL/AUTHORITY_CRITICAL → fail closed; approved digest → pass", () => {
-    expect(() => assertGuardedIntentConfirmed(gi({ ambiguity_class: "MATERIAL" }), false)).toThrow(
+  const run = (
+    over: Record<string, unknown>,
+    semantic_mode: string | null = "guarded",
+  ) => ({ semantic_mode, goal_intent: gi(over) });
+  const coveredAnalysis = (goal = "g"): Record<string, unknown> =>
+    fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      goal,
+    ) as unknown as Record<string, unknown>;
+  it("guarded MATERIAL/AUTHORITY_CRITICAL → fail closed; covered approval → pass", () => {
+    expect(() => assertGuardedIntentConfirmed(run({ ambiguity_class: "MATERIAL" }), null)).toThrow(
       IntegrityError,
     );
-    expect(() => assertGuardedIntentConfirmed(gi({ ambiguity_class: "AUTHORITY_CRITICAL" }), false)).toThrow(
+    expect(() => assertGuardedIntentConfirmed(run({ ambiguity_class: "AUTHORITY_CRITICAL" }), null)).toThrow(
       IntegrityError,
     );
-    // A verified owner amendment IS the review act MATERIAL requires.
-    expect(() => assertGuardedIntentConfirmed(gi({ ambiguity_class: "MATERIAL" }), true)).not.toThrow();
+    // A verified owner amendment IS the review act — but only for the
+    // ambiguity it reviewed: the revision's material items must be
+    // covered by the approved statements.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        run({ ambiguity_class: "MATERIAL", analysis: coveredAnalysis() }),
+        { approved_statements: ["no KPI specified"] },
+      ),
+    ).not.toThrow();
+    // An approval covering a DIFFERENT concern leaves this revision's
+    // new ambiguity unresolved — approval is not generic review proof.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        run({ ambiguity_class: "MATERIAL", analysis: coveredAnalysis() }),
+        { approved_statements: ["deadline extension approved"] },
+      ),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
     // AUTHORITY_CRITICAL = a live contradiction — item approval is not
     // a remedy; only a revised goal clears it (always fail closed).
-    expect(() => assertGuardedIntentConfirmed(gi({ ambiguity_class: "AUTHORITY_CRITICAL" }), true)).toThrow(
-      IntegrityError,
-    );
-    expect(() => assertGuardedIntentConfirmed(gi({}), false)).not.toThrow();
-  });
-  it("guarded unavailable → fail closed; shadow/off evidence never gates", () => {
     expect(() =>
-      assertGuardedIntentConfirmed(gi({ status: "unavailable" }), false),
+      assertGuardedIntentConfirmed(
+        run({ ambiguity_class: "AUTHORITY_CRITICAL" }),
+        { approved_statements: ["anything"] },
+      ),
     ).toThrow(IntegrityError);
+  });
+  it("guarded run with missing/mismatched evidence → fail closed (F1)", () => {
+    // A GUARDED-stamped run with NO pinned evidence (swallowed analysis
+    // or persistence exception) can never confirm.
     expect(() =>
-      assertGuardedIntentConfirmed(gi({ mode: "shadow", ambiguity_class: "AUTHORITY_CRITICAL" }), false),
+      assertGuardedIntentConfirmed({ semantic_mode: "guarded", goal_intent: null }, null),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
+    // Evidence stamped under a different mode inside a guarded run —
+    // provenance mismatch, fail closed.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        { semantic_mode: "guarded", goal_intent: gi({ mode: "shadow" }) },
+        null,
+      ),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
+    // MATERIAL class without enumerable material items — malformed.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        run({ ambiguity_class: "MATERIAL", analysis: null }),
+        { approved_statements: ["no KPI specified"] },
+      ),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
+  });
+  it("guarded unavailable → fail closed; shadow/off/legacy provenance never gates", () => {
+    expect(() =>
+      assertGuardedIntentConfirmed(run({ status: "unavailable" }), null),
+    ).toThrow(IntegrityError);
+    // OFF/SHADOW-stamped runs carry no evidence legitimately — no gate.
+    expect(() =>
+      assertGuardedIntentConfirmed({ semantic_mode: "off", goal_intent: null }, null),
     ).not.toThrow();
-    expect(() => assertGuardedIntentConfirmed(null, false)).not.toThrow();
+    expect(() =>
+      assertGuardedIntentConfirmed({ semantic_mode: "shadow", goal_intent: null }, null),
+    ).not.toThrow();
+    // Historical run (no stamp) + shadow evidence → evidence-only.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        { semantic_mode: null, goal_intent: gi({ mode: "shadow", ambiguity_class: "AUTHORITY_CRITICAL" }) },
+        null,
+      ),
+    ).not.toThrow();
+    expect(() => assertGuardedIntentConfirmed(null, null)).not.toThrow();
+    // Historical run carrying guarded-stamped evidence still gates on it.
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        { semantic_mode: null, goal_intent: gi({ ambiguity_class: "MATERIAL" }) },
+        null,
+      ),
+    ).toThrow(IntegrityError);
   });
 });
 
@@ -658,11 +724,16 @@ describe("P18.6 — confirm-gate integration (real MissionControl seam)", () => 
     // its analysis_digest legitimately differs from the approval's. The
     // audit's dead-code repro: digest-equality gating made the designed
     // remediation path unreachable; a verified approval IS the review
-    // act MATERIAL ambiguity requires.
+    // act MATERIAL ambiguity requires — when the revision's material
+    // items are the ones the owner reviewed (statement coverage).
+    const a2 = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      approval.amended_goal,
+    );
     const run2 = intentRunRow(store, approval.amended_goal, {
-      analysis_digest: "ad-amended-2",
-      ambiguity_class: "MATERIAL",
-      analysis: null,
+      analysis_digest: a2.analysis_digest,
+      ambiguity_class: a2.ambiguity.class,
+      analysis: a2 as unknown as Record<string, unknown>,
     });
     const amendedInput = {
       project_id: project.project_id, goal: GOAL,
@@ -721,9 +792,11 @@ describe("P18.6 — replan snapshot scope binding + pin clamps", () => {
         mode: "guarded", analysis: analysisP1 as unknown as Record<string, unknown>,
       },
     });
-    // P1 scope resolves it; P2 scope refuses the P1-scoped snapshot.
-    expect(latestGoalIntentSnapshot(store, goal, { project_id: "P1" })?.analysis_digest).toBe("p1-digest");
-    expect(latestGoalIntentSnapshot(store, goal, { project_id: "P2" })).toBeNull();
+    // Full lineage resolves it; a foreign project refuses the snapshot.
+    expect(latestGoalIntentSnapshot(store, goal, SCOPE)?.analysis_digest).toBe("p1-digest");
+    expect(latestGoalIntentSnapshot(store, goal, { ...SCOPE, project_id: "P2" })).toBeNull();
+    // Under-specified request scope can never silently match it either.
+    expect(latestGoalIntentSnapshot(store, goal, { project_id: "P1" })).toBeNull();
   });
 
   it("pinPlannerRunGoalIntent clamps evidence + folds provider_requests", async () => {
@@ -823,5 +896,212 @@ describe("P18.6 — authority digests exclude interpretation evidence", () => {
     });
     expect(typeof pd).toBe("string");
     expect(pd.length).toBeGreaterThan(10);
+  });
+});
+
+/* ==================================================================
+ * P18.6 FINAL CLOSURE — adversarial probes for the three audit
+ * findings. Written against the remediated contract; they reproduce
+ * the original bypasses when run against the pre-fix code.
+ * ================================================================== */
+const GOAL_FOR_CLOSURE = "closure probe goal text";
+
+describe("P18.6-FINAL F1 — GUARDED missing-evidence bypass", () => {
+  it("guarded-stamped run with NO pinned evidence → confirm fails closed", () => {
+    const { store, control, project } = makeControlCtx();
+    // Persistence/analysis failure shape: a run created under GUARDED
+    // whose goal_intent never landed (swallowed pin exception).
+    const run = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+    });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOAL_FOR_CLOSURE,
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(run.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    expect(() =>
+      control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest) }),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_(EVIDENCE|UNAVAILABLE)/);
+    const row = store.tryGet("mission_plan_preview", String(pv.preview_id)) as Record<string, unknown> | null;
+    expect(String(row?.state)).toBe("READY"); // failed confirm never consumes
+  });
+  it("guarded-stamped run with UNAVAILABLE analysis → confirm fails closed", () => {
+    const { store, control, project } = makeControlCtx();
+    const run = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: "ad-unavail", block: "", ambiguity_class: "MATERIAL",
+        status: "unavailable", unavailable_reason: "provider_timeout",
+        model: "m", provider_id: "codex-cli", provider_requests: 1, analysis_ms: 1,
+        from_cache: false, source_goal_sha: digest({ operator_goal: GOAL_FOR_CLOSURE }),
+        context_digest: null, mode: "guarded",
+      },
+    });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOAL_FOR_CLOSURE,
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(run.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    expect(() =>
+      control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest) }),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_UNAVAILABLE/);
+  });
+  it("OFF/SHADOW-stamped runs without evidence → historical compat (no gate)", () => {
+    const { store, control, project } = makeControlCtx();
+    for (const mode of ["off", "shadow"] as const) {
+      const run = beginPlannerRun(store, {
+        routes: ["codex-cli:m"], actor: "t", semantic_mode: mode,
+      });
+      const pv = control.createPlanPreview(
+        {
+          project_id: project.project_id, goal: GOAL_FOR_CLOSURE,
+          granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+        },
+        { planner_run_id: String(run.planner_run_id), attempts: [], winner: null, warnings: [] },
+      );
+      const mission = control.confirmPlanPreview({
+        preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest),
+      });
+      expect(String(mission.mission_id)).toMatch(/^MSN_/);
+    }
+    // Legacy run (no semantic_mode stamp at all, no evidence) → P18.5 path.
+    const legacy = beginPlannerRun(store, { routes: ["codex-cli:m"], actor: "t" });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOAL_FOR_CLOSURE,
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(legacy.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    const mission = control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest),
+    });
+    expect(String(mission.mission_id)).toMatch(/^MSN_/);
+  });
+});
+
+describe("P18.6-FINAL F2 — approval only resolves the ambiguity it reviewed", () => {
+  it("verified approval + NEW uncovered unresolved item → confirm stays blocked", () => {
+    const { store, control, project } = makeControlCtx();
+    const GOAL2 = "grow subscribers in two weeks";
+    // Original analysis: one material item the owner will approve.
+    const a1 = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      GOAL2,
+    );
+    a1.scope = { ...SCOPE, project_id: String(project.project_id) };
+    const run1 = intentRunRow(store, GOAL2, {
+      analysis_digest: a1.analysis_digest, ambiguity_class: a1.ambiguity.class,
+      analysis: a1 as unknown as Record<string, unknown>,
+    });
+    const pv1 = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOAL2, operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: run1, attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv1.preview_id), base_goal: GOAL2,
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    // The AMENDED revision's analysis: the reviewed gap is re-flagged
+    // (covered) PLUS a NEW unresolved gap the owner never reviewed.
+    const a2 = fakeAnalysis(
+      [
+        item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" }),
+        item({ id: "i2", category: "missing_information", statement: "no deadline budget window", confidence: "high" }),
+      ],
+      approval.amended_goal,
+    );
+    expect(a2.ambiguity.class).toBe("MATERIAL");
+    const run2 = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a2.analysis_digest, block: "b", ambiguity_class: a2.ambiguity.class,
+        status: "analyzed", unavailable_reason: null, model: "m",
+        provider_id: "codex-cli", provider_requests: 1, analysis_ms: 1,
+        from_cache: false, source_goal_sha: digest({ operator_goal: approval.amended_goal }),
+        context_digest: null, mode: "guarded",
+        analysis: a2 as unknown as Record<string, unknown>,
+      },
+    });
+    const amendedInput = {
+      project_id: project.project_id, goal: GOAL2,
+      operator_goal: approval.amended_goal, operator_id: "op1",
+      metadata: {
+        goal_intent_approval: {
+          approval_id: approval.approval_id,
+          revision_digest: approval.revision_digest,
+          analysis_digest: approval.analysis_digest,
+        },
+      },
+      granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW" as const,
+    };
+    const pv2 = control.createPlanPreview(amendedInput, {
+      planner_run_id: String(run2.planner_run_id), attempts: [], winner: null, warnings: [],
+    });
+    expect(() =>
+      control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: String(pv2.plan_digest) }),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
+    // And a revision whose material items are ALL covered → passes.
+    const a3 = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      approval.amended_goal,
+    );
+    const run3 = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a3.analysis_digest, block: "b", ambiguity_class: a3.ambiguity.class,
+        status: "analyzed", unavailable_reason: null, model: "m",
+        provider_id: "codex-cli", provider_requests: 1, analysis_ms: 1,
+        from_cache: false, source_goal_sha: digest({ operator_goal: approval.amended_goal }),
+        context_digest: null, mode: "guarded",
+        analysis: a3 as unknown as Record<string, unknown>,
+      },
+    });
+    const pv3 = control.createPlanPreview(amendedInput, {
+      planner_run_id: String(run3.planner_run_id), attempts: [], winner: null, warnings: [],
+    });
+    const mission = control.confirmPlanPreview({
+      preview_id: String(pv3.preview_id), plan_digest: String(pv3.plan_digest),
+    });
+    expect(String(mission.mission_id)).toMatch(/^MSN_/);
+  });
+});
+
+describe("P18.6-FINAL F3 — cross-scope replan snapshot reuse", () => {
+  const GOAL3 = "cross-lineage identical goal text";
+  it("strict full-lineage binding — partial/foreign scope never reuses", () => {
+    const store = freshStore();
+    const sha = digest({ operator_goal: GOAL3 });
+    const a = fakeAnalysis([item({ statement: GOAL3, category: "primary_outcome" })], GOAL3);
+    // Snapshot produced under scope {B1,OBJ1,WI1,P1}.
+    beginPlannerRun(store, {
+      routes: [], actor: "t",
+      goal_intent: {
+        analysis_digest: "scoped-digest", block: "b", ambiguity_class: "HARMLESS",
+        status: "analyzed", unavailable_reason: null, model: "m",
+        provider_id: "codex-cli", provider_requests: 1, analysis_ms: 1,
+        from_cache: false, source_goal_sha: sha, context_digest: "ctx",
+        mode: "guarded", analysis: a as unknown as Record<string, unknown>,
+      },
+    });
+    const full = { business_id: "B1", objective_id: "OBJ1", work_item_id: "WI1", project_id: "P1" };
+    // Exact lineage → reuse.
+    expect(latestGoalIntentSnapshot(store, GOAL3, full)?.analysis_digest).toBe("scoped-digest");
+    // Any foreign dimension → never reuse.
+    expect(latestGoalIntentSnapshot(store, GOAL3, { ...full, work_item_id: "WI2" })).toBeNull();
+    expect(latestGoalIntentSnapshot(store, GOAL3, { ...full, objective_id: "OBJ2" })).toBeNull();
+    expect(latestGoalIntentSnapshot(store, GOAL3, { ...full, business_id: "B2" })).toBeNull();
+    expect(latestGoalIntentSnapshot(store, GOAL3, { ...full, project_id: "P2" })).toBeNull();
+    // Under-specified request cannot silently match a specific snapshot.
+    expect(latestGoalIntentSnapshot(store, GOAL3, { project_id: "P1" })).toBeNull();
+    expect(latestGoalIntentSnapshot(store, GOAL3, { work_item_id: "WI1" })).toBeNull();
+    expect(latestGoalIntentSnapshot(store, GOAL3, null)).toBeNull();
   });
 });

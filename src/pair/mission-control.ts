@@ -1046,10 +1046,7 @@ export class MissionControl {
               String(v.preview.planner_run_id),
             ) as Record<string, unknown> | null)
           : null;
-      const runGoalIntent = (intentRun?.goal_intent ?? null) as
-        | Record<string, unknown>
-        | null;
-      let approvedAmendment = false;
+      let approvedAmendment: { approved_statements: string[] } | null = null;
       if (
         ((mi.metadata as Record<string, unknown> | undefined) ?? {})
           .goal_intent_approval != null
@@ -1057,14 +1054,18 @@ export class MissionControl {
         // A verified owner-approved amendment on this preview's revision
         // IS the review act MATERIAL ambiguity requires — the row binds
         // the persisted goal sha + the pinned analysis that minted it,
-        // so a forged or replayed reference already threw above.
-        verifyGoalIntentApproval(this.store, { mission_input: mi });
-        approvedAmendment = true;
+        // so a forged or replayed reference already threw above. The
+        // gate still compares THIS revision's material items against
+        // the approved statements: ambiguity the owner never reviewed
+        // stays blocked.
+        const approval = verifyGoalIntentApproval(this.store, { mission_input: mi });
+        approvedAmendment = { approved_statements: approval.item_statements };
       }
-      // An amendment resolves MATERIAL ambiguity on the revision it
-      // governs; AUTHORITY_CRITICAL (a live contradiction) still fails
-      // closed — the remedy there is a revised goal, not item approval.
-      assertGuardedIntentConfirmed(runGoalIntent, approvedAmendment);
+      // The run's durably-stamped semantic_mode decides whether evidence
+      // is REQUIRED (guarded) or optional (off/shadow/legacy). An
+      // amendment resolves only the ambiguity its statements cover;
+      // AUTHORITY_CRITICAL (a live contradiction) always fails closed.
+      assertGuardedIntentConfirmed(intentRun, approvedAmendment);
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
       // validate what was pinned, never widen it. A READY preview without

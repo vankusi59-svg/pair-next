@@ -849,25 +849,93 @@ export function verifyGoalIntentApproval(
   return approval;
 }
 
+/** The UNRESOLVED items that drive a MATERIAL ambiguity class — the
+ *  same discriminator classifyAmbiguity uses (ambiguity/conflict items,
+ *  or high-confidence missing_information). A MATERIAL class with no
+ *  enumerable driving items is inconsistent evidence — callers treat
+ *  it as malformed, never as resolved. */
+export function materialAmbiguityItems(
+  analysis: GoalIntentAnalysis | null | undefined,
+): IntentItem[] {
+  const items = Array.isArray(analysis?.items) ? analysis!.items : [];
+  return items.filter(
+    (i) =>
+      i.authority === "UNRESOLVED" &&
+      (i.category === "ambiguity" || i.category === "conflict" ||
+        (i.category === "missing_information" && i.confidence === "high")),
+  );
+}
+
+/** Deterministic statement coverage — an item's statement is "covered"
+ *  by an approved statement when it shares the reconcile threshold of
+ *  content-token overlap (≥60%). Item ids are positional per-analysis,
+ *  so statements are the only stable cross-revision binding. */
+function statementCoveredBy(statement: string, approvedStatements: string[]): boolean {
+  const it = tokens(statement);
+  if (!it.size) return false;
+  for (const s of approvedStatements) {
+    const st = tokens(String(s));
+    let overlap = 0;
+    for (const t of it) if (st.has(t)) overlap++;
+    if (overlap / it.size >= 0.6) return true;
+  }
+  return false;
+}
+
 /** GUARDED-mode confirm gate — the deterministic rule the mission
- *  contract requires: a GUARDED-pinned interpretation carrying
- *  MATERIAL or AUTHORITY_CRITICAL ambiguity, or an unavailable
- *  analysis, can never be confirmed without an owner-approved
- *  amendment resolving it. OFF/SHADOW-pinned evidence and absent
- *  evidence never gate (backward-compatible; shadow is evidence-only
- *  by contract). */
+ *  contract requires.
+ *
+ *  Run-level mode binding (P18.6 closure): `semantic_mode` is stamped
+ *  durably at run creation — trustworthy provenance the swallowed-
+ *  exception path cannot lose. A run stamped "guarded" MUST carry
+ *  pinned guarded-mode evidence: missing (analysis exception or
+ *  persistence failure), mismatched-mode, unavailable or malformed
+ *  interpretation → fail closed. Legacy runs (no stamp — genuinely
+ *  pre-stamp OFF/SHADOW provenance) gate only on the evidence's own
+ *  mode, preserving backward compatibility.
+ *
+ *  MATERIAL resolution (P18.6 closure): a verified owner-approved
+ *  amendment resolves ONLY the ambiguity it reviewed — every material-
+ *  driving unresolved item in THIS revision's pinned analysis must be
+ *  covered by an approved statement (deterministic token-overlap
+ *  match). Newly introduced or materially changed ambiguity stays
+ *  blocked until separately resolved. AUTHORITY_CRITICAL always fails
+ *  closed. */
 export function assertGuardedIntentConfirmed(
-  run_goal_intent: Record<string, unknown> | null | undefined,
-  approved: boolean,
+  run:
+    | {
+        semantic_mode?: string | null;
+        goal_intent?: Record<string, unknown> | null;
+      }
+    | null
+    | undefined,
+  resolution: { approved_statements?: Array<unknown> | null } | null,
 ): void {
-  if (!run_goal_intent || run_goal_intent.mode !== "guarded") return;
-  if (run_goal_intent.status !== "analyzed") {
+  const g = run?.goal_intent ?? null;
+  const sm = run?.semantic_mode != null ? String(run.semantic_mode) : null;
+  if (sm === "guarded") {
+    if (!g) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+        "GUARDED run carries no pinned interpretation evidence — analysis or evidence persistence failed",
+      );
+    }
+    if (String(g.mode) !== "guarded") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+        `GUARDED run pinned evidence stamped '${String(g.mode)}' — provenance mismatch`,
+      );
+    }
+  } else if (g == null || String(g.mode) !== "guarded") {
+    return; // OFF/SHADOW/historical run: no guarded evidence → never gates
+  }
+  if (String(g!.status) !== "analyzed") {
     throw new IntegrityError(
       "FAIL_CLOSED_GOAL_INTENT_UNAVAILABLE",
-      `GUARDED semantic interpretation unavailable: ${String(run_goal_intent.unavailable_reason ?? "unknown")}`,
+      `GUARDED semantic interpretation unavailable: ${String(g!.unavailable_reason ?? "unknown")}`,
     );
   }
-  const cls = String(run_goal_intent.ambiguity_class);
+  const cls = String(g!.ambiguity_class);
   // AUTHORITY_CRITICAL = a live contradiction in the confirmed
   // revision — an item approval cannot resolve a contradiction; the
   // remedy is a revised goal (new preview), so this always fails closed.
@@ -877,28 +945,71 @@ export function assertGuardedIntentConfirmed(
       "GUARDED: AUTHORITY_CRITICAL ambiguity requires a revised goal — item approval cannot resolve a contradiction",
     );
   }
-  // MATERIAL = owner-reviewable ambiguity — a verified owner-approved
-  // amendment IS the review act the policy requires.
-  if (cls === "MATERIAL" && !approved) {
+  if (cls !== "MATERIAL") return; // HARMLESS — never gates
+  const approved = (resolution?.approved_statements ?? [])
+    .filter((s): s is string => typeof s === "string" && s.length > 0)
+    .slice(0, MAX_AMENDMENT_ITEMS);
+  if (!approved.length) {
     throw new IntegrityError(
       "FAIL_CLOSED_GOAL_INTENT_AMBIGUITY",
       "GUARDED: MATERIAL ambiguity requires an owner-approved amendment before confirm",
+    );
+  }
+  const analysis = g!.analysis as GoalIntentAnalysis | null | undefined;
+  const items = Array.isArray(analysis?.items) ? analysis!.items : null;
+  const material = items ? materialAmbiguityItems(analysis) : null;
+  if (!material || material.length === 0) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+      "GUARDED: MATERIAL class without enumerable material items — malformed evidence",
+    );
+  }
+  const uncovered = material.filter(
+    (i) => !statementCoveredBy(i.statement, approved),
+  );
+  if (uncovered.length) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_AMBIGUITY",
+      `GUARDED: ${uncovered.length} material ambiguity item(s) not covered by the approved resolution: ${uncovered
+        .slice(0, 4)
+        .map((i) => `${i.id}:${i.category}`)
+        .join(",")}`,
     );
   }
 }
 
 /** The latest pinned goal-intent snapshot for a given goal text —
  *  the replan seam replays the SAME interpretation (snapshot pinning,
- *  never silent reinterpretation of a failed mission). `scope`
- *  constrains the match: a snapshot whose pinned analysis carries a
- *  different non-null project scope is never replayed cross-project
- *  (identical goal text under another tenant stays isolated). */
+ *  never silent reinterpretation of a failed mission).
+ *
+ *  Scope binding (P18.6 closure): the snapshot's pinned analysis scope
+ *  must equal the requester's FULL canonical lineage — business,
+ *  objective, work_item AND project — dimension-for-dimension. An
+ *  unknown/missing snapshot dimension can never silently satisfy a
+ *  more-specific requested dimension; a scoped snapshot never leaks
+ *  into an unscoped request. Mismatch → null (caller runs an
+ *  authorized fresh analysis or fails closed — never reuses). */
 export function latestGoalIntentSnapshot(
   store: PairEvidenceStore,
   goal: string,
-  scope?: { project_id?: string | null } | null,
+  scope?:
+    | {
+        business_id?: string | null;
+        objective_id?: string | null;
+        work_item_id?: string | null;
+        project_id?: string | null;
+      }
+    | null,
 ): Record<string, unknown> | null {
   const sha = digest({ operator_goal: goal });
+  const norm = (v: unknown): string =>
+    v != null && String(v) !== "" ? String(v) : "";
+  const req = {
+    business_id: norm(scope?.business_id),
+    objective_id: norm(scope?.objective_id),
+    work_item_id: norm(scope?.work_item_id),
+    project_id: norm(scope?.project_id),
+  };
   let best: Record<string, unknown> | null = null;
   let bestTs = "";
   for (const row of store.list("planner_run")) {
@@ -908,13 +1019,19 @@ export function latestGoalIntentSnapshot(
       | undefined;
     if (!g || g.source_goal_sha !== sha || g.status !== "analyzed") continue;
     const aScope = (g.analysis as GoalIntentAnalysis | null | undefined)?.scope;
-    const reqProject = scope?.project_id != null ? String(scope.project_id) : null;
+    const snap = {
+      business_id: norm(aScope?.business_id),
+      objective_id: norm(aScope?.objective_id),
+      work_item_id: norm(aScope?.work_item_id),
+      project_id: norm(aScope?.project_id),
+    };
     if (
-      reqProject != null &&
-      aScope?.project_id != null &&
-      String(aScope.project_id) !== reqProject
+      snap.business_id !== req.business_id ||
+      snap.objective_id !== req.objective_id ||
+      snap.work_item_id !== req.work_item_id ||
+      snap.project_id !== req.project_id
     ) {
-      continue; // same goal text, different project — never replay
+      continue; // scope lineage mismatch — never replay cross-scope
     }
     const ts = String((row as Record<string, unknown>).created_at ?? "");
     if (best === null || ts > bestTs) {
