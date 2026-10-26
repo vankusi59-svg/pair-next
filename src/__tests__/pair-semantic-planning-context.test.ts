@@ -35,6 +35,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -63,7 +64,7 @@ import {
 } from "../pair/index.js";
 import { IntegrityError } from "../pair/errors.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-semantic-ctx-"));
+const ROOT = mkTmpDir("pair-semantic-ctx-");
 let counter = 0;
 const OP = "semantic-owner";
 const FUTURE = "2999-01-01T00:00:00.000Z";

@@ -47,6 +47,18 @@ export interface GoalRequirement {
   maxAmount?: number;
   /** For `only X`-bounded constraints: the explicit permitted value(s). */
   onlyTerms?: string[];
+  /** P18.5 F10 — dimensioned operator ceiling: the amount plus the
+   *  verification class it is bound to. Money ceilings check declared
+   *  task amounts; task-count ceilings check the plan's task count;
+   *  object-count ceilings check numbers bound to the same unit noun in
+   *  task instructions (and declared produced artifacts for file-like
+   *  units). A ceiling with no verifiable dimension is never minted —
+   *  the constraint stays PRESERVED rather than fabricating a bound. */
+  ceiling?: {
+    amount: number;
+    kind: "money" | "task-count" | "object-count";
+    unit?: string;
+  };
 }
 
 export interface GoalContract {
@@ -415,10 +427,100 @@ const DEADLINE_RE =
  *  constraint and fell through to the preserved-obligation backstop —
  *  a ceiling inverting into a floor. Unicode lookarounds throughout. */
 const CONSTRAINT_RE =
-  /(?<![\p{L}\p{N}])budget(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngân sách(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])tối đa(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])không quá(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])only(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ được(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngoại trừ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])except(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in (?:english|vietnamese|spanish|french|japanese)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])bằng tiếng(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:max|maximum|up to|at most)\s+\d|(?<![\p{L}\p{N}])(?:<=|≤)\s*\$?\s*\d/iu;
+  /(?<![\p{L}\p{N}])budget(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngân sách(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])tối đa(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])không quá(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])only(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ được(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngoại trừ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])except(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in (?:english|vietnamese|spanish|french|japanese)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])bằng tiếng(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:max|maximum|up to|at most|no more than|not more than|nhiều nhất|không hơn|không vượt quá)\s+\d|(?<![\p{L}\p{N}])(?:<=|≤)\s*\$?\s*\d/iu;
 
 const BUDGET_RE =
   /\bbudget\b[^\d]{0,20}(\d+(?:\.\d+)?)|\bngân sách\b[^\d]{0,20}(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)\s*(?:budget|max|tối đa)/i;
+
+/* P18.5 F10 — dimensioned ceilings. `maxAmount`/BUDGET_RE only sees the
+ *  literal "budget" phrasing, so "không quá 50 USD" / "at most 5
+ *  outputs" minted constraint rows that were recorded but never
+ *  enforceable. CEILING_RE captures EN/VI ceiling markers + grouped
+ *  numbers + an optional unit token; the unit class decides which
+ *  deterministic evidence may check the bound. Unicode lookarounds —
+ *  VI markers end on non-ASCII edges (`đa`, `á`, `t`) where `\b` dies.
+ *  One optional gap word absorbs forms like "tối đa tháng 500 đơn" so
+ *  the amount binds to the trailing object noun, not the gap word. */
+const CEILING_MARKER_ALT =
+  `at most|no more than|not more than|up to|max(?:imum)?|không quá|` +
+  `không vượt quá|nhiều nhất|không hơn|tối đa|<=|≤`;
+const CEILING_MARKER_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}])(?:${CEILING_MARKER_ALT})(?![\\p{L}\\p{N}])`,
+  "iu",
+);
+const CEILING_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}])(?:${CEILING_MARKER_ALT})\\s*` +
+    `(?:([\\$€£]|usd|vnd|đồng|dollars?|euros?|pounds?)\\s*)?` +
+    `(?:(\\p{L}+)\\s+)?` +
+    `(\\d{1,3}(?:[.,]\\d{3})+|\\d+(?:\\.\\d+)?)` +
+    `(?:\\s+([\\p{L}$€£][\\p{L}$€£]*(?:\\s+[\\p{L}$€£][\\p{L}$€£]*)?))?`,
+  "iu",
+);
+
+/** Money units → the ceiling is enforceable against declared task
+ *  amounts via the same-unit amount scan (no FX conversion). */
+const CEILING_UNIT_MONEY = new Set([
+  "$", "€", "£", "usd", "dollar", "dollars", "vnd", "đồng", "đô",
+  "đô la", "euro", "euros",
+]);
+/** Task-count units → enforceable against the plan's own task count. */
+const CEILING_UNIT_TASKS = new Set([
+  "task", "tasks", "step", "steps", "stage", "stages", "mission",
+  "missions", "tác vụ", "nhiệm vụ", "công việc", "việc", "bước",
+  "giai đoạn",
+]);
+/** Units that are NEVER count evidence — a cap on a duration,
+ *  frequency, percentage, or version is schedule/context, not an
+ *  enforceable object count. */
+const CEILING_UNIT_NEVER = new Set([
+  "day", "days", "ngày", "hour", "hours", "giờ", "minute", "minutes",
+  "phút", "second", "seconds", "giây", "week", "weeks", "tuần",
+  "month", "months", "tháng", "quý", "quarter", "quarters", "year",
+  "years", "năm", "lần", "times", "mỗi", "per", "%", "phần trăm",
+  "percent", "version", "versions", "phiên bản",
+]);
+
+function extractCeiling(
+  clause: string,
+): { amount: number; kind: "money" | "task-count" | "object-count"; unit?: string } | undefined {
+  const m = CEILING_RE.exec(clause);
+  if (!m) return undefined;
+  const amount = parseNum(m[3]);
+  if (!Number.isFinite(amount)) return undefined;
+  const pre = (m[1] ?? m[2]) ? String(m[1] ?? m[2]).toLowerCase() : undefined;
+  let unitRaw = (m[4] ?? "").trim().toLowerCase();
+  // A trailing multiword capture stops at function words — "50 USD mỗi
+  //  tháng" binds `USD`, never `usd mỗi`; "500 đơn hàng" keeps both.
+  if (unitRaw.includes(" ")) {
+    const parts = unitRaw.split(/\s+/);
+    const cut = parts.findIndex((w) => CEILING_UNIT_STOP.has(w));
+    if (cut === 0) unitRaw = "";
+    else if (cut > 0) unitRaw = parts.slice(0, cut).join(" ");
+  }
+  if (unitRaw && CEILING_UNIT_STOP.has(unitRaw)) unitRaw = "";
+  // A currency before the number types the bound regardless of what
+  // word follows it ("max $500 for hosting").
+  if (pre && CEILING_UNIT_MONEY.has(pre)) {
+    return { amount, kind: "money", unit: pre };
+  }
+  if (!unitRaw) return undefined;
+  if (CEILING_UNIT_MONEY.has(unitRaw)) {
+    return { amount, kind: "money", unit: unitRaw };
+  }
+  if (CEILING_UNIT_TASKS.has(unitRaw)) {
+    return { amount, kind: "task-count", unit: unitRaw };
+  }
+  if (CEILING_UNIT_NEVER.has(unitRaw)) return undefined;
+  return { amount, kind: "object-count", unit: unitRaw };
+}
+
+/** Function words that may follow a ceiling number without being the
+ *  bounded object — "max $500 for …" / "không quá 50 USD mỗi tháng". */
+const CEILING_UNIT_STOP = new Set([
+  "for", "the", "a", "an", "of", "in", "on", "to", "per", "each",
+  "and", "or", "và", "với", "cho", "trong", "của", "mỗi", "tổng",
+  "total", "được", "là", "thiết",
+]);
 
 /** Extension vocabulary shared by FILE_RE and the clause-split edge
  *  checks — the split guards recognize exactly the path shapes the
@@ -650,7 +752,12 @@ const BARE_NUM_VI_DOT_RE =
   /\b(\d{1,3}(?:\.\d{3})+)(?=\s*(?:người|ngày|tháng|tuần|giờ|đăng ký|đơn|lượt|tài khoản|thành viên|khách|đơn hàng|bài|file|video|sản phẩm|usd|vnd|đồng))\b/iu;
 
 function parseNum(raw: string): number {
-  return Number(raw.replace(/[,.]/g, ""));
+  /* Grouped thousands ("1,000"/"1.000") strip separators; a lone decimal
+   *  point ("2.5"/"9.99") is a magnitude, not grouping — stripping it
+   *  would inflate the bound ×10–100. */
+  return /^\d{1,3}([.,]\d{3})+$/.test(raw)
+    ? Number(raw.replace(/[.,]/g, ""))
+    : Number(raw);
 }
 
 /** Tokens that may appear inside a prohibition clause but are not the
@@ -932,13 +1039,31 @@ export function extractGoalContract(goal: string): GoalContract {
         quantity: extractQuantity(clause),
       });
     }
-    if (CONSTRAINT_RE.test(clause)) {
+    const ceiling = extractCeiling(clause);
+    if (CONSTRAINT_RE.test(clause) || ceiling !== undefined) {
       const bm = BUDGET_RE.exec(clause);
-      const maxAmount = bm ? Number(bm[1] ?? bm[2] ?? bm[3]) : undefined;
+      const maxAmount =
+        (bm ? Number(bm[1] ?? bm[2] ?? bm[3]) : undefined) ??
+        (ceiling?.kind === "money" ? ceiling.amount : undefined);
       const onlyTerms = extractOnlyTerms(clause);
+      const cq = extractQuantity(clause);
+      /* F10 — a ceiling-shaped clause can still carry a bare-scan `min`
+       *  ("tối đa tháng 500 đơn hàng" → min:500). A ceiling is never a
+       *  floor — strip `min` wherever an enforceable ceiling or budget
+       *  bound was extracted so recorded quantity metadata cannot
+       *  invert the operator's direction. */
+      if (
+        cq &&
+        (ceiling !== undefined ||
+          maxAmount !== undefined ||
+          CEILING_MARKER_RE.test(clause))
+      ) {
+        delete cq.min;
+      }
       push(constraints, "CON", clause, {
-        quantity: extractQuantity(clause),
+        quantity: cq && (cq.min !== undefined || cq.max !== undefined) ? cq : undefined,
         ...(maxAmount !== undefined ? { maxAmount } : {}),
+        ...(ceiling ? { ceiling } : {}),
         ...(onlyTerms ? { onlyTerms } : {}),
       });
     }
@@ -997,15 +1122,14 @@ export function extractGoalContract(goal: string): GoalContract {
           (extractQuantity(c) !== undefined || DEADLINE_RE.test(c)),
       )
       .sort((a, b) => b.length - a.length)[0];
-    if (shaped) {
-      /* K″ review F4 — a constraint-shaped preserved clause ("budget
-       *  max $500…", "tối đa tháng 500 đơn") must never promote its
-       *  bare number to a floor: keep `max`, drop `min`, else the
-       *  ceiling inverts into a floor the plan must reach. */
-      const q = extractQuantity(shaped);
-      if (q && CONSTRAINT_RE.test(shaped)) delete q.min;
+    /* P18.5 F10 — a constraint-shaped unclassified clause already minted
+     *  a verbatim CON row carrying its bound; re-preserving it as an
+     *  obligation only double-counts and can trap coverage on a bound
+     *  the task could never restate ("tối đa 3 ngày"). Skip those here —
+     *  the CON row remains the authoritative record. */
+    if (shaped && !CONSTRAINT_RE.test(shaped) && !CEILING_MARKER_RE.test(shaped)) {
       push(obligations, "OBL", shaped, {
-        quantity: q && (q.min !== undefined || q.max !== undefined) ? q : undefined,
+        quantity: extractQuantity(shaped),
       });
     }
   }

@@ -288,6 +288,26 @@ function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
     const nums = quantityNums(t);
     if (!nums.length || Math.max(...nums) < req.quantity.min) return false;
   }
+  /* F10 — a ceiling-shaped quantity bound is contradicted by evidence
+   *  exceeding it, but only numbers bound to the obligation's OWN
+   *  subject nouns may speak ("port 8080" / "version 2" never violate
+   *  and never satisfy a bound). For a max-only obligation the bound
+   *  is unverifiable when the covering task carries no subject-bound
+   *  number at all — it then fails closed rather than minting a
+   *  proven-row on an unverified hard limit. For the exact form
+   *  (min===max) the min check above already demands magnitude ≥, so
+   *  exceeding bound evidence is what must be rejected. */
+  if (req.quantity?.max !== undefined) {
+    const bound = amountsBoundToSubject(t, req);
+    if (bound.some((n) => n > (req.quantity?.max ?? Infinity))) return false;
+    if (req.quantity.min === undefined && bound.length === 0) {
+      const hasNouns = [
+        ...subjectAnchors(req.text),
+        ...externalSubjectKeys(req.text),
+      ].some((n) => n.length >= 3);
+      if (hasNouns) return false;
+    }
+  }
   return true;
 }
 
@@ -312,13 +332,86 @@ function taskProducesDeliverable(task: Record<string, unknown>, name: string): b
 /* ------------------------------------------------------------------ */
 
 /** Checkable task amounts — common explicit forms of the SAME unit the
- *  constraint states (`$50` ≡ `50 USD` ≡ `USD 50`; no conversion). */
+ *  constraint states (`$50` ≡ `50 USD` ≡ `USD 50`; no conversion).
+ *  P18.5 F10: extended to `vnd`/`đồng`/`dollar`/`euro` forms; Unicode
+ *  lookarounds because `đồng`/`ồ` edges kill ASCII `\b` (K″ rule). */
 const TASK_AMOUNT_RES = [
   /\$\s*(\d+(?:\.\d+)?)/g,
-  /\b(\d+(?:\.\d+)?)\s*usd\b/gi,
-  /\busd\s*(\d+(?:\.\d+)?)/gi,
+  /(?<![\p{L}\p{N}])(\d+(?:\.\d+)?)\s*(usd|vnd|đồng|đô(?:\s+la)?|dollars?|euros?|€|£|pounds?|gbp)(?![\p{L}\p{N}])/giu,
+  /(?<![\p{L}\p{N}])(usd|vnd|đồng|đô(?:\s+la)?|dollars?|euros?|€|£|pounds?|gbp)\s*(\d+(?:\.\d+)?)(?![\p{L}\p{N}])/giu,
 ];
+
+/** Currency token → canonical currency. A bound in VND can never be
+ *  satisfied or violated by USD evidence — no FX conversion is ever
+ *  fabricated (audit F3). */
+function canonCurrency(tok: string | undefined): string {
+  const t = (tok ?? "").toLowerCase();
+  if (/^(usd|dollars?|\$|đô(\s+la)?)$/.test(t)) return "usd";
+  if (/^(vnd|đồng)$/.test(t)) return "vnd";
+  if (/^(euros?|€)$/.test(t)) return "eur";
+  if (/^(gbp|pounds?|£)$/.test(t)) return "gbp";
+  return t;
+}
+
+/* P18.5 F10 — numbers bound to a named unit noun in task text. Only a
+ *  `NUM <unit>` adjacency counts — a stray number ("port 8080",
+ *  "version 2") is never allowed to satisfy or violate a bound. Up to
+ *  two modifier words may intervene ("5 technical reports", "3 new
+ *  files") — the natural LLM restatement shape — but a gap can never
+ *  contain another number or detach the noun entirely. */
+function amountsBoundTo(instr: string, unit: string): number[] {
+  const words = unit
+    .split(/\s+/)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .map((w) =>
+      /s$/.test(w)
+        ? `${w.replace(/e?s$/, "")}(?:e?s)?`
+        : `${w}(?:e?s)?`,
+    );
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}])(\\d{1,3}(?:[.,]\\d{3})+|\\d{1,9})\\s+(?:(?!\\d)[\\p{L}]+\\s+){0,2}${words.join("\\s+")}(?![\\p{L}\\p{N}])`,
+    "giu",
+  );
+  const out: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(instr))) {
+    const raw = m[1];
+    out.push(
+      raw.includes(",") || raw.includes(".")
+        ? Number(raw.replace(/[.,]/g, ""))
+        : Number(raw),
+    );
+  }
+  return out;
+}
+
+/** Subject-bound numbers: digits adjacent to the requirement's own
+ *  subject nouns — the only magnitude evidence that may speak for or
+ *  against a `quantity.max` obligation. */
+function amountsBoundToSubject(
+  instr: string,
+  req: GoalRequirement,
+): number[] {
+  const nouns = new Set<string>([
+    ...subjectAnchors(req.text),
+    ...externalSubjectKeys(req.text),
+  ]);
+  const out: number[] = [];
+  for (const n of nouns) {
+    if (n.length >= 3) out.push(...amountsBoundTo(instr, n));
+  }
+  return out;
+}
 const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
+
+/* F10 — object-count ceilings on file-like units can also read the
+ *  plan's declared produced artifacts (canonical dataflow) as
+ *  evidence — "at most 5 outputs" vs a plan producing 6 files. */
+const FILE_COUNT_UNITS = new Set([
+  "file", "files", "output", "outputs", "deliverable", "deliverables",
+  "artifact", "artifacts", "report", "reports", "báo cáo", "document",
+  "documents",
+]);
 
 /* ------------------------------------------------------------------ */
 /* prohibition enforcement — action-gated, object-scoped                */
@@ -518,12 +611,20 @@ function violatesOnlyConstraint(instr: string, onlyTerms: string[]): string | nu
   return null;
 }
 
-function instructionAmounts(instr: string): number[] {
-  const out: number[] = [];
-  for (const re of TASK_AMOUNT_RES) {
-    re.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(instr)) !== null) out.push(Number(m[1]));
+function instructionAmounts(instr: string): { value: number; cur: string }[] {
+  const out: { value: number; cur: string }[] = [];
+  TASK_AMOUNT_RES[0].lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TASK_AMOUNT_RES[0].exec(instr)) !== null) {
+    out.push({ value: Number(m[1]), cur: "usd" });
+  }
+  TASK_AMOUNT_RES[1].lastIndex = 0;
+  while ((m = TASK_AMOUNT_RES[1].exec(instr)) !== null) {
+    out.push({ value: Number(m[1]), cur: canonCurrency(m[2]) });
+  }
+  TASK_AMOUNT_RES[2].lastIndex = 0;
+  while ((m = TASK_AMOUNT_RES[2].exec(instr)) !== null) {
+    out.push({ value: Number(m[2]), cur: canonCurrency(m[1]) });
   }
   return out;
 }
@@ -647,28 +748,86 @@ export function assertPlanCoverage(
     rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: hits });
   }
   for (const req of contract.constraints) {
-    // Bounded direct validation only where the constraint exposes a
-    // checkable quantity (e.g. a budget ceiling): a task instruction
-    // asserting a larger explicit amount is a proven contradiction.
-    if (req.maxAmount !== undefined) {
-      let sawAmount = false;
+    /* P18.5 F10 — dimensioned ceilings. A ceiling is only enforceable
+     *  where deterministically verifiable plan evidence exists:
+     *   - money: amounts declared in task instructions in the same
+     *     currency class (no FX conversion);
+     *   - task-count: the plan's own task count;
+     *   - object-count: numbers bound to the ceiling's unit noun in
+     *     task instructions (plus declared produced artifacts for
+     *     file-like units).
+     *  Evidence above the bound → VIOLATION (fail closed); evidence at
+     *  or below → PROVEN; no evidence → PRESERVED, never fabricated.
+     *  An unrelated number can neither satisfy nor violate a bound. */
+    /* Bound dimensions are evaluated INDEPENDENTLY — a clause carrying
+     *  `budget $500 max 3 files` owes evidence to both; a money ceiling
+     *  with a typed unit supersedes the unit-less maxAmount only for the
+     *  money dimension (audit F4). The row is PROVEN only when every
+     *  enforceable dimension is proven; a dimension with no evidence
+     *  keeps the row PRESERVED; explicit overage always VIOLATES. */
+    const ceil = req.ceiling;
+    const moneyDims: { amount: number; cur?: string }[] = [];
+    if (req.maxAmount !== undefined && ceil?.kind !== "money") {
+      moneyDims.push({ amount: req.maxAmount });
+    }
+    if (ceil?.kind === "money") {
+      moneyDims.push({ amount: ceil.amount, cur: canonCurrency(ceil.unit) });
+    }
+    let proven = true;
+    let enforceable = false;
+    for (const dim of moneyDims) {
+      enforceable = true;
+      let saw = false;
       for (const t of work) {
         const instr = String(t.task_instruction ?? "");
         for (const amt of instructionAmounts(instr)) {
-          sawAmount = true;
-          if (amt > req.maxAmount) {
-            violated(req, `task ${String(t.task_key)} asserts amount ${amt} > budget ${req.maxAmount}`);
+          if (dim.cur !== undefined && amt.cur !== dim.cur) continue;
+          saw = true;
+          if (amt.value > dim.amount) {
+            violated(req, `task ${String(t.task_key)} asserts amount ${amt.value} ${amt.cur} > bound ${dim.amount}${dim.cur ? ` ${dim.cur}` : ""}`);
           }
         }
       }
-      // No checkable amount → preserved, never claimed proven.
-      rows.push({
-        requirement_id: req.id,
-        kind: req.kind,
-        state: sawAmount ? "PROVEN" : "PRESERVED",
-        task_keys: [],
-      });
-      continue;
+      if (!saw) proven = false;
+    }
+    if (ceil?.kind === "task-count") {
+      enforceable = true;
+      // The plan's own task count is the bound's evidence — an
+      // operator cap of N tasks is contradicted by scheduling N+1.
+      if (work.length > ceil.amount) {
+        violated(req, `plan schedules ${work.length} tasks > ceiling ${ceil.amount} (${ceil.unit ?? "tasks"})`);
+      }
+    } else if (ceil?.kind === "object-count") {
+      enforceable = true;
+      // Bound numbers adjacent to the unit noun are summed plan-wide —
+      // two tasks declaring "4 files" each DO exceed "at most 5". For
+      // file-like units declared produced artifacts also count.
+      let saw = false;
+      let total = 0;
+      for (const t of work) {
+        const instr = String(t.task_instruction ?? "");
+        for (const amt of amountsBoundTo(instr, ceil.unit ?? "")) {
+          saw = true;
+          total += amt;
+        }
+      }
+      if (FILE_COUNT_UNITS.has(ceil.unit ?? "")) {
+        for (const t of work) {
+          try {
+            const n = extractTaskDataflow(t).produces.length;
+            if (n > 0) {
+              saw = true;
+              total += n;
+            }
+          } catch {
+            /* unparseable dataflow → no artifact evidence */
+          }
+        }
+      }
+      if (saw && total > ceil.amount) {
+        violated(req, `plan evidence declares ${total} ${ceil.unit} > ceiling ${ceil.amount}`);
+      }
+      if (!saw) proven = false;
     }
     // `only X` bounds: a mandatory bounded constraint may not be
     // silently dropped — the permitted value must be carried into the
@@ -697,10 +856,15 @@ export function assertPlanCoverage(
         ),
       );
       if (!satisfied) incomplete(req);
+      // A numeric dimension that stayed unverified still cannot claim
+      // PROVEN — the bound is only half-discharged.
+      if (!enforceable) proven = true;
+    }
+    if (enforceable || req.onlyTerms?.length) {
       rows.push({
         requirement_id: req.id,
         kind: req.kind,
-        state: "PROVEN",
+        state: proven ? "PROVEN" : "PRESERVED",
         task_keys: [],
       });
       continue;

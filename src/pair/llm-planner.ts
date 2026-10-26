@@ -406,6 +406,9 @@ const ANCHOR_STOP = new Set([
   "filesystem", "monorepo", "source", "open",
   // quantity bounds — modifiers, never subject identity
   "least", "most", "min", "max", "minimum", "maximum", "fewer",
+  "exactly", "exact", "more", "less", "fewest", "đúng", "chính",
+  "xác", "tối", "đa", "quá", "vượt", "hơn", "nhất", "nhiều",
+  "không", "ngoài", "trên", "dưới",
   // K′ audit — clause-initial connectives orphaned by a prohibition
   // split ("Research crypto but…") or leading a subordinate clause are
   // syntax, never subject identity; the ±2 context-anchor scan used to
