@@ -150,3 +150,16 @@ as its predecessor merges (stacked chain).
 - `staging/pr59-safe` → `main` via PR **#146** (`d0d50dd`): the complete P16-P18 governed autonomy program now lives on the repo default branch.
 - Open PRs remaining: 0. Merged: #134-#146.
 - Local feat/* branches remain for archaeology; remote feature branches left undeleted (owner may clean).
+
+## Semantic & Context-Aware Planning V1 — feat/semantic-context-planning-v1 (READY_FOR_INDEPENDENT_AUDIT 2026-10-26)
+- BASE `46b05bf` (main @ P18.4 #153 merge) → HEAD `b2e85b5`, 7 commits. Plan: `docs/plans/2026-10-26-semantic-context-planning-v1.md` + architecture map (codex-planner review verdict SOUND_WITH_ADJUSTMENTS, M1–M8 applied).
+- `PlanningContextEnvelope` (`src/pair/planning-context.ts`): advisory evidence class only — CANONICAL/PROVEN/PROJECTED/UNVERIFIED sections, volatile-stripped digest, ≤4096-char render. Assembled lazily at the two async seams (`planExpander`, `runReplanPoolGeneration` via `invokePlannerPool`); replan pins `planning_context_block`+digest on the durable `replan_generation` row; fresh paths render live. Assembly failure → context-free planning, null evidence. Never bound into `plan_digest`/`effective_input_digest`.
+- Deterministic EN/VI extension (`goal-contract.ts`): outcome verbs (grow/tăng/đạt/thu hút…), grouped quantities (`1,000`/`1.000`), relative deadlines (`within N days`/`trong vòng N ngày`), `without`→prohibition, guarded comma split.
+- Coverage (`plan-coverage.ts`): outcome obligations need fulfillment-verb tasks — preparation verbs (research/write/draft…) can never satisfy "grow a channel"; quantity floor compares magnitudes; `assertPlanCoverage` remains sole authority, `pair_coverage` stays advisory (forgery/non-claimable → fail closed).
+- Evidence: coverageSink per attempt → sanitized PlanCoverageReport on planner_attempt → copied to preview row → `/api/plan-previews/:id` + preview response + read-only MissionNew UI block.
+- Both transports share the canonical prompt builder; `planningContextBlock`+`rejectionContext` threaded identically; codex strict schema carries no advisory props. Zero new provider invocations (cost envelope untouched).
+- Tests: 9/9 context + 13/13 coverage + 20/20 adversarial (H1–H20) + 244/244 planner regression sweep.
+- Real-model E2E (codex AUTH_OK, `scripts/dev-verification/semantic-real-e2e.mjs`): `2_PASS_3_FAIL_CLOSED_0_OTHER`; E2E-2 demonstrated INITIAL:FAIL_CLOSED → REASK:CANONICAL_PASS governed retry; remaining fails are correct conservative governance (unbound dataflow, unauthorized network source, prohibited-term). Report: `docs/e2e-semantic-v1/REAL_PLANNER_E2E_REPORT.*`.
+- verify:change --base 46b05bf → **READY_FOR_INDEPENDENT_AUDIT**: claim 14/14, invariants 9/9, regression 48/48, TSC+BUILD PASS, full suite PASS_WITH_KNOWN_BASELINE (+133). NOTE: run requires ambient `PAIR_DSH_*`/`AGNES_API_KEY`/`PAIR_PLANNER_*` host env unset — ambient env adds 2 env-driven p5 failures over baseline budget (harness/host-env interaction, not production).
+- Windows baselines confirmed: covmap T9/T11 `.cjs` spawn EFTYPE; p5 `.local` PATH-mask misses `AppData\Local`; win32 /proc/self/fd artifact baselines — all verified BASE==HEAD.
+- Next: K′ three-scope independent audit → owner-reviewable PR (no auto-merge).
