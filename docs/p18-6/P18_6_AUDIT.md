@@ -280,3 +280,28 @@ cross-project generic wording passed confirm unreviewed.
 - Genuine approve->amend->re-preview->confirm E2E preserved — generic
   rephrasing of the same issue still covers.
 - `npx tsc --noEmit` clean.
+
+### Round-3 audit residuals — all RE-FIXED (independent re-audit: SHIP)
+
+- **MEDIUM — sub-3-char token blindness:** `issueKeyFor` now uses a
+  dedicated `issueTokens()` (len>=2 + single-char numerics) instead of
+  the reconciliation-tuned `tokens()` — `v2`/`v3`, `us`/`eu`, `50`/`90`,
+  `phase ii`/`iv`, `5`/`9` swaps all produce distinct keys.
+- **LOW — wh-dimension filter:** what/which/who/how/when/where/why +
+  VN equivalents stay discriminating — "when to deploy" != "where to
+  deploy".
+- **LOW — empty discriminating set:** falls back to the normalized
+  statement — content-free statements never cross-cover; identical
+  statements still cover.
+- **LOW — resolutions[] asymmetry:** verify re-derives statement +
+  issue_key AND requires bijective item_ids plus the exact amended-goal
+  line per decision (`Operator-approved:`/`Operator-supplied: <text>`);
+  flips and forgeries fail closed.
+- **LOW — READY ordering:** lifecycle is a mint precondition AFTER the
+  idempotent lookup — response-lost retry returns the minted row; new
+  mint on a consumed preview fails closed. Operator-ownership still
+  precedes the lookup (no authz regression).
+
+Upgrade note: approvals minted between the tokenizer change and this
+fix hold stale issue_keys and fail closed at verify — re-approval
+required (pre-merge only; no production exposure).
