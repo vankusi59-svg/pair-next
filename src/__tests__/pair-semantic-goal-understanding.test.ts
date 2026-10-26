@@ -473,6 +473,76 @@ describe("P18.6 — GUARDED confirm gate", () => {
       ),
     ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
   });
+  it("hardening: HARMLESS stamp with material items / unknown class / run-less under guarded env → fail closed", () => {
+    // Crafted evidence: HARMLESS class but the pinned analysis carries
+    // material-driving UNRESOLVED items → integrity violation.
+    const aCrafted = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      "g",
+    );
+    expect(aCrafted.ambiguity.class).toBe("MATERIAL");
+    expect(() =>
+      assertGuardedIntentConfirmed(
+        run({ ambiguity_class: "HARMLESS", analysis: aCrafted as unknown as Record<string, unknown> }),
+        null,
+      ),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
+    // Unrecognized class stamp → malformed evidence.
+    expect(() =>
+      assertGuardedIntentConfirmed(run({ ambiguity_class: "BENIGN_LOOKING" }), null),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_EVIDENCE/);
+    // A preview with NO planner run under a live guarded process →
+    // provenance-less → fail closed (env restored immediately).
+    const prior = process.env.PAIR_SEMANTIC_MODE;
+    process.env.PAIR_SEMANTIC_MODE = "guarded";
+    try {
+      expect(() => assertGuardedIntentConfirmed(null, null)).toThrow(
+        /FAIL_CLOSED_GOAL_INTENT_EVIDENCE/,
+      );
+    } finally {
+      if (prior == null) delete process.env.PAIR_SEMANTIC_MODE;
+      else process.env.PAIR_SEMANTIC_MODE = prior;
+    }
+  });
+  it("hardening: tampered approval item_statements → verify fails closed", () => {
+    const { store, control, project } = makeControlCtx();
+    const GOALT = "tamper-probe goal text";
+    const a1 = fakeAnalysis(
+      [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
+      GOALT,
+    );
+    a1.scope = { ...SCOPE, project_id: String(project.project_id) };
+    const run1 = intentRunRow(store, GOALT, {
+      analysis_digest: a1.analysis_digest, ambiguity_class: a1.ambiguity.class,
+      analysis: a1 as unknown as Record<string, unknown>,
+    });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: GOALT, operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: run1, attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: GOALT,
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    // Tamper the stored row's statement field (trusted-store write) —
+    // verify must re-derive statements from the pinned analysis.
+    const row = store.tryGet("goal_intent_approval", approval.approval_id) as Record<string, unknown>;
+    store.put("goal_intent_approval", approval.approval_id, {
+      ...row, item_statements: ["unlimited budget approved"],
+    }, Number((row as { version?: number }).version ?? 0));
+    expect(() =>
+      verifyGoalIntentApproval(store, {
+        mission_input: {
+          operator_goal: approval.amended_goal, project_id: project.project_id,
+          operator_id: "op1",
+          metadata: { goal_intent_approval: { approval_id: approval.approval_id, revision_digest: approval.revision_digest } },
+        },
+      }),
+    ).toThrow(/FAIL_CLOSED_GOAL_INTENT_APPROVAL/);
+  });
   it("guarded unavailable → fail closed; shadow/off/legacy provenance never gates", () => {
     expect(() =>
       assertGuardedIntentConfirmed(run({ status: "unavailable" }), null),

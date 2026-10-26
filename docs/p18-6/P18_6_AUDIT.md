@@ -203,3 +203,28 @@ analyses stamp the same resolved lineage so future replans can bind.
   61/61 seeded lane unchanged (real-model lane: 6/8, honest
   UNAVAILABLE on 2 provider timeouts — reported separately from the
   seeded pipeline-integrity result per the benchmark doc's caveat).
+
+### Closure audit verdict: SHIP (independent reviewer)
+
+All three findings CLOSED at the real seam; probes verified as genuine
+reproductions of the original bypasses. Three LOW residuals were
+folded in the same commit:
+
+- L-1 (`verifyGoalIntentApproval`): `item_statements` are now
+  RE-DERIVED from the pinned analysis items — a tampered approval-row
+  statement field fails closed instead of smuggling coverage.
+- L-2 (gate class consistency): a HARMLESS stamp carrying
+  material-driving items, a stamp disagreeing with the analysis's own
+  class, or an unrecognized class → `FAIL_CLOSED_GOAL_INTENT_EVIDENCE`.
+- L-3 (run-less preview): a preview with no `planner_run` provenance
+  under a live guarded process fails closed — provenance-less
+  confirmations are impossible under GUARDED; OFF/SHADOW/historical
+  unaffected.
+
+INFO notes documented, not defects: `source_goal_sha` binding is
+implicit via the server-side run→preview linkage; pre-upgrade guarded
+runs lacking the stamp keep evidence-driven gating (bounded upgrade
+window); approval re-proof binds `project_id` (goal-sha binding makes
+cross-dim replay impossible); `genIntentScopeOk` in the mjs script is
+untested-by-construction (mirrors the tested
+`latestGoalIntentSnapshot` normalization verbatim).

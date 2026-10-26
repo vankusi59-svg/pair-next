@@ -846,7 +846,23 @@ export function verifyGoalIntentApproval(
       "approval references items absent from the pinned analysis",
     );
   }
-  return approval;
+  // P18.6 closure — the statements the confirm gate consumes are
+  // RE-DERIVED from the pinned analysis items, never trusted from the
+  // mutable approval row: post-mint tampering of `item_statements`
+  // cannot smuggle coverage for ambiguity the owner never reviewed.
+  const byId = new Map(analysis.items.map((i) => [i.id, i]));
+  const derived = approval.item_ids.map((id) => String(byId.get(id)!.statement));
+  if (
+    !Array.isArray(approval.item_statements) ||
+    approval.item_statements.length !== derived.length ||
+    approval.item_statements.some((s, i) => String(s) !== derived[i])
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_APPROVAL",
+      "approval item_statements inconsistent with the pinned analysis items",
+    );
+  }
+  return { ...approval, item_statements: derived };
 }
 
 /** The UNRESOLVED items that drive a MATERIAL ambiguity class — the
@@ -911,8 +927,22 @@ export function assertGuardedIntentConfirmed(
     | undefined,
   resolution: { approved_statements?: Array<unknown> | null } | null,
 ): void {
-  const g = run?.goal_intent ?? null;
-  const sm = run?.semantic_mode != null ? String(run.semantic_mode) : null;
+  if (run == null) {
+    // P18.6 closure — a preview with NO planner-run provenance cannot
+    // prove interpretation ever ran. Under a live guarded deployment
+    // that is the same shape as missing evidence → fail closed.
+    // (Run-less previews only arise from the caller-supplied plan path;
+    // historical OFF/SHADOW environments keep confirming them.)
+    if (semanticMode() === "guarded") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+        "GUARDED: preview carries no planner-run provenance — interpretation cannot be proven",
+      );
+    }
+    return;
+  }
+  const g = run.goal_intent ?? null;
+  const sm = run.semantic_mode != null ? String(run.semantic_mode) : null;
   if (sm === "guarded") {
     if (!g) {
       throw new IntegrityError(
@@ -945,7 +975,33 @@ export function assertGuardedIntentConfirmed(
       "GUARDED: AUTHORITY_CRITICAL ambiguity requires a revised goal — item approval cannot resolve a contradiction",
     );
   }
-  if (cls !== "MATERIAL") return; // HARMLESS — never gates
+  if (cls !== "MATERIAL" && cls !== "HARMLESS") {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+      `GUARDED: unrecognized ambiguity class '${cls}' — malformed evidence`,
+    );
+  }
+  if (cls === "HARMLESS") {
+    // Defense-in-depth (P18.6 closure): a HARMLESS stamp carrying
+    // material-driving items, or a stamp disagreeing with the pinned
+    // analysis's own class, is inconsistent evidence — fail closed.
+    // Unreachable through real pinning (class derives from the same
+    // items) but crafted rows can never masquerade as reviewed.
+    const a = g!.analysis as GoalIntentAnalysis | null | undefined;
+    if (a != null && Array.isArray(a.items)) {
+      const ac = a.ambiguity?.class;
+      if (
+        (typeof ac === "string" && ac !== cls) ||
+        materialAmbiguityItems(a).length > 0
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_GOAL_INTENT_EVIDENCE",
+          "GUARDED: HARMLESS stamp inconsistent with pinned items — evidence integrity violation",
+        );
+      }
+    }
+    return; // HARMLESS — never gates
+  }
   const approved = (resolution?.approved_statements ?? [])
     .filter((s): s is string => typeof s === "string" && s.length > 0)
     .slice(0, MAX_AMENDMENT_ITEMS);
