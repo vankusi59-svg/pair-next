@@ -1085,8 +1085,14 @@ const invokePlannerPool = ({
   externalInputArtifacts,
   priorRejectionContext,
   planningContextBlock,
-}) =>
-  runPlannerFailover({
+}) => {
+  // Semantic Planning V1 (G′) — per-attempt coverage evidence slot.
+  // onAttemptStart resets it (a stale report from a prior attempt can
+  // never attach to one that failed before canonicalize); the
+  // canonicalize sink fills it; settle persists it. Attempts run
+  // sequentially inside one failover — no interleaving.
+  let attemptCoverage = null;
+  return runPlannerFailover({
     candidates,
     ...(priorRejectionContext ? { priorRejectionContext } : {}),
     // §9 — full canonical eligibility re-proved before EVERY invocation
@@ -1140,6 +1146,9 @@ const invokePlannerPool = ({
         raw_delivery_emission_state:
           evidence?.raw_delivery_emission_state,
         external_input_artifacts: externalInputArtifacts,
+        // Semantic Planning V1 (G′) — capture the deterministic coverage
+        // report the canonical seam PROVED so attempt settle persists it.
+        coverageSink: (r) => { attemptCoverage = r; },
       });
       validatePlanProposal({ tasks: canon }, knownCapabilityIds());
       return canon;
@@ -1189,13 +1198,17 @@ const invokePlannerPool = ({
       ceilingMs: cfgCodexPlannerTimeoutMs,
       requestTimeoutMs: cfgCodexPlannerTimeoutMs,
     }),
-    onAttemptStart: (base) =>
-      persistPlannerAttemptStart(store, {
+    onAttemptStart: (base) => {
+      // G′ — this attempt owns the coverage slot from now on: a report
+      // set by a PRIOR attempt's canonicalize can never leak forward.
+      attemptCoverage = null;
+      return persistPlannerAttemptStart(store, {
         planner_run_id: plannerRunId,
         project_id: projectId,
         record: base,
         actor: "PAIR_PLANNER",
-      }).planner_attempt_id,
+      }).planner_attempt_id;
+    },
     // P-REASK R4 — durable re-ask initiation on the SAME attempt row
     // before the second model invocation (never a second row).
     onAttemptReask: (paid, code) =>
@@ -1209,6 +1222,9 @@ const invokePlannerPool = ({
         planner_attempt_id: String(paid),
         record: rec,
         winner: rec.outcome === "SUCCESS",
+        // G′ — the coverage report THIS attempt's canonical plan proved
+        // (null when it never reached/passed canonicalize).
+        coverage_report: attemptCoverage,
         actor: "PAIR_PLANNER",
       }),
     onExhausted: () =>
@@ -1220,6 +1236,7 @@ const invokePlannerPool = ({
     // Phase C — one absolute deadline across the whole failover chain.
     deadlineMs: deadlineAt,
   });
+};
 const planExpander = async (input, expandCtx) => {
   // Phase C — the ONE planner for every new-Mission ingress. The
   // PAIR_MC_TEMPLATE_PLANNER bypass is gone: there is no environment

@@ -18,12 +18,22 @@ type St =
   | { kind: "unavailable"; code: string }
   | { kind: "error"; err: ApiError };
 
+type CoverageRow = {
+  requirement_id: string;
+  kind: string;
+  state: string;
+  task_keys: string[];
+};
+
 type Pinned = {
   preview_id: string;
   plan_digest: string;
   tasks: Array<Record<string, unknown>>;
   source: string | null;
   model: string | null;
+  /* Semantic Planning V1 (G′) — deterministic coverage report the
+     winning plan proved; read-only review evidence, never authority. */
+  coverage_report: { verdict: string; rows: CoverageRow[] } | null;
   /* effective inputs pinned at preview time — any change invalidates */
   project_id: string;
   goal: string;
@@ -160,12 +170,17 @@ export function MissionNew() {
         setPreviewErr("INVALID_PREVIEW — response missing preview_id, plan_digest or a valid task list. Nothing to confirm.");
         return;
       }
+      const cov = (r as { coverage_report?: unknown }).coverage_report;
       const pinned: Pinned = {
         preview_id: String(r.preview_id),
         plan_digest: String(r.plan_digest),
         tasks: r.plan.tasks,
         source: r.plan_source ?? null,
         model: r.plan_model ?? null,
+        coverage_report:
+          cov && typeof cov === "object" && (cov as { verdict?: unknown }).verdict === "PASS"
+            ? (cov as Pinned["coverage_report"])
+            : null,
         project_id: projectId,
         goal: goal.trim(),
       };
@@ -318,6 +333,28 @@ export function MissionNew() {
               </div>
             ))}
           </div>
+          {preview.coverage_report ? (
+            <div className="need">
+              <div className="nrow">
+                <span className="note mono">
+                  requirement coverage — deterministic check on the pinned plan (advisory evidence)
+                </span>
+              </div>
+              {preview.coverage_report.rows.map((r) => (
+                <div className="nrow" key={r.requirement_id}>
+                  <code className="mono">{r.requirement_id}</code>
+                  <span className="note mono">{r.kind}</span>
+                  <StatusBadge
+                    tone={r.state === "PROVEN" ? "ok" : r.state === "PRESERVED" ? "warn" : "unknown"}
+                    label={r.state}
+                  />
+                  <span className="note mono" style={{ flex: 1 }}>
+                    {r.task_keys.length ? `by ${r.task_keys.join(", ")}` : "—"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <DagView dag={{
             nodes: preview.tasks.map((t) => ({
               task_id: String(t.task_key), task_key: String(t.task_key),

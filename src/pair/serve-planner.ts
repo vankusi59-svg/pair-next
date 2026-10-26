@@ -267,6 +267,13 @@ export function makeServeCanonicalizer(deps: {
      *  (envelope for delegated missions — bookkeeping writes it, the
      *  model sees it); absent → `goal` itself is operator-authored. */
     authorityGoal?: string;
+    /** Semantic Planning V1 (G′) — evidence sink for the deterministic
+     *  PlanCoverageReport produced by the canonical authority seam.
+     *  Advisory persistence only: the sink observes the report the
+     *  seam ALREADY proved (a throw above never reaches it); it cannot
+     *  influence the verdict and is never called for a plan that did
+     *  not pass coverage. */
+    coverageSink?: (report: import("./plan-coverage.js").PlanCoverageReport) => void;
   },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
@@ -632,7 +639,18 @@ export function makeServeCanonicalizer(deps: {
     // R1 — coverage binds the operator authority text, never the
     // enriched envelope: appended `[AGENT CONTEXT]` history cannot
     // mint obligations/deliverables/constraints/prohibitions.
-    assertPlanCoverage(extractGoalContract(authorityGoal), allTasks);
+    const coverageReport = assertPlanCoverage(
+      extractGoalContract(authorityGoal),
+      allTasks,
+    );
+    // G′ — surface the report the authority just proved. Sink faults
+    // must never fault canonicalization: evidence capture is advisory
+    // and a persistence-side bug can never un-pass a proven plan.
+    try {
+      ctx?.coverageSink?.(coverageReport);
+    } catch {
+      /* evidence sink fault is non-authoritative by contract */
+    }
     return allTasks;
   };
 }

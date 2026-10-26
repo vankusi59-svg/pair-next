@@ -902,6 +902,11 @@ export class MissionControl {
       planner: row.planner ?? null,
       planner_attempt_id: row.planner_attempt_id ?? null,
       planner_run_id: row.planner_run_id ?? null,
+      // Semantic Planning V1 (G′) — read-only projection of the
+      // deterministic coverage report the winning plan proved. Advisory
+      // evidence for the operator's review surface; confirm still binds
+      // digests, never this field.
+      coverage_report: row.coverage_report ?? null,
       expires_at: row.expires_at,
       state: row.state,
       // Phase C — the TEMPLATE source is gone: a preview that reached
