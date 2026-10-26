@@ -286,3 +286,35 @@ recorded as a post-merge hardening item, out of this PR's scope.
 | Production integration | PASS — both transports identical prompt threading; replan pin durable; UI read-only |
 
 Unresolved correctness-critical findings: **none**.
+
+### Merge-readiness audit (codex-reviewer, 46b05bf..HEAD) — FIX_THEN_VERIFY → remediated
+
+Third independent review pass over the complete diff. No fail-open /
+authority-leaking issue found (every residual fails **closed**). Findings:
+
+- **F1 HIGH** — `không cần` ("no need to") minted term-bans on relief
+  phrasing (`không cần thiết` → banned `thiết/trong/báo/cáo`) → idiomatic
+  VI goals near-unplannable. Fixed: `không cần` now requires a following
+  action form (`không cần dùng martingale` still bans); `trong` added to
+  `PROHIBITION_STOPWORDS`.
+- **F2 MED** — `by/due/hạn DD/MM` and bare `DD/MM` minted floors
+  (`by 15/10` → `min:15`). Fixed: bare `\d{1,2}[/-]\d{1,2}` date-shape
+  mask.
+- **F3 MED** — duration ranges half-masked (`trong 30-45 ngày` →
+  `min:30`, no DDL). Fixed: `\d+(?:[-–]\d+)?` range numbers in both the
+  mask and `DEADLINE_RE` — ranges mask fully AND mint the deadline row.
+- **F4 MED** — constraint-shaped backstop promoted bare numbers to
+  floors (`budget max $500` → `min:500`). Fixed: `min` is stripped when
+  the preserved clause matches `CONSTRAINT_RE` — ceilings can never
+  become floors.
+- **F6 LOW** — render could emit 4097 chars vs ≤4096 persisted evidence.
+  Fixed: hard slice at the return seam — prompt bytes ≡ evidence bytes.
+- **Ridden (documented, fail-closed-or-benign)**: F5 `without X` term
+  granularity (consistent with baseline `do not use X`), F7 `và không`
+  dead mid-clause alternative (harmless dead code), F8 `chỉ <verb>`
+  loose binding (satisfiable), F9 year-mask trade-off (documented),
+  F10 non-budget ceilings mint CON but unenforced `maxAmount`
+  (pre-existing), legacy MissionNew route lacks the coverage card
+  (additive field, no break), `in N hours` deadline parity added (F42).
+
+Post-remediation: **42/42 adversarial green**, 422/422 focused sweep.

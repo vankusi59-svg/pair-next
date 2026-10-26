@@ -555,5 +555,8 @@ export function renderPlanningContextBlock(env: PlanningContextEnvelope): string
     kept.push(l);
   }
   if (kept.length < lines.length) body += `\n${marker}`;
-  return `${header}${body}\n`;
+  /* K″ review F6 — the arithmetic bound covers header+body+marker but
+   *  the trailing newline could push the render to MAX+1 while persisted
+   *  evidence records ≤MAX. Slice so prompt bytes ≡ evidence bytes. */
+  return `${header}${body}\n`.slice(0, PLANNING_CONTEXT_BLOCK_MAX);
 }

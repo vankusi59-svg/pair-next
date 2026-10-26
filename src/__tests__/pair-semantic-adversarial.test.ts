@@ -633,3 +633,64 @@ describe("SEM-ADV — K″ follow-up: revived edges mint satisfiable semantics",
     expect(solo.obligations[0]?.quantity).toEqual({ max: 50 });
   });
 });
+
+/* ---------- H38–H42: final-review follow-up (F1–F4/F6) ---------- */
+
+describe("SEM-ADV — final review: relief-vs-ban, dates, ranges, ceiling backstop", () => {
+  it("H38 — 'không cần' is relief, not a ban — unless followed by a real action", () => {
+    for (const g of [
+      "loại bỏ các phần không cần thiết trong báo cáo",
+      "viết báo cáo, không cần kiểm tra lại",
+    ]) {
+      const c = extractGoalContract(g);
+      const pro = contractRequirements(c).filter((r) => r.kind === "prohibition");
+      expect(pro.length).toBe(0);
+    }
+    // A genuine action after không cần still mints the ban.
+    const c = extractGoalContract("không cần dùng martingale");
+    const pro = contractRequirements(c).filter((r) => r.kind === "prohibition");
+    expect(pro.length).toBeGreaterThan(0);
+    expect((pro[0] as { terms?: string[] }).terms).toContain("martingale");
+  });
+
+  it("H39 — deadline date shapes never mint floors (by DD/MM, ngày DD/MM)", () => {
+    for (const [g, leaked] of [
+      ["submit the report by 15/10", 15],
+      ["submit the report by 15/10", 10],
+      ["nộp trước ngày 15/10", 15],
+    ] as const) {
+      const c = extractGoalContract(g);
+      expect(c.deadline).toBeTruthy();
+      for (const o of c.obligations) expect(o.quantity?.min ?? 0).not.toBe(leaked);
+    }
+  });
+
+  it("H40 — duration ranges mask fully AND mint the deadline (30-45 ngày, 2-3 weeks, 5-7 giờ)", () => {
+    for (const g of [
+      "viết báo cáo trong 30-45 ngày",
+      "finish in 2-3 weeks",
+      "trong vòng 5-7 giờ",
+    ]) {
+      const c = extractGoalContract(g);
+      expect(c.deadline).toBeTruthy();
+      for (const o of c.obligations) expect(o.quantity).toBeUndefined();
+    }
+  });
+
+  it("H41 — constraint-shaped backstop never promotes a bare number to a floor", () => {
+    for (const g of [
+      "budget max $500 for the analysis",
+      "tối đa tháng 500 đơn hàng",
+    ]) {
+      const c = extractGoalContract(g);
+      for (const o of c.obligations) {
+        expect(o.quantity?.min ?? 0).not.toBe(500);
+      }
+    }
+  });
+
+  it("H42 — 'in 5 hours' mints a deadline like 'within 5 hours'", () => {
+    expect(extractGoalContract("finish in 5 hours").deadline).toBeTruthy();
+    expect(extractGoalContract("finish within 5 hours").deadline).toBeTruthy();
+  });
+});

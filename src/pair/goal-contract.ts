@@ -363,7 +363,13 @@ const PROHIBITION_RE = new RegExp(
        exclusion the operator stated. VI equivalents keep structural
        action evidence (`không` needs a forbidden action after it). */
     `|(?<![\\p{L}\\p{N}])without(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])` +
-    `|(?<![\\p{L}\\p{N}])(?:mà không|và không|không cần)(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])`,
+    /* K″ review F1 — `không cần` means "no need to" (relief), not
+       "must not": gating it on a following ACTION FORM keeps `không
+       cần dùng martingale` a ban while `không cần thiết` (unnecessary)
+       and `không cần kiểm tra lại` stop minting term-bans on the
+       goal's own content words. `mà không`/`và không` keep the
+       any-word tail (pre-existing semantics). */
+    `|(?<![\\p{L}\\p{N}])(?:mà không|và không|không cần(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))(?=\\s+[\\p{L}\\p{N}])(?![\\p{L}\\p{N}])`,
   "iu",
 );
 
@@ -402,7 +408,7 @@ function prohibitionHead(clause: string): string {
  *  fire, so "trước 10 giờ" / "trong vòng 30 giờ" minted no deadline
  *  row AND leaked `10`/`30` into the bare-quantity scan. */
 const DEADLINE_RE =
-  /(?<![\p{L}\p{N}])deadline(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])due(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])hạn(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước ngày(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước(?![\p{L}\p{N}]).{0,12}(?<![\p{L}\p{N}])(?:giờ|ngày)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])by\s+\d{1,2}[/-]\d{1,2}|(?<![\p{L}\p{N}])within\s+\d+\s*(?:days?|weeks?|months?|hours?|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in\s+\d+\s*(?:days?|weeks?|months?)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+vòng\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+khoảng\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])/iu;
+  /(?<![\p{L}\p{N}])deadline(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])due(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])hạn(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước ngày(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước(?![\p{L}\p{N}]).{0,12}(?<![\p{L}\p{N}])(?:giờ|ngày)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])by\s+\d{1,2}[/-]\d{1,2}|(?<![\p{L}\p{N}])within\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|hours?|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|hours?)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+vòng\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+khoảng\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])/iu;
 
 /* K″ audit — `không quá` (ends `á`), bare `chỉ` (`ỉ`) and `ngoại trừ`
  *  (`ừ`) were dead under ASCII `\b`: "không quá 50 USD" minted no
@@ -634,7 +640,7 @@ const QUANTITY_EXACT_RE =
  * schedule positions, never quantity floors. Per-unit digit bounds so
  * `tháng 500 đơn` keeps its real 500. */
 export const TEMPORAL_NUM_RE =
-  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong|trước)\s+\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:ngày|day)\s+\d{1,3}(?:\s*[/–-]\s*\d{1,2}(?:\s*[/–-]\s*\d{2,4})?)?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:tháng|month)\s+\d{1,2}(?:\s*[/–-]\s*\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:thứ|tuần|quý|week)\s+\d{1,2}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])năm\s+\d{1,4}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:19|20)\d{2}(?![\p{L}\p{N}])/giu;
+  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong|trước)\s+\d+(?:\s*[-–]\s*\d+)?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]\s*\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:ngày|day)\s+\d{1,3}(?:\s*[/–-]\s*\d{1,2}(?:\s*[/–-]\s*\d{2,4})?)?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:tháng|month)\s+\d{1,2}(?:\s*[/–-]\s*\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:thứ|tuần|quý|week)\s+\d{1,2}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])năm\s+\d{1,4}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d{1,2}[/–-]\d{1,2}(?:[/–-]\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:19|20)\d{2}(?![\p{L}\p{N}])/giu;
 /* Semantic Planning V1 (C′) — grouped-thousand forms: `1,000` (EN) is
  *  unambiguous thousands grouping; VI `1.000` is accepted only with a
  *  VI-unit lookahead so a version/decimals token ("1.000.2") never
@@ -663,6 +669,7 @@ const PROHIBITION_STOPWORDS = new Set([
   "nào", "bao", "giờ", "case", "provided", "long", "as", "and", "or",
   "without",
   "nor", "else", "than", "hoặc", "cùng", "với", "của", "cho", "là",
+  "trong",
   "các", "những", "một", "mỗi", "vào", "ra", "lên", "xuống", "lại",
   "hết", "còn", "sau", "trước", "giữa", "dưới", "ở", "tại", "về",
   "theo", "như",
@@ -991,8 +998,14 @@ export function extractGoalContract(goal: string): GoalContract {
       )
       .sort((a, b) => b.length - a.length)[0];
     if (shaped) {
+      /* K″ review F4 — a constraint-shaped preserved clause ("budget
+       *  max $500…", "tối đa tháng 500 đơn") must never promote its
+       *  bare number to a floor: keep `max`, drop `min`, else the
+       *  ceiling inverts into a floor the plan must reach. */
+      const q = extractQuantity(shaped);
+      if (q && CONSTRAINT_RE.test(shaped)) delete q.min;
       push(obligations, "OBL", shaped, {
-        quantity: extractQuantity(shaped),
+        quantity: q && (q.min !== undefined || q.max !== undefined) ? q : undefined,
       });
     }
   }
