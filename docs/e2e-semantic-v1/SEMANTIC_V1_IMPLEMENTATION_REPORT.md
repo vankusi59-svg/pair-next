@@ -188,7 +188,30 @@ counts stayed inside the existing envelope: 1 request for first-pass cases,
   prohibition enforcement is action+term-level (a task naming the banned
   object under the banned action violates even with a negating qualifier).
 
+## K″ final audit remediation (post-0a4e204)
+
+Owner-requested final correctness pass found one residual defect class —
+ASCII `\b` boundaries dead adjacent to non-ASCII-edged Vietnamese lexemes:
+
+- `DEADLINE_RE`/`TEMPORAL_NUM_RE`: `giờ`(ờ-edge) dead →
+  `trước 10 giờ`/`trong vòng 30 giờ` minted no deadline and leaked
+  duration numbers into quantity extraction **on both the contract and
+  task sides** (phantom floors; a task duration could satisfy an
+  unrelated floor). Fixed with Unicode lookarounds + `phút`/`giây` +
+  `trước N <unit>` + date-ordinal masks (`trước ngày 15` ≠ `min:15`).
+- `CONSTRAINT_RE`: `không quá`/`chỉ`/`ngoại trừ`/`<=`/`≤` dead →
+  ceilings could invert into floors via the preserved-row backstop.
+- `LOCAL_SOURCE_RE`, VI output/source markers (`kết quả`, `đọc`), and
+  the connective counter (`và`, `sau đó`) had the same dead-edge class.
+
+Full detail + sweep methodology + false-positive classification:
+`SEMANTIC_V1_INDEPENDENT_AUDIT.md` §K″. Regression proof: H21–H30 in
+`pair-semantic-adversarial.test.ts` (30/30 green). Re-verified at HEAD
+`fa78955`: verify:change `--base 0a4e204` →
+**READY_FOR_INDEPENDENT_AUDIT** at `fa78955` (code-final; pushed HEAD `e6912c1` carries only doc/claim-text deltas) (claim 10/10, invariants 8/8,
+regression 18/18, TSC+BUILD PASS, full suite PASS_WITH_KNOWN_BASELINE).
+
 ## 9. Merge status
 
-**Not merged.** Independent audit (K′) precedes any owner merge decision.
-Releases remain unauthorized until the owner acts.
+**Not merged.** K″ audit remediation verified at `fa78955`; owner merge
+decision pending. Releases remain unauthorized until the owner acts.

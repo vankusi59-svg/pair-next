@@ -57,7 +57,7 @@ export function deriveWorkTaskBudget(goal: string): number {
   const connectives = (
     g
       .toLowerCase()
-      .match(/\b(và|and|then|sau đó|tiếp|rồi|cuối cùng|finally|also|song song)\b|[,;]/gu) ?? []
+      .match(/(?<![\p{L}\p{N}])(?:và|and|then|sau đó|tiếp|rồi|cuối cùng|finally|also|song song)(?![\p{L}\p{N}])|[,;]/gu) ?? []
   ).length;
   const score = words + 4 * enumerations + 2 * connectives;
   if (score <= 40) return WORK_TASK_BUDGET_SIMPLE;
@@ -200,7 +200,7 @@ const ONLINE_RE =
  *  repo, not on the network. Presence suppresses the requirement unless
  *  an online marker coexists. */
 const LOCAL_SOURCE_RE =
-  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)\b|(?<![\p{L}\p{N}])(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
+  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
 
 /** Information-retrieval verbs. Word-bounded so "fetched", "scraper"
  *  do NOT match — only an explicit request to retrieve. */

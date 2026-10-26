@@ -10,8 +10,10 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractGoalContract } from "../pair/goal-contract.js";
+import { extractGoalContract, contractRequirements } from "../pair/goal-contract.js";
 import { assertPlanCoverage } from "../pair/plan-coverage.js";
+import { detectOutputLanguage } from "../pair/output-language.js";
+import { goalRequiresCurrentExternalData } from "../pair/llm-planner.js";
 import { makeServeCanonicalizer, SERVE_LLM_PLANNER_CAPS } from "../pair/serve-planner.js";
 import {
   PlanningContextService,
@@ -439,5 +441,195 @@ describe("SEM-ADV — digest & evidence isolation", () => {
     expect(a).toEqual(b);
     expect(r1).toEqual(r2);
     expect((r1 as { verdict: string }).verdict).toBe("PASS");
+  });
+});
+
+/* ---------- H21–H30: K″ unicode-boundary duration/quantity probes ---------- */
+
+describe("SEM-ADV — K″ unicode boundary: durations never become quantities", () => {
+  it("H21 — 'trong vòng 30 giờ' mints a deadline AND 30 never mints a floor", () => {
+    const c = extractGoalContract("Tăng 500 người đăng ký trong vòng 30 giờ");
+    expect(c.deadline).toBeTruthy();
+    const obl = c.obligations[0]!;
+    // The real floor is 500 — the duration number must not mint,
+    // merge, or replace it.
+    expect(obl.quantity).toEqual({ min: 500 });
+    expect(obl.quantity!.min).not.toBe(30);
+  });
+
+  it("H22 — 'trước 10 giờ' mints a deadline AND 10 never mints a floor", () => {
+    const c = extractGoalContract("Viết báo cáo trước 10 giờ");
+    expect(c.deadline).toBeTruthy();
+    for (const o of c.obligations) expect(o.quantity?.min ?? 0).not.toBe(10);
+  });
+
+  it("H23 — duration-only clause carries no obligation quantity at all", () => {
+    for (const g of [
+      "Viết bài trong vòng 30 phút",
+      "Xong trong 2 giờ",
+      "Finish within 30 days",
+      "Viết báo cáo trước 10 giờ",
+    ]) {
+      const c = extractGoalContract(g);
+      for (const o of c.obligations) {
+        expect(o.quantity).toBeUndefined();
+      }
+    }
+  });
+
+  it("H24 — 'trước ngày 15' is a date ordinal, never a floor of 15", () => {
+    const c = extractGoalContract("Gửi kết quả trước ngày 15");
+    expect(c.deadline).toBeTruthy();
+    for (const o of c.obligations) expect(o.quantity?.min ?? 0).not.toBe(15);
+  });
+
+  it("H25 — a task containing a duration can never satisfy an unrelated floor", () => {
+    const c = extractGoalContract("Tăng 500 người đăng ký trong vòng 30 giờ");
+    expectIntegrity(
+      () =>
+        assertPlanCoverage(c, [
+          work("T1", "Recruit the subscriber cohort trong 30 giờ"),
+        ]),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("H26 — EN duration on the task side likewise cannot satisfy the floor", () => {
+    const c = extractGoalContract("Grow the channel by 500 subscribers within 30 days");
+    expectIntegrity(
+      () =>
+        assertPlanCoverage(c, [
+          work("T1", "Grow the channel reaching the subscriber goal in 30 days"),
+        ]),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("H27 — 'không quá 50 USD' mints a constraint ceiling, never a floor", () => {
+    const c = extractGoalContract("Research VPN providers, không quá 50 USD mỗi tháng");
+    const con = contractRequirements(c).filter((r) => r.kind === "constraint");
+    expect(con.length).toBeGreaterThan(0);
+    // The ceiling may attach as a quantity max — it must never be a min.
+    for (const o of c.obligations) {
+      expect(o.quantity?.min).toBeUndefined();
+    }
+  });
+
+  it("H28 — 'chỉ' and 'ngoại trừ' constraint alternatives are live", () => {
+    for (const g of [
+      "Research tools, chỉ dùng nguồn đáng tin",
+      "Publish weekly reports, ngoại trừ ngày lễ",
+    ]) {
+      const c = extractGoalContract(g);
+      const con = contractRequirements(c).filter((r) => r.kind === "constraint");
+      expect(con.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("H29 — VI source/output markers: 'đọc … tiếng anh' binds the SOURCE language, 'kết quả … tiếng việt' binds OUTPUT", () => {
+    const out = detectOutputLanguage(
+      "Đọc tài liệu tiếng anh và viết kết quả bằng tiếng việt",
+    );
+    expect(out.code).toBe("vi");
+    expect(out.authority).toBe("GOAL_DIRECTIVE");
+  });
+
+  it("H30 — 'files cục bộ' / 'files dữ liệu' suppress the current-external requirement (LOCAL_SOURCE_RE right edge)", () => {
+    // Both right-edge non-ASCII alternatives were dead under \b: the
+    // local-source clause could never classify as local.
+    expect(goalRequiresCurrentExternalData("đọc files cục bộ về giá vàng")).toBe(false);
+    expect(goalRequiresCurrentExternalData("đọc files dữ liệu về giá vàng")).toBe(false);
+    // A real online request still requires external data.
+    expect(goalRequiresCurrentExternalData("tìm giá vàng mới nhất trên mạng")).toBe(true);
+  });
+});
+
+/* ---------- H31–H37: K″ review follow-up — auxiliary onlyTerms + ordinals ---------- */
+
+describe("SEM-ADV — K″ follow-up: revived edges mint satisfiable semantics", () => {
+  it("H31 — 'chỉ <auxiliary>' never binds a function word as onlyTerms (unsatisfiable constraint)", () => {
+    for (const g of [
+      "chỉ cần viết báo cáo",
+      "chỉ muốn xem giá vàng",
+      "chỉ số giá",
+      "tăng 500 đăng ký chỉ trong 30 ngày",
+    ]) {
+      const c = extractGoalContract(g);
+      for (const r of contractRequirements(c)) {
+        const ot = (r as { onlyTerms?: string[] }).onlyTerms;
+        if (ot) {
+          for (const t of ot) {
+            expect(["cần", "muốn", "được", "là", "số", "trong"]).not.toContain(t);
+          }
+        }
+      }
+    }
+  });
+
+  it("H32 — 'chỉ được dùng CSV' binds the real value, not the auxiliary", () => {
+    const c = extractGoalContract("chỉ được dùng CSV khi tải dữ liệu");
+    const con = contractRequirements(c).filter((r) => r.kind === "constraint");
+    const bound = con.flatMap((r) => (r as { onlyTerms?: string[] }).onlyTerms ?? []);
+    expect(bound).toContain("csv");
+    expect(bound).not.toContain("được");
+    expect(bound).not.toContain("dùng");
+  });
+
+  it("H33 — a 'chỉ cần' goal stays plannable: coverage cannot fail on a phantom onlyTerm", () => {
+    const c = extractGoalContract("chỉ cần viết báo cáo");
+    // No onlyTerms minted → nothing can fail closed on the constraint.
+    const r = assertPlanCoverage(c, [work("T1", "Viết báo cáo")]);
+    expect(r.verdict).not.toBe("FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION");
+  });
+
+  it("H34 — VI scheduling ordinals never mint floors: thứ N / tuần N / quý N / ngày dd/mm", () => {
+    for (const [g, leaked] of [
+      ["viết báo cáo trước thứ 6", 6],
+      ["trước tuần 15 nộp báo cáo", 15],
+      ["quý 3 nộp báo cáo", 3],
+      ["trước ngày 15/10", 15],
+      ["trước ngày 15/10", 10],
+      ["finish by day 365", 365],
+    ] as const) {
+      const c = extractGoalContract(g);
+      for (const o of c.obligations) {
+        expect(o.quantity?.min ?? 0).not.toBe(leaked);
+      }
+    }
+  });
+
+  it("H35 — deadline minting is unit-consistent: giây in trong/trong khoảng/trong vòng", () => {
+    for (const g of [
+      "Xong trong 30 giây",
+      "Xong trong khoảng 30 giây",
+      "Xong trong vòng 30 giây",
+      "Xong trong 30 phút",
+    ]) {
+      expect(extractGoalContract(g).deadline).toBeTruthy();
+    }
+  });
+
+  it("H36 — per-unit ordinal bound: 'tháng 500 đơn' keeps its real quantity", () => {
+    const c = extractGoalContract("giao tháng 500 đơn hàng");
+    expect(c.obligations[0]?.quantity?.min).toBe(500);
+  });
+
+  it("H37 — 'không quá 50 USD' mints a constraint and never a floor of 50", () => {
+    for (const g of [
+      "Research VPN providers, không quá 50 USD mỗi tháng",
+      "không quá 50 USD mỗi tháng",
+    ]) {
+      const c = extractGoalContract(g);
+      const con = contractRequirements(c).filter((r) => r.kind === "constraint");
+      expect(con.length).toBeGreaterThan(0);
+      // The ceiling may surface as a quantity max — never as a min.
+      for (const o of c.obligations) {
+        expect(o.quantity?.min ?? 0).not.toBe(50);
+        if (o.quantity) expect(o.quantity.min).toBeUndefined();
+      }
+    }
+    // Where an obligation row carries the ceiling it is max-typed.
+    const solo = extractGoalContract("không quá 50 USD mỗi tháng");
+    expect(solo.obligations[0]?.quantity).toEqual({ max: 50 });
   });
 });

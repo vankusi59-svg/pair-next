@@ -134,3 +134,120 @@ telegram-delivery clauses are consumed by the intent check upstream.
 - `ghi`/`khai`/`gia` in ANCHOR_STOP trade an edge case (a proper noun that
   is also an action syllable) for eliminating the false-anchor class —
   consistent with the existing stop-list doctrine.
+
+---
+
+## K″ final correctness audit (owner-requested, HEAD 0a4e204)
+
+Scope: remaining Unicode-boundary defects in deadline/temporal/constraint
+extraction, plus a repository-wide `\b`-adjacent-to-non-ASCII sweep.
+
+### Root cause (single class)
+
+JavaScript `\b` is ASCII-only: it can never fire adjacent to a character
+outside `[A-Za-z0-9_]`. Every regex boundary placed next to a
+Vietnamese lexeme ending/starting on a diacritic vowel (`ờ`, `á`, `ỉ`,
+`ừ`, `ộ`, `ệ`, `ả`, `đ…`) was dead code — invisible to both the author
+of the original patterns and the K′ remediation pass, because the
+dead edge is silent (the regex simply never matches).
+
+### Findings — all correctness-critical, all remediated at fa78955
+
+| # | Finding | Severity | Fix |
+|---|---|---|---|
+| K″-1 | `DEADLINE_RE` — `giờ` (ends `ờ`) dead in four alternations: `"trước 10 giờ"` and `"trong vòng 30 giờ"` minted **no deadline row**, and `10`/`30` leaked into the bare-quantity scan → **phantom floor `min:10`** on a deadline-only clause | HIGH | All `\b` → `(?<![\p{L}\p{N}])`/`(?![\p{L}\p{N}])`; `phút`/`giây` units added |
+| K″-2 | `TEMPORAL_NUM_RE` — same `ờ` edge dead on both branches: `"30 giờ"` masked **neither on the contract side** (phantom floor) **nor the task side** (a task `"trong 30 giờ"` could satisfy an unrelated floor) | HIGH | Lookarounds; added `trước N <unit>` and `(ngày\|tháng\|day\|month) N` date-ordinal masks (`"trước ngày 15"` had minted `min:15`) |
+| K″-3 | `CONSTRAINT_RE` — `không quá`(`á`), bare `chỉ`(`ỉ`), `ngoại trừ`(`ừ`), and left-edge `<=`/`≤` all dead: `"không quá 50 USD"` minted **no constraint row** and fell into the preserved-obligation backstop — a ceiling surfaced as a *coverable obligation* (`max:50` on an OBL row that coverage ignores) with **no constraint record at all**; reviving `chỉ` also armed `ONLY_VI_RE`, which bound auxiliaries (`chỉ cần/muốn/được` → `onlyTerms:["cần"/"muốn"/"được"]`) → unsatisfiable constraint → guaranteed `FAIL_CLOSED_PLAN_INCOMPLETE` on common VI hedging | HIGH | Full lookaround conversion (+ `u` flag); `ONLY_VI_RE` auxiliary skip-chain (`được`/`dùng`/`dụng`) + `ONLY_TERM_STOP` extended with VI function words → `chỉ <aux>` degrades to harmless PRESERVED |
+| K″-4 | `LOCAL_SOURCE_RE` (`llm-planner`) — right-edge group `cục bộ`(`ộ`)/`dữ liệu`(`ệ`) dead: `"files cục bộ"`/`"files dữ liệu"` never classified as local source | MED | Trailing `\b` → `(?![\p{L}\p{N}])` |
+| K″-5 | `output-language` VI markers — `kết quả`(`ả`) right-edge and `đọc` left-edge dead: VI source/output directives misclassified (`"Đọc tài liệu tiếng anh … kết quả bằng tiếng việt"` resolved `UNDETERMINED` instead of `vi`) | MED | Lookarounds on both marker sets |
+| K″-6 | `llm-planner` connective counter — `và`(`à`)/`sau đó`(`ó`) dead: VI connectives never counted toward task-budget derivation | LOW | Lookarounds |
+
+### Sweep methodology & false-positive classification
+
+`scripts/dev-verification/b-boundary-sweep.cjs` enumerates every `\b`
+adjacent to an alternation containing a non-ASCII edge char across
+`src/pair/*.ts`. Remaining flags after fixes were verified **false
+positives** by hand:
+
+- `goal-contract` `BARE_NUM_VI_DOT_RE` — the `\b` sits after a
+  zero-width lookahead `(?=\s*(units))` and binds the digit position,
+  not the unit text (units intentionally prefix-match);
+- `llm-planner` `:219/:224` — `giá`/`tỷ giá` are bare alternations with
+  no adjacent `\b` (prefix-match by design);
+- `llm-planner` `:203` bare `cục bộ` alternative — same, by design;
+- `plan-coverage` `:514` dynamic `\b${ch}\b` — `ONLY_CHANNELS` is
+  all-ASCII;
+- `plan-dataflow`, `recovery-controller`, `experience-extraction`,
+  `objective-source-terms`, `codex-cli-transport` — ASCII-edged only.
+
+### Adversarial regression probes (H21–H30, all green)
+
+- H21/H22: `trong vòng 30 giờ` and `trước 10 giờ` mint `DDL_001`; the
+  duration numbers never mint `quantity.min`.
+- H23: duration-only clauses (`30 phút`, `2 giờ`, `within 30 days`)
+  mint no obligation quantity at all.
+- H24: `trước ngày 15` is a date ordinal — no `min:15`.
+- H25/H26: a task text containing `trong 30 giờ`/`in 30 days` can never
+  satisfy an unrelated `min:500` floor — `FAIL_CLOSED_PLAN_INCOMPLETE`.
+- H27: `không quá 50 USD` mints a constraint and `quantity.max` —
+  never `min`.
+- H28: `chỉ`/`ngoại trừ` constraint alternatives are live.
+- H29: `đọc`/`kết quả` markers — VI source/output directive resolves
+  `code:"vi"`, authority `GOAL_DIRECTIVE`.
+- H30: `files cục bộ`/`files dữ liệu` suppress current-external
+  requirement; a genuine `trên mạng` request still requires it.
+
+### K″ verification record (clean environment)
+
+`env -u PAIR_DSH_MODEL_ROUTE -u AGNES_API_KEY -u PAIR_DSH_* npm run
+verify:change -- --base 0a4e204` at HEAD `fa78955`:
+
+- patch-claim tests **10/10 PASS** (includes 30/30 adversarial)
+- invariants **8/8 PASS** (+3 known baseline)
+- affected regression **18/18 PASS** (+27 known baseline)
+- TSC **PASS**, build **PASS**
+- full suite **PASS_WITH_KNOWN_BASELINE** (+133 — Windows spawn/
+  artifact baselines, verified `BASE==HEAD`)
+- final verdict **READY_FOR_INDEPENDENT_AUDIT**
+
+Focused suites: 206/206 across planning-context, coverage, adversarial,
+prv2b goal-coverage, goal-context-authority, async-replan-generation;
+410/412 on the planner/coverage regression sweep (2 fails = covmap
+T9/T11 `.cjs`-spawn Windows baseline).
+
+### K″ independent review (codex-reviewer) — FIX-THEN-SHIP → remediated
+
+The K″ fix diff (`0a4e204..fa78955`) was independently reviewed. Verdict
+FIX-THEN-SHIP with one correctness-critical finding — now resolved:
+
+- **MAJOR** — `chỉ` revival armed `ONLY_VI_RE`: `chỉ cần/muốn/được/là/
+  số/trong …` bound VI auxiliaries as `onlyTerms` → unsatisfiable
+  constraint → guaranteed fail-closed on common VI hedging phrasing.
+  Fixed: `ONLY_VI_RE` skip-chain strips licensed auxiliaries
+  (`được`/`dùng`/`dụng`, iterated) and `ONLY_TERM_STOP` gained the VI
+  function-word set — `chỉ được dùng CSV` still binds `csv` correctly.
+- **MINOR** — ordinal mask coverage gaps: `thứ 6` (VI weekday), `tuần
+  15`, `quý 3`, `week 15`, `day 365`, and `ngày 15/10` (the canonical
+  VI dd/mm form — the `/10` tail leaked `min:10`). Fixed with per-unit
+  bounded branches (`ngày|day` ≤3 digits + optional date tail;
+  `tháng|month` ≤2 digits + optional year tail; `thứ|tuần|quý|week`
+  ≤2 digits; `năm` ≤4) — `tháng 500 đơn` still keeps its real 500.
+- **MINOR** — `giây` unit inconsistency between `trong vòng`/`trong
+  khoảng`/`trong` deadline alternations. Fixed.
+- **MINOR** — H-probes asserted revival but not bound semantics. Added
+  H31–H37: auxiliary-onlyTerms probes (incl. coverage-level
+  `chỉ cần` plannability), `csv` positive binding, all new ordinals,
+  `giây` deadline consistency, `tháng 500` non-masking, ceiling max-type.
+- **NIT** — K″-3 mechanism wording corrected (backstop carried
+  `max:50`, not `min:50`; the harm was a coverable obligation with no
+  constraint record).
+
+Reviewer-verified-clean (no action): DEADLINE_RE lookaround equivalence
+(`trước khi/mắt/đây/hết/tiên` do not false-positive; `10giờ` glued does
+not match), TEMPORAL mask never hides a real floor (`trước 5 đơn hàng`
+keeps 5; `Tăng 500` survives), prohibition still outranks `không quá`,
+remaining `\b` sites all ASCII-edged or deliberately bare, `x<=5`→` <= 5`
+left-edge change is the intended token-boundary semantics, and the `_`
+boundary delta (`due_date` mints deadline) is acceptable.
+
+Post-remediation probes: **37/37 adversarial green**.

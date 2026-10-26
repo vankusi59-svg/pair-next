@@ -397,11 +397,19 @@ function prohibitionHead(clause: string): string {
   return clause;
 }
 
+/* K″ audit — every boundary here is a unicode lookaround, never `\b`:
+ *  `giờ` ends on the non-ASCII vowel `ờ` where ASCII `\b` can never
+ *  fire, so "trước 10 giờ" / "trong vòng 30 giờ" minted no deadline
+ *  row AND leaked `10`/`30` into the bare-quantity scan. */
 const DEADLINE_RE =
-  /\bdeadline\b|\bdue\b|\bhạn\b|\btrước ngày\b|\btrước\b.{0,12}\b(?:giờ|ngày)\b|\bby\s+\d{1,2}[/-]\d{1,2}|\bwithin\s+\d+\s*(?:days?|weeks?|months?|hours?)\b|\bin\s+\d+\s*(?:days?|weeks?|months?)\b|\btrong\s+vòng\s+\d+\s*(?:ngày|tuần|tháng|giờ)\b|\btrong\s+khoảng\s+\d+\s*(?:ngày|tuần|tháng|giờ)\b|\btrong\s+\d+\s*(?:ngày|tuần|tháng)\b/iu;
+  /(?<![\p{L}\p{N}])deadline(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])due(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])hạn(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước ngày(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trước(?![\p{L}\p{N}]).{0,12}(?<![\p{L}\p{N}])(?:giờ|ngày)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])by\s+\d{1,2}[/-]\d{1,2}|(?<![\p{L}\p{N}])within\s+\d+\s*(?:days?|weeks?|months?|hours?|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in\s+\d+\s*(?:days?|weeks?|months?)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+vòng\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+khoảng\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])trong\s+\d+\s*(?:ngày|tuần|tháng|giờ|phút|giây)(?![\p{L}\p{N}])/iu;
 
+/* K″ audit — `không quá` (ends `á`), bare `chỉ` (`ỉ`) and `ngoại trừ`
+ *  (`ừ`) were dead under ASCII `\b`: "không quá 50 USD" minted no
+ *  constraint and fell through to the preserved-obligation backstop —
+ *  a ceiling inverting into a floor. Unicode lookarounds throughout. */
 const CONSTRAINT_RE =
-  /\bbudget\b|\bngân sách\b|\btối đa\b|\bkhông quá\b|\bonly\b|\bchỉ\b|\bchỉ được\b|\bngoại trừ\b|\bexcept\b|\bin (?:english|vietnamese|spanish|french|japanese)\b|\bbằng tiếng\b|\b(?:max|maximum|up to|at most)\s+\d|\b(?:<=|≤)\s*\$?\s*\d/i;
+  /(?<![\p{L}\p{N}])budget(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngân sách(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])tối đa(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])không quá(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])only(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])chỉ được(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])ngoại trừ(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])except(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])in (?:english|vietnamese|spanish|french|japanese)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])bằng tiếng(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:max|maximum|up to|at most)\s+\d|(?<![\p{L}\p{N}])(?:<=|≤)\s*\$?\s*\d/iu;
 
 const BUDGET_RE =
   /\bbudget\b[^\d]{0,20}(\d+(?:\.\d+)?)|\bngân sách\b[^\d]{0,20}(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)\s*(?:budget|max|tối đa)/i;
@@ -617,8 +625,16 @@ const QUANTITY_EXACT_RE =
  *  ngày", a bare year "…in 2026". Masked before the bare-quantity scan
  *  in both contract extraction and task-side floor comparison so a
  *  deadline can neither mint a phantom floor nor satisfy a real one. */
+/* K″ audit — trailing edges are `(?![\p{L}\p{N}])`, never `\b`: `giờ`
+ *  ends on `ờ` where ASCII `\b` cannot fire, so `30 giờ` leaked into
+ *  the quantity scan on both the contract side (phantom floor) and
+ *  the task side (a duration satisfying an unrelated floor). */
+/* Date ordinals — `ngày 15`, `tháng 5`, `ngày 15/10` (dd/mm tail),
+ * `thứ 6`, `tuần 15`, `quý 3`, `week 15`, `năm 2026`, `day 365` are
+ * schedule positions, never quantity floors. Per-unit digit bounds so
+ * `tháng 500 đơn` keeps its real 500. */
 export const TEMPORAL_NUM_RE =
-  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong)\s+\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm)\b|\b\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm)\b|\b(?:19|20)\d{2}\b/giu;
+  /(?:within|in|trong\s+vòng|trong\s+khoảng|trong|trước)\s+\d+\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])\d+\s*[-–]?\s*(?:days?|weeks?|months?|years?|hours?|ngày|tuần|tháng|giờ|năm|phút|giây)(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:ngày|day)\s+\d{1,3}(?:\s*[/–-]\s*\d{1,2}(?:\s*[/–-]\s*\d{2,4})?)?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:tháng|month)\s+\d{1,2}(?:\s*[/–-]\s*\d{2,4})?(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:thứ|tuần|quý|week)\s+\d{1,2}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])năm\s+\d{1,4}(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:19|20)\d{2}(?![\p{L}\p{N}])/giu;
 /* Semantic Planning V1 (C′) — grouped-thousand forms: `1,000` (EN) is
  *  unambiguous thousands grouping; VI `1.000` is accepted only with a
  *  VI-unit lookahead so a version/decimals token ("1.000.2") never
@@ -698,11 +714,24 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
  *  alternation match ("use only" capturing "use") can never win. */
 const ONLY_AFTER_RE = /\bonly\s+([\p{L}\p{N}_-]+)/iu;
 const ONLY_BEFORE_RE = /([\p{L}\p{N}_-]+(?:\s+[\p{L}\p{N}_-]+){0,2})\s+only\b/iu;
-const ONLY_VI_RE = /\bchỉ\s+(?:dùng\s+|dụng\s+)?([\p{L}\p{N}_-]+)/iu;
+/* K″ follow-up — `chỉ` is now live again (CONSTRAINT_RE edge fixed), so
+ *  this extractor must not bind VI auxiliaries/modals as the permitted
+ *  value: "chỉ được dùng CSV" must bind `csv`, but "chỉ cần/muốn/là/số/
+ *  trong …" binds a function word no task can carry — an onlyTerm minted
+ *  on an auxiliary is unsatisfiable by construction (guaranteed fail-
+ *  closed). The skip-chain strips licensed auxiliaries; the stop-set
+ *  degrades everything else to a harmless PRESERVED constraint. */
+const ONLY_VI_RE =
+  /(?<![\p{L}\p{N}])chỉ\s+(?:(?:dùng|dụng|được)\s+)*([\p{L}\p{N}_-]+)/iu;
 const ONLY_TERM_STOP = new Set([
   "the", "a", "an", "this", "that", "these", "those", "one", "two",
   "for", "to", "in", "on", "at", "of", "with", "by", "as", "be",
   "use", "using", "dùng", "dụng", "if", "when", "than", "then",
+  // VI function words — `chỉ <modal|aux|function>` is hedging, never a
+  // bounded permitted value (K″ review: chỉ cần/muốn/được/là/số/trong).
+  "cần", "muốn", "được", "là", "để", "sẽ", "mới", "vẫn", "có",
+  "phải", "nên", "mong", "hỏi", "xem", "số", "thị", "đạo", "trong",
+  "với", "cho", "của", "thôi", "hãy", "xin",
 ]);
 
 function extractOnlyTerms(clause: string): string[] | undefined {
