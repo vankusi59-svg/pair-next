@@ -52,6 +52,7 @@ import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   AUTONOMOUS_EXECUTOR_IDS,
   beginPlannerRun,
@@ -112,7 +113,7 @@ import {
   type PlannerCandidate,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-sub-auto-ceo-"));
+const ROOT = mkTmpDir("pair-sub-auto-ceo-");
 const OP = "1882810918";
 const OWNER = `operator:${OP}`;
 const FUTURE = "2999-01-01T00:00:00.000Z";

@@ -28,6 +28,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -73,7 +74,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-goalctx-"));
+const ROOT = mkTmpDir("pair-goalctx-");
 let counter = 0;
 let seq = 0;
 const servers: Server[] = [];
@@ -689,7 +690,7 @@ const missionState = (s: ReturnType<typeof govStack>, mid: string) =>
  *  fails every declared artifact closed at the ingest boundary, so
  *  full-mission COMPLETED is only observable where the probe reads. */
 const LOCAL_INGEST_SUPPORTED = (() => {
-  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pair-ingest-probe-"));
+  const probeRoot = mkTmpDir("pair-ingest-probe-");
   const probeFile = path.join(probeRoot, "probe.txt");
   fs.writeFileSync(probeFile, "probe");
   return secureReadContained(probeFile, 1 << 20, [probeRoot]).kind === "ok";

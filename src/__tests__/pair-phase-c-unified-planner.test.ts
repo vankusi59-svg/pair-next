@@ -29,6 +29,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -61,7 +62,7 @@ import {
   type PlannerCandidate,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phasec-"));
+const ROOT = mkTmpDir("pair-phasec-");
 let counter = 0;
 const OP = "op:phasec";
 const CAPS = SERVE_LLM_PLANNER_CAPS.slice();

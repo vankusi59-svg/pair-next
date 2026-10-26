@@ -16,6 +16,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactProvenanceValidator,
   ExperienceExtractor,
@@ -50,7 +51,7 @@ const noopCompute = {
   },
 } as unknown as ComputeClient;
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p7-live-"));
+const ROOT = mkTmpDir("pair-p7-live-");
 const LIVE_ENV = { os: process.platform, arch: process.arch, node: process.version.split(".")[0] };
 
 function makeCtx(name: string) {

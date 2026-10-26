@@ -7,6 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { DurableScheduler } from "../heartbeat/scheduler.js";
 import { buildTickContext } from "../heartbeat/tick-context.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   MockComputeClient,
   createTestDb,
@@ -419,7 +420,7 @@ describe("DurableScheduler", () => {
       const fs = await import("fs");
       const path = await import("path");
       const os = await import("os");
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-yaml-test-"));
+      const tmpDir = mkTmpDir("hb-yaml-test-");
       const configPath = path.join(tmpDir, "heartbeat.yml");
       fs.writeFileSync(configPath, "invalid: yaml: content: [unterminated");
 
@@ -447,7 +448,7 @@ describe("DurableScheduler", () => {
       const fs = await import("fs");
       const path = await import("path");
       const os = await import("os");
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-zero-test-"));
+      const tmpDir = mkTmpDir("hb-zero-test-");
       const configPath = path.join(tmpDir, "heartbeat.yml");
 
       // YAML with explicit zero values

@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   classifyOperationalIntents,
   classifyRequestCredential,
@@ -44,7 +45,7 @@ import {
   type OperatorContextRequest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phase1-op-"));
+const ROOT = mkTmpDir("pair-phase1-op-");
 let counter = 0;
 
 type Responder = (input: ConversationInvokeInput) => string | Error;

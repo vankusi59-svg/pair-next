@@ -23,6 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -75,7 +76,7 @@ import {
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p153-"));
+const ROOT = mkTmpDir("pair-p153-");
 const ROOT_DIR2 = path.resolve(import.meta.dirname, "..", "..");
 let counter = 0;
 const OP = "1882810918";

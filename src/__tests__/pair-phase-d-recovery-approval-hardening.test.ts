@@ -19,6 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 
 import {
   ApprovalQueue,
@@ -43,7 +44,7 @@ import {
 import type { ExecutorAdapter } from "../pair/adapter.js";
 
 function freshDir(prefix: string) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `pair-phd-${prefix}-`));
+  return mkTmpDir(`pair-phd-${prefix}-`);
 }
 
 class ScriptedAdapter implements ExecutorAdapter {

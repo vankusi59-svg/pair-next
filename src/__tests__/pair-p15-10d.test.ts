@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -73,7 +74,7 @@ import {
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p1510d-"));
+const ROOT = mkTmpDir("pair-p1510d-");
 let counter = 0;
 const OP = "1882810918";
 const OWNER = `operator:${OP}`;

@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PairEvidenceStore } from "../pair/store.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   runPlannerFailover,
   PLANNER_FAILURE_CLASS,
@@ -58,7 +59,7 @@ import {
 import { validatePlanProposal } from "../pair/proposal.js";
 import { IntegrityError } from "../pair/errors.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-cpl1-"));
+const ROOT = mkTmpDir("pair-cpl1-");
 const ROOT_DIR = path.resolve(import.meta.dirname, "..", "..");
 let counter = 0;
 const freshDir = (n: string) => {

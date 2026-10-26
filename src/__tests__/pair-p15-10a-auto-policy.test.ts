@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   BusinessLayer,
   ExecutorRegistry,
@@ -47,7 +48,7 @@ import {
 import { ObjectiveAutoPolicyService } from "../pair/objective-auto-policy.js";
 import type { Server } from "node:http";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p1510a-"));
+const ROOT = mkTmpDir("pair-p1510a-");
 let counter = 0;
 const OP = "1882810918";
 const OWNER = `operator:${OP}`;

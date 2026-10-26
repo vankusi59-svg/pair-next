@@ -29,6 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -50,7 +51,7 @@ import {
   digest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-step0-http-"));
+const ROOT = mkTmpDir("pair-step0-http-");
 let counter = 0;
 const OP = "step0-owner";
 const OWNER = `operator:${OP}`;

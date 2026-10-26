@@ -13,6 +13,7 @@ import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -41,7 +42,7 @@ import {
   type ConversationInvoker,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158e-bridge-"));
+const ROOT = mkTmpDir("pair-p158e-bridge-");
 const CHAT = "1882810918";
 const TOK = "mc-test-token";
 const servers: Server[] = [];

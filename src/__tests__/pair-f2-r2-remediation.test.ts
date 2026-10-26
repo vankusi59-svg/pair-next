@@ -22,6 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import { describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactDependencyResolver,
   artifactDependencySetDigest,
@@ -43,7 +44,7 @@ import {
   type DependencyArtifactEntry,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f2-r2-"));
+const ROOT = mkTmpDir("pair-f2-r2-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

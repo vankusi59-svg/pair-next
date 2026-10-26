@@ -25,6 +25,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactProvenanceValidator,
@@ -57,7 +58,7 @@ import {
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import { digest } from "../pair/canonical.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f5-"));
+const ROOT = mkTmpDir("pair-f5-");
 let n = 0;
 const freshDir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

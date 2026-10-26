@@ -5,6 +5,8 @@ export default defineConfig({
     testTimeout: 30_000,
     teardownTimeout: 5_000,
     include: ["src/__tests__/**/*.test.ts"],
+    setupFiles: ["src/test-utils/vitest-tmp-cleanup.ts"],
+    globalSetup: ["vitest.global-setup.ts"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

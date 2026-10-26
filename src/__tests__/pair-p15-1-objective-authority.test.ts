@@ -26,6 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   BusinessLayer,
   IntegrityError,
@@ -35,7 +36,7 @@ import {
   digest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p151-"));
+const ROOT = mkTmpDir("pair-p151-");
 let counter = 0;
 
 function freshDb(name: string): { dbPath: string; store: PairEvidenceStore; svc: ObjectiveAuthorityService } {

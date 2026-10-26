@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CredentialEnvSource,
   DshConfigSource,
@@ -34,7 +35,7 @@ import {
 } from "../pair/index.js";
 import { DshConfigModelAdapter } from "../pair/model-discovery.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p6-"));
+const ROOT = mkTmpDir("pair-p6-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

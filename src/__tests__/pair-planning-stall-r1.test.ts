@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ExecutorRegistry,
@@ -46,7 +47,7 @@ import {
 } from "../pair/index.js";
 import type { RuntimePlanner } from "../pair/mission-runtime.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-ps-"));
+const ROOT = mkTmpDir("pair-ps-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

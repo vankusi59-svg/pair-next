@@ -23,6 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ConversationReadGrantService,
   ConversationSessionService,
@@ -40,7 +41,7 @@ import {
   type OperatorContextRequest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p16-d-"));
+const ROOT = mkTmpDir("pair-p16-d-");
 let counter = 0;
 const NOW = "2026-10-20T00:00:00.000Z";
 const NOW_MS = Date.parse(NOW);

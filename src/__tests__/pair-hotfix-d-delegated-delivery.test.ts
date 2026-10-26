@@ -40,6 +40,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   assertPlanDataflow,
@@ -90,7 +91,7 @@ import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-hotfixd-"));
+const ROOT = mkTmpDir("pair-hotfixd-");
 let counter = 0;
 let seq = 0;
 const OP = "op:test";

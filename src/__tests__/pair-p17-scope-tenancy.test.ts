@@ -38,6 +38,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -76,7 +77,7 @@ import { SemanticMemoryManager } from "../memory/semantic.js";
 import { ProceduralMemoryManager } from "../memory/procedural.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p17-scope-"));
+const ROOT = mkTmpDir("pair-p17-scope-");
 let counter = 0;
 const OP = "p17-owner";
 const OWNER = `operator:${OP}`;

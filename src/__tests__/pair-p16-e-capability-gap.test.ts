@@ -44,6 +44,7 @@ import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   PairEvidenceStore,
   BusinessLayer,
@@ -71,7 +72,7 @@ import {
   qualifyModel,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p16e-"));
+const ROOT = mkTmpDir("pair-p16e-");
 const OP = "1882810918";
 const OWNER = "operator:" + OP;
 const FUTURE = "2999-01-01T00:00:00.000Z";

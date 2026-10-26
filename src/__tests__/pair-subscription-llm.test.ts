@@ -33,6 +33,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   assertCodexOnlyPlannerRoute,
   assertCodexCliPlannerTransport,
@@ -370,7 +371,7 @@ describe("S6 — Conversation Reasoning: codex-only, both chat surfaces", () => 
   let store: PairEvidenceStore;
 
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-sub-llm-"));
+    dir = mkTmpDir("pair-sub-llm-");
     store = new PairEvidenceStore(path.join(dir, "pair.db"));
   });
   afterEach(() => {

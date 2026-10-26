@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -51,7 +52,7 @@ import {
   usdToMicrousd,
 } from "../../apps/mission-control-ui/src/lib/objective-display.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p157-"));
+const ROOT = mkTmpDir("pair-p157-");
 let counter = 0;
 const OP = "1882810918";
 const TOK = "mc-test-token";

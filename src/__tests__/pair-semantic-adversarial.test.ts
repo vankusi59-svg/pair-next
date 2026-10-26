@@ -15,6 +15,7 @@ import { assertPlanCoverage } from "../pair/plan-coverage.js";
 import { detectOutputLanguage } from "../pair/output-language.js";
 import { goalRequiresCurrentExternalData } from "../pair/llm-planner.js";
 import { makeServeCanonicalizer, SERVE_LLM_PLANNER_CAPS } from "../pair/serve-planner.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   PlanningContextService,
   renderPlanningContextBlock,
@@ -41,7 +42,7 @@ import type { PlanningContextEnvelope } from "../pair/planning-context.js";
 let tmpN = 0;
 function freshStore(): PairEvidenceStore {
   return new PairEvidenceStore(
-    path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pair-semadv-")), `s-${tmpN++}.db`),
+    path.join(mkTmpDir("pair-semadv-"), `s-${tmpN++}.db`),
   );
 }
 
@@ -628,9 +629,14 @@ describe("SEM-ADV — K″ follow-up: revived edges mint satisfiable semantics",
         if (o.quantity) expect(o.quantity.min).toBeUndefined();
       }
     }
-    // Where an obligation row carries the ceiling it is max-typed.
+    // P18.5 F10 — the ceiling now mints a dimensioned constraint row
+    // (money-typed, enforced) instead of a preserved obligation row.
     const solo = extractGoalContract("không quá 50 USD mỗi tháng");
-    expect(solo.obligations[0]?.quantity).toEqual({ max: 50 });
+    const soloCon = contractRequirements(solo).find(
+      (r) => r.kind === "constraint",
+    );
+    expect(soloCon?.ceiling).toEqual({ amount: 50, kind: "money", unit: "usd" });
+    expect(soloCon?.maxAmount).toBe(50);
   });
 });
 
@@ -692,5 +698,293 @@ describe("SEM-ADV — final review: relief-vs-ban, dates, ranges, ceiling backst
   it("H42 — 'in 5 hours' mints a deadline like 'within 5 hours'", () => {
     expect(extractGoalContract("finish in 5 hours").deadline).toBeTruthy();
     expect(extractGoalContract("finish within 5 hours").deadline).toBeTruthy();
+  });
+});
+
+/* ---------- H43–H55: P18.5 F10 — dimensioned numeric ceilings ---------- */
+
+describe("SEM-ADV — F10: dimensioned numeric ceiling enforcement", () => {
+  const cons = (g: string) =>
+    contractRequirements(extractGoalContract(g)).filter((r) => r.kind === "constraint");
+  const cov = (g: string, tasks: ReturnType<typeof work>[]) =>
+    assertPlanCoverage(extractGoalContract(g), tasks);
+
+  it("H43 — ceiling minting is dimensioned: money / task-count / object-count / none", () => {
+    expect(cons("analyze the market, không quá 50 USD")[0]?.ceiling)
+      .toEqual({ amount: 50, kind: "money", unit: "usd" });
+    expect(cons("do the work, tối đa 3 tác vụ")[0]?.ceiling)
+      .toEqual({ amount: 3, kind: "task-count", unit: "tác vụ" });
+    expect(cons("research crypto, at most 5 outputs")[0]?.ceiling)
+      .toEqual({ amount: 5, kind: "object-count", unit: "outputs" });
+    expect(cons("sync the data, no more than 100 requests")[0]?.ceiling)
+      .toEqual({ amount: 100, kind: "object-count", unit: "requests" });
+    // Duration/frequency/percent units never mint an enforceable ceiling.
+    for (const g of [
+      "finish the audit, tối đa 3 ngày",
+      "run the job, at most 5 times",
+      "grow the channel, tối đa 20 phần trăm",
+    ]) {
+      for (const r of cons(g)) expect(r.ceiling).toBeUndefined();
+    }
+    // A bare ceiling with no unit stays preserved-only.
+    expect(cons("plan the work, at most 5")[0]?.ceiling).toBeUndefined();
+  });
+
+  it("H44 — money ceilings: under → PROVEN, over → VIOLATION, none → PRESERVED", () => {
+    const ok = cov("analyze the market, không quá 50 USD", [
+      work("t1", "analyze the market under a $30 budget"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+    expectIntegrity(
+      () => cov("analyze the market, không quá 50 USD", [
+        work("t1", "analyze the market spending $600"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    const noe = cov("analyze the market, không quá 50 USD", [
+      work("t1", "analyze the market"),
+    ]);
+    expect(noe.rows.find((r) => r.kind === "constraint")?.state).toBe("PRESERVED");
+  });
+
+  it("H45 — money ceilings: EN/VI equivalence and alternate units", () => {
+    // VI phrasing + đồng unit.
+    expectIntegrity(
+      () => cov("phân tích thị trường, tối đa 100 đồng", [
+        work("t1", "phân tích thị trường với 500 đồng"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    const ok = cov("phân tích thị trường, tối đa 100 đồng", [
+      work("t1", "phân tích thị trường với 50 đồng"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+    // $-prefix budget form stays money-typed.
+    expectIntegrity(
+      () => cov("do the analysis, budget max $500", [
+        work("t1", "do the analysis for $800"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("H46 — task-count ceilings bind the plan's own task count", () => {
+    expectIntegrity(
+      () => cov("build the report, tối đa 3 tác vụ", [
+        work("a", "build the report intro"),
+        work("b", "build the report body"),
+        work("c", "build the report annex"),
+        work("d", "build the report index"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    const ok = cov("build the report, tối đa 3 tác vụ", [
+      work("a", "build the report"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+  });
+
+  it("H47 — object-count ceilings bind only same-noun evidence", () => {
+    expectIntegrity(
+      () => cov("sync the data, no more than 100 requests", [
+        work("t1", "sync the data with 500 requests"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    // An unrelated number never violates and never satisfies.
+    const p = cov("sync the data, no more than 100 requests", [
+      work("t1", "sync the data on port 8080"),
+    ]);
+    expect(p.rows.find((r) => r.kind === "constraint")?.state).toBe("PRESERVED");
+  });
+
+  it("H48 — grouped numbers bind at true magnitude (1,000 / 1.000)", () => {
+    expect(cons("ship the release, no more than 1,000 files")[0]?.ceiling)
+      .toEqual({ amount: 1000, kind: "object-count", unit: "files" });
+    expectIntegrity(
+      () => cov("ship the release, no more than 1,000 files", [
+        work("t1", "ship the release with 1.001 files"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    // 1,000 under a 1,000 bound is within — the bound reads true magnitude.
+    const ok = cov("ship the release, no more than 1,000 files", [
+      work("t1", "ship the release with 1,000 files"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+  });
+
+  it("H49 — obligation quantity.max: exceeding evidence is contradicted", () => {
+    expectIntegrity(
+      () => cov("produce at most 50 reports", [
+        work("t1", "produce 60 reports"),
+      ]),
+      "PLAN_INCOMPLETE",
+    );
+    const ok = cov("produce at most 50 reports", [
+      work("t1", "produce 30 reports"),
+    ]);
+    expect(ok.rows[0]?.state).toBe("PROVEN");
+  });
+
+  it("H50 — an unquantified task can never prove a hard ceiling", () => {
+    // "produce at most 50 reports" + vague task → unverifiable → fail closed.
+    expectIntegrity(
+      () => cov("produce at most 50 reports", [
+        work("t1", "produce the reports"),
+      ]),
+      "PLAN_INCOMPLETE",
+    );
+  });
+
+  it("H51 — exact quantities reject over-delivery", () => {
+    const ok = cov("produce exactly 3 reports", [work("t1", "produce 3 reports")]);
+    expect(ok.rows[0]?.state).toBe("PROVEN");
+    expectIntegrity(
+      () => cov("produce exactly 3 reports", [work("t1", "produce 5 reports")]),
+      "PLAN_INCOMPLETE",
+    );
+  });
+
+  it("H52 — dates/durations never mint or speak for ceilings", () => {
+    // Temporal numbers in the bound's own clause: "by 15/10" is not a ceiling.
+    const c = extractGoalContract("submit the report by 15/10");
+    expect(c.deadline).toBeTruthy();
+    for (const r of contractRequirements(c)) {
+      expect(r.ceiling).toBeUndefined();
+    }
+    // A year or duration number in task text is never bound evidence.
+    const p = cov("sync the data, no more than 10 requests", [
+      work("t1", "sync the data in 2025 for 30 days"),
+    ]);
+    expect(p.rows.find((r) => r.kind === "constraint")?.state).toBe("PRESERVED");
+  });
+
+  it("H53 — file-like ceilings read declared produced artifacts", () => {
+    // "write 5 files" inside instruction text binds `files` directly.
+    expectIntegrity(
+      () => cov("research crypto, at most 3 files", [
+        work("t1", "research crypto and write 5 files"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("H54 — ceiling clauses mint no floor: ceiling ≠ floor", () => {
+    for (const g of [
+      "không quá 50 USD mỗi tháng",
+      "tối đa tháng 500 đơn hàng",
+      "no more than 100 requests",
+    ]) {
+      const c = extractGoalContract(g);
+      for (const o of c.obligations) {
+        expect(o.quantity?.min ?? 0).not.toBeGreaterThan(0);
+      }
+      for (const r of contractRequirements(c)) {
+        expect(r.quantity?.min).toBeUndefined();
+      }
+    }
+  });
+
+  it("H55 — advisory pair_coverage hints cannot bypass a violated ceiling", () => {
+    // A task forging advisory coverage evidence never mutes the gate —
+    // the violation throws before any hint is consulted, and a forged
+    // CON-row claim under metadata.pair_coverage itself fails closed
+    // (CON rows are never claimable).
+    const forged = work("t1", "analyze the market spending $600", undefined, {
+      metadata: { pair_coverage: ["CON_001"], proven: true },
+    });
+    try {
+      cov("analyze the market, không quá 50 USD", [forged]);
+      throw new Error("expected fail-closed throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(IntegrityError);
+      expect(String((e as IntegrityError).code ?? "")).toMatch(
+        /PLAN_CONSTRAINT_VIOLATION|PLAN_INCOMPLETE/,
+      );
+    }
+    const claim = work("t1", "analyze the market under a $30 budget", undefined, {
+      metadata: { pair_coverage: ["CON_001"] },
+    });
+    expectIntegrity(
+      () => cov("analyze the market, không quá 50 USD", [claim]),
+      "PLAN_INCOMPLETE",
+    );
+  });
+
+  it("H56 — currency-prefixed ceilings mint: $ / USD / maximum-of forms", () => {
+    expect(cons("do it, at most $500")[0]?.ceiling)
+      .toEqual({ amount: 500, kind: "money", unit: "$" });
+    expect(cons("cap it, at most USD 500")[0]?.ceiling)
+      .toEqual({ amount: 500, kind: "money", unit: "usd" });
+    expect(cons("limit work, maximum of 5 tasks")[0]?.ceiling)
+      .toEqual({ amount: 5, kind: "task-count", unit: "tasks" });
+  });
+
+  it("H57 — decimal ceilings keep true magnitude; never inflate ×10–100", () => {
+    expect(cons("x, budget at most $9.99")[0]?.maxAmount).toBe(9.99);
+    const ok = cov("x, budget at most $9.99", [work("t", "x for $9.99")]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+    expectIntegrity(
+      () => cov("x, budget at most $9.99", [work("t", "x for $99")]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("H58 — cross-currency evidence can neither satisfy nor violate a bound", () => {
+    // $50 ≈ 1.27M đồng — but no conversion is ever fabricated: a USD
+    // amount is not evidence about a VND bound.
+    const p = cov("phân tích thị trường, tối đa 100 đồng", [
+      work("t", "phân tích thị trường spending $50"),
+    ]);
+    expect(p.rows.find((r) => r.kind === "constraint")?.state).toBe("PRESERVED");
+    const ok = cov("phân tích thị trường, tối đa 100 đồng", [
+      work("t", "phân tích thị trường với 50 đồng"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+  });
+
+  it("H59 — multi-dimension clauses enforce every bound independently", () => {
+    // `budget $500` and `max 3 files` on one clause — neither shadows the other.
+    expectIntegrity(
+      () => cov("ship it, budget $500 max 3 files", [work("t", "ship it for $800")]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    expectIntegrity(
+      () => cov("ship it, budget $500 max 3 files", [work("t", "ship it writing 5 files")]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    // `only` bounds on a ceiling clause are never skipped — a sibling
+    // channel in task text is an explicit violation, not a skip.
+    expectIntegrity(
+      () => cov("send alerts only slack at most 3 tasks", [
+        work("t", "send alerts via discord"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("H60 — bound evidence binds across adjective gaps and sums plan-wide", () => {
+    expectIntegrity(
+      () => cov("write reports, no more than 3 reports", [
+        work("t", "write 5 technical reports"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    expectIntegrity(
+      () => cov("build it, at most 5 files", [
+        work("a", "build it writing 4 files"),
+        work("b", "build it writing 4 files"),
+      ]),
+      "PLAN_CONSTRAINT_VIOLATION",
+    );
+    const ok = cov("write reports, no more than 5 reports", [
+      work("t", "write 5 technical reports"),
+    ]);
+    expect(ok.rows.find((r) => r.kind === "constraint")?.state).toBe("PROVEN");
+    const p = cov("write reports, no more than 5 reports", [
+      work("t", "write reports"),
+    ]);
+    expect(p.rows.find((r) => r.kind === "constraint")?.state).toBe("PRESERVED");
   });
 });

@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ArtifactAuthority,
   ArtifactProvenanceValidator,
@@ -47,7 +48,7 @@ import { resolveDeliveryArtifactPath } from "../pair/telegram-delivery.js";
 const ON_WIN32 = process.platform === "win32";
 const dirLink = (target: string, link: string) =>
   fs.symlinkSync(target, link, ON_WIN32 ? "junction" : "dir");
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f1-r2-"));
+const ROOT = mkTmpDir("pair-f1-r2-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

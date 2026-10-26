@@ -15,6 +15,7 @@ import { extractGoalContract } from "../pair/goal-contract.js";
 import { assertPlanCoverage } from "../pair/plan-coverage.js";
 import { IntegrityError } from "../pair/errors.js";
 import { PairEvidenceStore } from "../pair/store.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   beginPlannerRun,
   persistPlannerAttemptStart,
@@ -156,7 +157,7 @@ describe("SEM-COV — outcome obligation coverage", () => {
 let tmpN = 0;
 function freshStore(): PairEvidenceStore {
   const p = path.join(
-    fs.mkdtempSync(path.join(os.tmpdir(), "pair-semcov-")),
+    mkTmpDir("pair-semcov-"),
     `s-${tmpN++}.db`,
   );
   return new PairEvidenceStore(p);

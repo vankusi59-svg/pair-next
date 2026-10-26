@@ -32,6 +32,7 @@ import type { ExecutorAdapter } from "../pair/adapter.js";
 import { classifyFailure } from "../pair/recovery-controller.js";
 import { registerGovernedExecutors } from "../pair/multi-executor.js";
 import { RouteSelector } from "../pair/route-selector.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -52,7 +53,7 @@ import {
   TRANSPORT_IN_PROCESS,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-rca-"));
+const ROOT = mkTmpDir("pair-rca-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

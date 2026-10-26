@@ -1,32 +1,21 @@
 {
-  "claim_id": "SEMANTIC_CONTEXT_PLANNING_V1_FULL",
-  "title": "Semantic & Context-Aware Planning V1 (full PR scope incl. K′/K″ remediation) — PlanningContextEnvelope advisory at async seams, deterministic EN/VI extraction + coverage, Unicode-boundary remediation, persisted coverage evidence, replan pinning",
+  "claim_id": "P18_5_GOVERNANCE_TEST_HARDENING",
+  "title": "P18.5 — F10 deterministic numeric-ceiling enforcement (money/task-count/object-count) + test temp-dir lifecycle remediation (mkTmpDir factory, registry cleanup, stale sweep)",
   "affected_surfaces": [
     "PLANNER",
     "MISSION_DRAFT",
-    "RECOVERY_REPLAY",
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "UI",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-semantic-planning-context.test.ts",
-    "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-semantic-adversarial.test.ts",
-    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
+    "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-goal-contract-produce-binding.test.ts",
     "src/__tests__/pair-goal-context-authority.test.ts",
-    "src/__tests__/pair-planner-prompt-contract.test.ts",
+    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
     "src/__tests__/pair-planner-contract-simplify.test.ts",
-    "src/__tests__/pair-cpl1-codex-planner.test.ts",
-    "src/__tests__/pair-p18-2-planner-adaptive-retry.test.ts",
     "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-p16-a-brain-context.test.ts",
-    "src/__tests__/pair-p16-b-reasoning-brief.test.ts",
-    "src/__tests__/pair-f3-plan-feasibility.test.ts",
-    "src/__tests__/pair-llm-planner.test.ts",
-    "src/__tests__/pair-output-delivery-contract.test.ts"
+    "src/__tests__/pair-tmpdir-lifecycle.test.ts",
+    "src/__tests__/dev-verification.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
@@ -34,6 +23,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "Full PR #154 scope (46b05bf..HEAD) per docs/plans/2026-10-26-semantic-context-planning-v1.md + K′/K″ audit remediations. Core V1: PlanningContextEnvelope — advisory provenance-bound context snapshot (volatile-stripped digest) assembled only at the two async planner seams (planExpander + runReplanPoolGeneration), persisted as evidence, never bound into effective_input_digest/plan_digest, never a gate; deterministic EN/VI extraction + coverage extension (outcome verbs, grouped quantities, relative deadlines, prohibitions); PlanCoverageReport persisted on attempt/preview evidence + read-only UI; zero new provider invocations. K′ remediation: Unicode verb-boundary dead code (đ/í-edged lexemes → vacuous coverage), grouped-marker quantity collapse, temporal-number floors both directions, VI anchor stop-set, render-bound enforcement, trailing-connective trim, prohibition-term leak, reask staleness, UI guard. K″ remediation: ASCII \\b dead adjacent to non-ASCII-edged VI lexemes across DEADLINE_RE/TEMPORAL_NUM_RE ('trước 10 giờ'/'trong vòng 30 giờ' deadlines + duration masking both sides), CONSTRAINT_RE ('không quá'/'chỉ'/'ngoại trừ'/'<='/'≤' → ceilings can never invert into floors), LOCAL_SOURCE_RE ('cục bộ'/'dữ liệu'), output-language markers ('kết quả'/'đọc'), connective counter ('và'/'sau đó'); review follow-ups: không cần action-gate (relief-vs-ban), DD/MM + duration-range + ordinal masks, constraint-shaped backstop never promotes min, render ≤4096 bound; ONLY_VI_RE auxiliary skip-chain + VI function-word stop-set ('chỉ cần/muốn/được' no longer mints unsatisfiable onlyTerms), ordinal masks (thứ/tuần/quý/week/năm + dd/mm tails, per-unit digit bounds). Adversarial probes H1–H42 + SC-1..19 + PC-1..11. Deterministic authority/fail-closed semantics preserved; no auto-merge.",
+  "description": "P18.5 on base 2174e91 (post-#154 main). F10: dimension-aware numeric ceilings on constraint requirements - ceiling{amount,kind:money|task-count|object-count,unit} extracted from EN/VI ceiling markers (at most/no more than/up to/max/toi da/khong qua/khong vuot qua/nhieu nhat/khong hon/<=/<=) with grouped numbers; money ceilings feed legacy maxAmount, enforced via currency-tagged instructionAmounts - over bound VIOLATES (fail-closed), at/under PROVEN, no evidence PRESERVED (never fabricated); task-count ceilings enforce plan task count; object-count ceilings bind numbers to the same unit noun; duration/frequency/percent never mint ceilings; quantity.max enforced by contradiction via bound numbers; ceilings never invert into floors. Runtime note: plan-time inspection proves declared plan evidence only; unverifiable limits stay PRESERVED. Test infra: src/test-utils/tmpdir.ts factory (mkTmpDir registry + idempotent cleanupTmpDirs + exit hook + marker-gated sweepStaleTestDirs - VALID .pair-tmp-owner with ESRCH-confirmed dead pid mandatory; missing/malformed markers and live/EPERM-uncertain pids SKIP; prefix+age never proof; opt-in tmp-recover.mts for unmarked residue (dry-run + explicit --paths + --confirm + realpath containment); top-level links rejected pre-inspection via lstat+realpath; removal aborts on ununlinkable links (no unsafe rmSync); dirSize lstat-safe; mkTmpDir rejects escaping prefixes; oversized markers invalid), vitest setupFiles/globalSetup wiring, codemod of literal-prefix mkdtempSync callsites; measured residuals. No planner/canonicalizer/executor refactor; deterministic authority + fail-closed preserved; zero new provider invocations; no auto-merge",
   "risk_override": "HIGH"
 }

@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CodexCliExecutorAdapter,
   CODEX_EXECUTOR_ID,
@@ -21,7 +22,7 @@ import {
 
 const FAKE_ARGV_CODEX = path.resolve(__dirname, "fixtures", "fake-codex-argv.mjs");
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-cni1-"));
+const ROOT = mkTmpDir("pair-cni1-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

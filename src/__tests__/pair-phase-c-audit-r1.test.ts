@@ -30,6 +30,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { TOLERATED_FAILURES } from "../../scripts/dev-verification/lib.mjs";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -80,7 +81,7 @@ import {
 } from "../pair/index.js";
 import { llmPlan } from "../pair/llm-planner.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phasec-r1-"));
+const ROOT = mkTmpDir("pair-phasec-r1-");
 let counter = 0;
 const OP = "1882810918";
 const OWNER = `operator:${OP}`;

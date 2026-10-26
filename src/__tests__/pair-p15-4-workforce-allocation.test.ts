@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -43,7 +44,7 @@ import {
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 import { execFileSync } from "node:child_process";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p154-"));
+const ROOT = mkTmpDir("pair-p154-");
 let counter = 0;
 const OP = "1882810918";
 

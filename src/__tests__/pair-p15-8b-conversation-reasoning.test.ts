@@ -20,6 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   CodexCliConversationInvoker,
   conversationCliArgv,
@@ -47,7 +48,7 @@ import {
   type OperatorContextRequest,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158b-"));
+const ROOT = mkTmpDir("pair-p158b-");
 let counter = 0;
 const OWNER = "operator:owner-1";
 const OTHER = "operator:owner-2";

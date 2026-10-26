@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   IntegrityError,
   runPlannerFailover,
@@ -493,7 +494,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
   });
 
   it("18/19/20. durable single-row REASK provenance — written BEFORE the second invocation", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-"));
+    const dir = mkTmpDir("pair-preask-");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
     const order: string[] = [];
@@ -675,7 +676,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
   /* -------------------- R1 remediation — adversarial -------------------- */
 
   it("R1.A — re-proof authority throw settles ONCE, propagates exact code, zero REASK", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1a-"));
+    const dir = mkTmpDir("pair-preask-r1a-");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
     let eligCalls = 0;
@@ -743,7 +744,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
   });
 
   it("R1.B-1 — re-proof consuming the ENTIRE budget → no REASK, no marker, original PLAN_INVALID settle", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1b1-"));
+    const dir = mkTmpDir("pair-preask-r1b1-");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const run = beginPlannerRun(store, { routes: ["p:A", "p:B"], actor: "PAIR_PLANNER" });
     const calls: string[] = [];
@@ -864,7 +865,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
   });
 
   it("R1.C — persistence seam fail-closed: missing attempt evidence → REASK never invokes the model", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1c-"));
+    const dir = mkTmpDir("pair-preask-r1c-");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
     let planCalls = 0;
@@ -908,7 +909,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
   });
 
   it("R1.C-2 — non-STARTED attempt row blocks the re-ask at the canonical seam", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1c2-"));
+    const dir = mkTmpDir("pair-preask-r1c2-");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
     const start = persistPlannerAttemptStart(store, {

@@ -17,6 +17,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { PolicyEngine } from "../agent/policy-engine.js";
 import { createBuiltinTools, executeTool } from "../agent/tools.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   createTestDb,
   createTestIdentity,
@@ -48,7 +49,7 @@ import fs from "fs";
 // ─── Test Helpers ───────────────────────────────────────────────
 
 function createRawTestDb(): Database.Database {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "policy-test-"));
+  const tmpDir = mkTmpDir("policy-test-");
   const dbPath = path.join(tmpDir, "test.db");
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");

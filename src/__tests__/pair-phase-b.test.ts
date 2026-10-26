@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   DSH_EXECUTOR_ID,
@@ -73,7 +74,7 @@ import {
   type PlannerCandidate,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phase-b-"));
+const ROOT = mkTmpDir("pair-phase-b-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);
@@ -1654,7 +1655,7 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
       envReader: secretEnv,
       compatEnvRouteFallback: true, // compat dispatch path (Phase E §12)
     });
-    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-c-ws-"));
+    const ws = mkTmpDir("ht-c-ws-");
     const disp = dsh.dispatch(governedTask(ws, "DEEPSEEK_HARNESS", { timeout: 2, task_instruction: "HANG_FOREVER now" }));
     const t0 = Date.now();
     const o = await waitTerminal(dsh, String(disp.execution_id));
@@ -1673,7 +1674,7 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
       journalRoot: path.join(dir, "j"),
       executable: "node", executableArgs: [hang], envReader: secretEnv,
     });
-    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-d-ws-"));
+    const ws = mkTmpDir("ht-d-ws-");
     const disp = codex.dispatch(governedTask(ws, "CODEX", { timeout: 2 }));
     const o = await waitTerminal(codex, String(disp.execution_id));
     expect(o.status).toBe("TIMEOUT");

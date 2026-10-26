@@ -40,6 +40,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -68,7 +69,7 @@ import {
   type ConversationInvoker,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phase1-http-"));
+const ROOT = mkTmpDir("pair-phase1-http-");
 let counter = 0;
 const NOW = "2026-10-20T00:00:00.000Z";
 const OP = "op1"; // the VICTIM — owns real canonical resources

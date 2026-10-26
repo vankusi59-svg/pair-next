@@ -23,6 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   DevinExecutorAdapter,
@@ -45,7 +46,7 @@ import {
 } from "../pair/index.js";
 import type { DevinFetch } from "../pair/devin-executor.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-lorc-"));
+const ROOT = mkTmpDir("pair-lorc-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

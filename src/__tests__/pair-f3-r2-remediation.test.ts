@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import type {
   RuntimePlanner,
   RuntimePlannerInput,
@@ -46,7 +47,7 @@ import {
   type ReplanAttemptRecord,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f3-r2-"));
+const ROOT = mkTmpDir("pair-f3-r2-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

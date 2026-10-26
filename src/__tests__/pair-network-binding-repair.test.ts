@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   llmPlan,
   repairNetworkCapabilityBinding,
@@ -156,7 +157,7 @@ describe("NETWORK binding repair", () => {
   });
 
   it("T2 (codex lane parity): the SAME helper repairs identically on the codex transport", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-netrep-"));
+    const dir = mkTmpDir("pair-netrep-");
     const exe = path.join(dir, "fake-codex.cjs");
     fs.writeFileSync(
       exe,

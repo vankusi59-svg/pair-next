@@ -58,6 +58,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -97,7 +98,7 @@ import {
   type CeoInvokeResult,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p16c-"));
+const ROOT = mkTmpDir("pair-p16c-");
 let counter = 0;
 const OP = "p16c-owner";
 const OWNER = `operator:${OP}`;

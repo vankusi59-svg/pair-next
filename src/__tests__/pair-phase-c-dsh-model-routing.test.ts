@@ -19,6 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   assertDshCandidateEligible,
   assertDshExecutionModelRole,
@@ -50,7 +51,7 @@ import type { DshModelCandidate } from "../pair/index.js";
 
 const FAKE_ACP_PHC = path.resolve(__dirname, "fixtures", "fake-acp-agent-phc.mjs");
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phc-"));
+const ROOT = mkTmpDir("pair-phc-");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);

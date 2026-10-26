@@ -22,6 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 
 /* B4 drives the ASYNC child 'error' path (post-spawn ENOENT/EACCES —
  * the win32 failure shape Node delivers via the event, not a sync
@@ -71,7 +72,7 @@ import {
   utcnow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p0-codex-"));
+const ROOT = mkTmpDir("pair-p0-codex-");
 const isWin32 = process.platform === "win32";
 let n = 0;
 const dir = (s: string) => {

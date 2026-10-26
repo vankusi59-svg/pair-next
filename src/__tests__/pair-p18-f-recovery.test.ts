@@ -38,6 +38,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ObjectiveAutoPolicyService,
   ObjectiveAutoScheduler,
@@ -49,7 +50,7 @@ import {
   utcnow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p18f-recovery-"));
+const ROOT = mkTmpDir("pair-p18f-recovery-");
 const OP = "1882810918";
 const OWNER = "operator:" + OP;
 const FUTURE = "2999-01-01T00:00:00.000Z";

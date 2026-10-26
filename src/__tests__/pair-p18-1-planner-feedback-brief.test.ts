@@ -31,6 +31,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -62,7 +63,7 @@ import {
 } from "../pair/index.js";
 import { canonicallyTerminateMission } from "./canonical-mission-completion.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-pf-"));
+const ROOT = mkTmpDir("pair-pf-");
 const OP = "pf-owner";
 const OWNER = `operator:${OP}`;
 const KPI = "KPI_DELIVERABLES";

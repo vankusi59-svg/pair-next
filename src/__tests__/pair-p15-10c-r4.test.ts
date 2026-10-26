@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   BusinessLayer,
   DRIVER_ACTOR,
@@ -40,7 +41,7 @@ import {
   writeSchedulerRow,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p1510cr4-"));
+const ROOT = mkTmpDir("pair-p1510cr4-");
 const OP = "1882810918";
 const OWNER = "operator:" + OP;
 const FUTURE = "2999-01-01T00:00:00.000Z";

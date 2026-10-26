@@ -27,6 +27,7 @@ import type { RuntimePlanner, RuntimePlannerInput } from "../pair/mission-runtim
 import { createDatabase } from "../state/database.js";
 import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   ApprovalQueue,
   assertPlannerCandidateEligible,
@@ -86,7 +87,7 @@ import {
   type ReplanGenerationRecord,
 } from "../pair/index.js";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-async-replan-"));
+const ROOT = mkTmpDir("pair-async-replan-");
 let n = 0;
 const dir = (s: string) => {
   const p = path.join(ROOT, `${n++}-${s}`);

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import { buildWisdomFromGoal, createBudgetFromTask, emptyWisdom } from "../../ag
 import type { TaskNode } from "../../orchestration/task-graph.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
+import { mkTmpDir } from "../../test-utils/tmpdir.js";
 
 describe("agent/harness-types", () => {
   let tempDir: string | undefined;
@@ -58,7 +59,7 @@ describe("agent/harness-types", () => {
 
   it("builds wisdom from completed/failed goal tasks and workspace decisions", () => {
     const db = createInMemoryDb();
-    tempDir = mkdtempSync(path.join(os.tmpdir(), "harness-wisdom-"));
+    tempDir = mkTmpDir("harness-wisdom-");
     const workspace = new AgentWorkspace("goal-1", path.join(tempDir, "workspace"));
 
     db.prepare(

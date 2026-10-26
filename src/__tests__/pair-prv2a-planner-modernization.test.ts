@@ -20,6 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { mkTmpDir } from "../test-utils/tmpdir.js";
 import {
   deriveWorkTaskBudget,
   resolveWorkTaskBudget,
@@ -593,7 +594,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
 
 /* ---------------- R1.B — NETWORK_ACCESS is a real routing fact ---------------- */
 
-const NET_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-prv2a-r1b-"));
+const NET_ROOT = mkTmpDir("pair-prv2a-r1b-");
 let netCounter = 0;
 
 /** Minimal live adapter whose capability declaration is mutable — stands in
