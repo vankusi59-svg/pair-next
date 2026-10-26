@@ -81,3 +81,7 @@ introduced by the codemod/lifecycle change.
 - Historical unmarked dirs route to `scripts/dev-verification/tmp-recover.mts` — dry-run listing by default; deletion requires explicit `--paths` selection **and** `--confirm`, and still refuses outside-temp-root, non-allowlisted, and live-owned targets.
 
 Adversarial probes: S1 rewritten (unmarked aged dir survives), S1b (valid marker + dead pid + aged → reclaimed), A1 (unmarked `ws-`/`live-`/`pair-` aged dirs all survive), A2 (7 malformed-marker shapes), A3 (EPERM-uncertain liveness → skip via injectable `isAlive` seam — production `globalSetup` uses the real `pidIsAlive`).
+
+## Final closure — root junction escape
+
+Third adversarial pass caught that `statSync` follows links: a top-level `pair-*` junction's external target could qualify the entry on its own marker. Fixed at three layers — lstat rejection before inspection, realpath direct-child containment, and abort-not-fallthrough removal (`safeRemoveDir`/`unlinkReparsePoints` boolean contract, shared by sweep, registry cleanup, exit hook, and tmp-recover). Repro script retained at `scripts/dev-verification/repro-junction-escape.mts` (pre-fix: foreign tree mutated; post-fix: `removed=0`, everything survives).

@@ -21,12 +21,13 @@
  *   npx tsx scripts/dev-verification/tmp-recover.mts \
  *     --paths "C:\\Users\\x\\AppData\\Local\\Temp\\pair-abc" --confirm
  */
-import { readdirSync, statSync, lstatSync, unlinkSync, rmSync, realpathSync } from "node:fs";
+import { readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import {
   TEST_TMP_PREFIXES,
   ownerStatusOf,
+  safeRemoveDir,
 } from "../../src/test-utils/tmpdir.js";
 
 const args = process.argv.slice(2);
@@ -44,33 +45,17 @@ const root = (() => {
   }
 })();
 
-/** Unlink reparse points (junctions/symlinks) inside `dir` before
- *  rmSync — Node ≥24 native rmSync descends junctions into their
- *  targets. lstat flags junctions as symlinks on all Node versions. */
-function unlinkReparsePoints(dir: string, depth = 0): void {
-  if (depth > 64) return;
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    try {
-      if (lstatSync(p).isSymbolicLink()) unlinkSync(p);
-      else if (e.isDirectory()) unlinkReparsePoints(p, depth + 1);
-    } catch { /* locked entry — rmSync retries handle residue */ }
-  }
-}
-
-function dirSize(dir: string): number {
+function dirSize(dir: string, depth = 0): number {
   let bytes = 0;
+  if (depth > 64) return 0;
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
       const p = join(dir, e.name);
       try {
-        bytes += e.isDirectory() ? dirSize(p) : statSync(p).size;
+        const lst = lstatSync(p); // lstat only — never follow links
+        if (lst.isSymbolicLink()) bytes += lst.size;
+        else if (lst.isDirectory()) bytes += dirSize(p, depth + 1);
+        else bytes += lst.size;
       } catch { /* locked entry */ }
     }
   } catch { /* unreadable */ }
@@ -142,12 +127,11 @@ if (pathsArg) {
       console.log(`DRY   ${t}  ${fmtMb(bytes)} — pass --confirm to delete`);
       continue;
     }
-    try {
-      unlinkReparsePoints(t);
-      rmSync(t, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 });
+    if (safeRemoveDir(t)) {
       console.log(`DEL   ${t}  ${fmtMb(bytes)}`);
-    } catch (e) {
-      console.log(`FAIL  ${t}  ${(e as Error).message}`);
+    } else {
+      console.log(`FAIL  ${t}  removal aborted (lock or unsafe link)`);
+      process.exitCode = 1;
     }
   }
   if (!confirm) console.log("\nDry-run. Re-run with --confirm to delete the listed paths.");

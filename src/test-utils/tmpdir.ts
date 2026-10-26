@@ -108,39 +108,64 @@ function safeReal(path: string): string {
  *  descend into the junction TARGET — deleting real files outside the
  *  link. lstat().isSymbolicLink() flags junctions on every supported
  *  Node version, so unlinking them first bounds deletion to the dir's
- *  own contents on all engines. */
-function unlinkReparsePoints(dir: string, depth = 0): void {
-  if (depth > 64) return;
+ *  own contents on all engines.
+ *
+ *  Returns false — aborting the caller's rmSync — whenever certainty
+ *  is lost: a link that cannot be unlinked, a subdirectory that cannot
+ *  be listed (it may hide links), or the recursion ceiling. Never
+ *  falls through into an unverified recursive delete. */
+export function unlinkReparsePoints(dir: string, depth = 0): boolean {
+  if (depth > 64) return false;
   let entries: import("node:fs").Dirent[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    return;
+    return false; // cannot inspect → cannot prove link-free → abort
   }
   for (const e of entries) {
     const p = join(dir, e.name);
     try {
-      if (lstatSync(p).isSymbolicLink()) {
-        unlinkSync(p); // unlink the link itself, never its target
-      } else if (e.isDirectory()) {
-        unlinkReparsePoints(p, depth + 1);
+      const lst = lstatSync(p);
+      if (lst.isSymbolicLink()) {
+        try {
+          unlinkSync(p); // unlink the link itself, never its target
+        } catch {
+          return false; // link survived → recursive delete unsafe
+        }
+      } else if (lst.isDirectory() && !unlinkReparsePoints(p, depth + 1)) {
+        return false;
       }
     } catch {
-      /* locked/vanished entry — rmSync retry path handles residue */
+      /* A dir OR link whose lstat fails is unverifiable — it might be
+       * (or hide) a reparse point. Abort rather than let rmSync reach
+       * it. Plain files carry no traversal risk. */
+      if (e.isDirectory() || e.isSymbolicLink()) return false;
     }
+  }
+  return true;
+}
+
+/** Safe recursive removal: refuses to delete through a reparse point.
+ *  A top-level link is UNLINKED (never traversed); a real dir is only
+ *  rmSync'd after the pre-pass proves no link survives inside. */
+export function safeRemoveDir(dir: string): boolean {
+  try {
+    if (lstatSync(dir).isSymbolicLink()) {
+      unlinkSync(dir); // remove the link entry itself — target intact
+      return true;
+    }
+    if (!unlinkReparsePoints(dir)) return false; // abort, no rmSync
+    rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
 /** rm a single dir, tolerating Windows file locks via rmSync retries
  *  and swallowing terminal failures (ENOENT, EPERM, EBUSY residue). */
 function removeDir(dir: string): boolean {
-  try {
-    unlinkReparsePoints(dir);
-    rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 150 });
-    return true;
-  } catch {
-    return false;
-  }
+  return safeRemoveDir(dir);
 }
 
 function installExitHook(): void {
@@ -247,14 +272,17 @@ export function ownerStatusOf(
   return { status: isAlive(pid as number) ? "live" : "orphan", ts: ts as number };
 }
 
-function dirSize(dir: string): number {
+function dirSize(dir: string, depth = 0): number {
   let bytes = 0;
+  if (depth > 64) return 0;
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
       const p = join(dir, e.name);
       try {
-        if (e.isDirectory()) bytes += dirSize(p);
-        else bytes += statSync(p).size;
+        const lst = lstatSync(p); // lstat only — never follow links
+        if (lst.isSymbolicLink()) bytes += lst.size;
+        else if (lst.isDirectory()) bytes += dirSize(p, depth + 1);
+        else bytes += lst.size;
       } catch {
         /* locked entry — ignore */
       }
@@ -298,6 +326,31 @@ export function sweepStaleTestDirs(opts?: {
     if (!prefixes.some((p) => name.startsWith(p))) continue;
     const dir = join(root, name);
     res.scanned++;
+    // Reparse-point gate — BEFORE any marker inspection or deletion:
+    // statSync follows links, so a top-level junction could otherwise
+    // qualify on its TARGET's marker and let the pre-pass/rmSync
+    // mutate outside the authorized root. lstat sees the entry itself.
+    try {
+      if (lstatSync(dir).isSymbolicLink()) {
+        res.skipped++;
+        continue;
+      }
+    } catch {
+      res.skipped++;
+      continue;
+    }
+    // Canonical containment: the realpath must remain a direct child
+    // of the real temp root — no mid-path traversal may escape it.
+    try {
+      const real = realpathSync(dir);
+      if (real !== join(root, name) && real !== dir) {
+        res.skipped++;
+        continue;
+      }
+    } catch {
+      res.skipped++;
+      continue;
+    }
     // Ownership gate: a VALID marker is mandatory — prefix + age are
     // not proof. Missing/malformed/unreadable markers and any pid that
     // is live, inaccessible, or uncertain all SKIP; only a confirmed-

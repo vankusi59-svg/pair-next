@@ -52,3 +52,21 @@ Second independent pass on the uncommitted safety hotfix: marker-required sweep,
 Additional adversarial coverage: A1 (unmarked `ws-`/`live-`/`pair-` aged dirs all survive), A2 (10 malformed-marker shapes: garbage JSON, missing pid/ts, string/zero/float pid, negative/future ts, empty file), A3 (EPERM-shaped uncertain liveness → treated alive → skip via injected seam; production `globalSetup` uses real `pidIsAlive` — verified no production injection path).
 
 **Post-remediation verdict: SHIP** — no remaining path deletes a dir without a valid marker + ESRCH-confirmed dead owner + age gate + prefix allowlist + realpath containment under `os.tmpdir()` + reparse-point pre-unlink. Automatic sweep scope is unchanged (test-infra only; zero production PAIR runtime impact).
+
+## Third pass — root junction escape closure
+
+**Independently reproduced finding:** a top-level `%TEMP%\pair-*` junction passed the sweep because `statSync` follows links — its external target's valid dead-pid marker qualified the entry, and the reparse-point pre-pass `readdirSync`'d THROUGH the link into the foreign tree. Repro (`scripts/dev-verification/repro-junction-escape.mts`): pre-fix the sweep deleted a nested junction inside a victim dir outside the authorized root (unauthorized cross-root mutation); on rmSync variants that descend root junctions the victim's contents would have been deleted outright.
+
+**Closure:** (a) `lstatSync` gate on every top-level candidate — reparse points rejected BEFORE marker inspection; (b) realpath containment — candidate's realpath must equal its direct-child path under the real temp root; (c) `unlinkReparsePoints` returns boolean and aborts (no rmSync) on ununlinkable links, unreadable subdirs, or depth>64; (d) `safeRemoveDir` unlinks top-level links instead of traversing; (e) `dirSize` lstat-based; (f) `tmp-recover.mts` shares `safeRemoveDir`. Probes: A6 (junction + marker-bearing external victim staged under non-allowlisted parent — survives untouched, junction skipped), A7 (70-deep tree → abort, no unsafe rmSync), A8 (safeRemoveDir link semantics). Post-fix repro: `removed=0`, victim + nested junction + top junction all survive.
+
+### Third-pass residual findings — folded
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| L-1 | LOW | `unlinkReparsePoints` catch treated a failed `lstat` on a *link-typed* dirent as vanished — a persistent-but-unlstatable link could survive to rmSync | Fixed: abort on `isDirectory() \|\| isSymbolicLink()` — one clause, certainty contract restored |
+| L-2 | LOW | Residual dir↔junction TOCTOU inside the tree is inherent to Node (no openat/dirfd); window is µs-scale, no capability gain for same-user attacker | Documented: **the test suite must not run elevated** — an unelevated-planted junction could then reach elevated-only targets. Cheap re-lstat pre-rmSync noted; per-subdir windows inherent |
+| L-3 | LOW | Remaining `res.removed===0` assertions were environment-flaky (real host residue legitimately reclaims) | Fixed: all sweep-level assertions now prove survival of the test's own fixtures, not global counts |
+| I-5 | INFO | tmp-recover `FAIL` printed but exited 0 | Fixed: `process.exitCode = 1` |
+| I-7 | INFO | Pre-existing production `rmSync(recursive)` callsites (`src/skills/registry.ts`, `src/pair/codex-cli-transport.ts`) share the Node≥24 junction class — NOT in this diff | Follow-up recommended; test-infra scope preserved |
+
+**Final verdict: SHIP** — no deletion path can escape an authorized, owned temporary directory: top-level links rejected before inspection, containment proven on realpaths, removal aborts unless the tree is verified link-free, all three removal paths (sweep, registry cleanup, tmp-recover) funnel through `safeRemoveDir`.
