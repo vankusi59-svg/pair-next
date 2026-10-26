@@ -17,6 +17,7 @@ export * from "./output-language.js";
 export * from "./plan-dataflow.js";
 export * from "./plan-feasibility.js";
 export * from "./planning-context.js";
+export * from "./semantic-goal-understanding.js";
 export * from "./replan-generation.js";
 export * from "./serve-planner.js";
 export * from "./telegram-delivery.js";
