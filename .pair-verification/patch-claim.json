@@ -3,8 +3,9 @@
   "title": "Semantic & Context-Aware Planning V1 — PlanningContextEnvelope (advisory, provenance-bound) wired at the two async planner seams, deterministic EN/VI normalization + coverage extension, advisory semantic_hints verified by assertPlanCoverage, persisted coverage/explainability evidence",
   "affected_surfaces": [
     "PLANNER",
-    "GOAL_CONTRACT",
-    "PLAN_COVERAGE",
+    "MISSION_DRAFT",
+    "RECOVERY_REPLAY",
+    "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "UI",
     "DEV_INFRA"
