@@ -356,3 +356,23 @@ idempotent retries unchanged.
 Upgrade note: rows minted before this change carry token-set
 issue_keys; verify re-derives with the current function, so pre-R4
 approvals fail closed and need re-approval (pre-merge only).
+
+### Round-4 audit residuals — minors + one fold
+
+- **folded — newline goal-line injection:** `supplied` text and
+  approved-statement lines are whitespace-collapsed to single-line
+  `Operator-*:` records at mint; verify compares the same single-line
+  form. A `\nOperator-approved:` smuggle can no longer forge a
+  decision line; newline-bearing statements no longer mint
+  unverifiable approvals (probe `R4b` covers both).
+- **minor — VN diacritic fold merges accent-distinct words**
+  (bàn/bản/bán/bạn → `ban`): documented over-collapse; direction is
+  fail-closed (extra review, never a bypass).
+- **minor — case-fold merges** (US/us): inherent normalization
+  trade-off; fail-closed direction.
+- **note — pre-R4 approvals fail re-verify** (key format changed):
+  documented upgrade edge, pre-merge only.
+
+Independent audit round 5 verdict: **SHIP** — all four collision
+classes reproduced at 48ceba6 via extracted old code and verified
+distinct at HEAD through the real seam; no exploitable hole found.
