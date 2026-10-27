@@ -1299,9 +1299,11 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
         control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: String(pv2.plan_digest) }),
       ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
     }
-    // SAME issue, generically rephrased → still covered (genuine flow).
+    // SAME issue, canonical-identical (case/punct surface variant) →
+    // still covered (genuine reuse). A paraphrase is NOT provable
+    // identity and would now require fresh owner review.
     const a3 = fakeAnalysis(
-      [item({ id: "i1", category: "missing_information", statement: "telegram subscriber target missing", confidence: "high" })],
+      [item({ id: "i1", category: "missing_information", statement: "No telegram subscriber target, specified!", confidence: "high" })],
       approval.amended_goal,
     );
     const run3 = beginPlannerRun(store, {
@@ -1536,8 +1538,12 @@ describe("P18.6-IDENTITY-R3 — tokenizer + key-edge residuals", () => {
     expect(k("target of 5 launches unclear")).not.toBe(
       k("target of 9 launches unclear"),
     );
-    // Sanity: genuine rephrase of the same issue still collapses.
-    expect(k("no telegram subscriber target specified")).toBe(
+    // Sanity: canonical surface variants of the same issue collapse;
+    // a paraphrase does NOT (no longer provable identity).
+    expect(k("No Telegram Subscriber Target Specified!")).toBe(
+      k("no telegram subscriber target specified"),
+    );
+    expect(k("no telegram subscriber target specified")).not.toBe(
       k("telegram subscriber target missing"),
     );
   });
@@ -1681,5 +1687,70 @@ describe("P18.6-IDENTITY-R3 — tokenizer + key-edge residuals", () => {
         supplied: { i1: "different decision" },
       }),
     ).toThrow(/FAIL_CLOSED_PREVIEW_STATE/);
+  });
+});
+
+/* ==================================================================
+ * P18.6-IDENTITY-R4 — exact approval identity: negation, word-order,
+ * single-letter and direction/entity collisions must NOT share an
+ * issue key (token-SET equivalence discards all of them).
+ * ================================================================== */
+describe("P18.6-IDENTITY-R4 — canonical statement identity", () => {
+  const k = (s: string, category = "ambiguity") =>
+    issueKeyFor({ category, statement: s });
+
+  it("negation flips are never the reviewed issue", () => {
+    // 'no/not/do' were generic-filtered — opposite statements collided.
+    expect(k("no send to alice allowed unclear")).not.toBe(
+      k("send to alice allowed unclear"),
+    );
+    expect(k("do not delete backups unclear")).not.toBe(
+      k("do delete backups unclear"),
+    );
+    expect(k("retry limit not specified unclear")).not.toBe(
+      k("retry limit specified unclear"),
+    );
+  });
+
+  it("word-order/direction swaps are never the reviewed issue", () => {
+    // Sorted token sets collapse every permutation.
+    expect(k("alice notifies bob unclear")).not.toBe(
+      k("bob notifies alice unclear"),
+    );
+    expect(k("migrate mysql to postgres unclear")).not.toBe(
+      k("migrate postgres to mysql unclear"),
+    );
+    expect(k("export csv to pdf unclear")).not.toBe(
+      k("export pdf to csv unclear"),
+    );
+    expect(k("owner alice pays bob unclear")).not.toBe(
+      k("owner bob pays alice unclear"),
+    );
+  });
+
+  it("single-letter identifiers discriminate (tier a ≠ tier b)", () => {
+    expect(k("tier a limit unclear", "missing_information")).not.toBe(
+      k("tier b limit unclear", "missing_information"),
+    );
+    expect(k("option x rollout unclear")).not.toBe(
+      k("option y rollout unclear"),
+    );
+  });
+
+  it("genuinely identical statements still reuse (canonical surface variants)", () => {
+    // Case, punctuation, spacing, diacritic spelling — the SAME issue.
+    expect(k("No Telegram Subscriber Target!", "missing_information")).toBe(
+      k("no telegram subscriber target", "missing_information"),
+    );
+    expect(k("không có KPI rõ ràng", "missing_information")).toBe(
+      k("khong co kpi ro rang", "missing_information"),
+    );
+    expect(k("  KPI   target: 500? ", "missing_information")).toBe(
+      k("kpi target 500", "missing_information"),
+    );
+    // Category remains part of the identity.
+    expect(k("same wording", "ambiguity")).not.toBe(
+      k("same wording", "missing_information"),
+    );
   });
 });

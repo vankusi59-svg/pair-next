@@ -604,73 +604,48 @@ const APPROVABLE_AUTHORITIES = new Set<IntentAuthorityClass>([
 ]);
 
 /* ------------------------------------------------------------------
- * P18.6-IDENTITY — stable structured issue identity.
+ * P18.6-IDENTITY — stable, provenance-bound issue identity.
  *
- * An approval must bind THE SAME material issue — same entity,
- * dimension, quantity, scope — not merely similar wording. Token
- * overlap alone cannot establish that: "no telegram subscriber
- * target" and "no email subscriber target" share every generic word
- * yet are different issues. The issue key = category + the exact
- * discriminating token set (all content tokens minus issue-SHAPE
- * generic words). Generic-issue vocabulary is intentionally small:
- * words that describe the form of an ambiguity, never its subject.
+ * An approval must bind THE SAME material issue — never a similar one.
+ * Token-SET equivalence proved lossy: sorting discards word ORDER and
+ * direction ("alice notifies bob" ≡ "bob notifies alice"), generic-
+ * vocab filtering discards NEGATION ("do not delete" ≡ "do delete")
+ * and length floors discard single-letter identifiers ("tier a" ≡
+ * "tier b"). None of that is provable identity — paraphrase similarity
+ * is not approval evidence.
+ *
+ * The issue key is therefore the item's CANONICAL STATEMENT — a
+ * deterministic, order-preserving normalization: NFC → lowercase →
+ * đ→d (not NFD-decomposable) → NFD strip combining marks (accented and
+ * unaccented Vietnamese spellings of the same word collapse) →
+ * punctuation→space → whitespace collapse. Negation, direction,
+ * entity, quantity, unit, relationship and scope words are all
+ * preserved verbatim; only surface formatting varies. Two issues are
+ * identical iff their canonical statements are byte-equal — anything
+ * else requires explicit owner review (fail closed by construction).
  * ------------------------------------------------------------------ */
-const ISSUE_GENERIC_TOKENS = new Set<string>([
-  // english issue-shape words
-  "no","not","missing","unspecified","specified","given","information",
-  "info","required","requirement","requirements","unclear","ambiguous",
-  "defined","provided","lack","lacks","lacking","absent","none",
-  "without","any",
-  "is","are","be","the","a","an","for","of","to","in","on","at","by",
-  "per","and","or","with","value","amount","detail","details","exact",
-  "specific","needed","need","must","should","would","could","can",
-  "will","target","goal","scope","set","number","count","total",
-  "current","currently","appropriate","stated","mentioned","enough",
-  // NOTE: wh-dimension words (what/which/who/how/when/where/why) are
-  // deliberately NOT generic — "unclear WHEN to deploy" and "unclear
-  // WHERE to deploy" are different review questions (temporal vs
-  // location). They remain discriminating identity tokens.
-  // vietnamese issue-shape words (accented + unaccented forms)
-  "không","khong","chưa","chua","thiếu","thieu","thông","thong","tin",
-  "cần","can","phải","phai","được","duoc","của","cua","và","va","hoặc",
-  "hoac","cho","với","voi","trong","trên","tren","là","la","có","co",
-  "một","mot","các","cac","những","nhung","rõ","ro","đủ","du",
-  "xác","xac","định","dinh",
-]);
-
-/* Issue-identity tokenizer — intentionally NOT the reconciliation
- * `tokens()` (which drops len<3 for fuzzy-overlap tuning). Identity
- * binding exists precisely for short discriminating payloads: version
- * tags (v2/v3), region codes (us/eu/uk), small quantities (50/90/5/9),
- * roman numerals (ii/iv). Kept: len>=2 tokens AND single-char numerics;
- * single-char LETTERS stay dropped (noise — "a", stray possessives). */
-function issueTokens(s: string): Set<string> {
-  return new Set(
-    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/)
-      .filter((t) => t.length >= 2 || /\p{N}/u.test(t)),
-  );
+function canonicalIssueStatement(s: string): string {
+  return s
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/đ/g, "d")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 640);
 }
 
 /** The deterministic identity of an interpretation item's ISSUE —
- *  `category|sorted discriminating tokens`. Two items are the same
- *  issue iff category AND discriminating-token SET are equal; generic
- *  rephrasing ("no KPI specified" ↔ "KPI missing") collapses to the
- *  same key, while entity/channel/quantity/project swaps cannot. */
+ *  `category|canonical statement`. Identical issues reuse approval;
+ *  any provable difference — negation, ordering, entity, quantity,
+ *  identifier — is a different issue requiring fresh owner review. */
 export function issueKeyFor(item: {
   category: string;
   statement: string;
 }): string {
-  const disc = [...issueTokens(item.statement)]
-    .filter((t) => !ISSUE_GENERIC_TOKENS.has(t))
-    .sort();
-  // A content-free statement ("missing required information") yields an
-  // EMPTY discriminating set — left bare it would let any content-free
-  // statement cover any other in the category. Fall back to the
-  // normalized statement itself so only the identical statement covers.
-  const key =
-    disc.join(",") ||
-    item.statement.toLowerCase().replace(/\s+/g, " ").trim();
-  return `${item.category}|${key}`.slice(0, 640);
+  return `${item.category}|${canonicalIssueStatement(item.statement)}`;
 }
 
 /** An approved issue identity — the reviewable unit a resolution
