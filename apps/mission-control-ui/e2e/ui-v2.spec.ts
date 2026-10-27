@@ -136,28 +136,41 @@ test("v2 intake: negative budget blocked — invalid values never silently dropp
   const confirmBtn = page.getByRole("button", { name: "Tạo Objective →" });
 
   /* Finite-but-negative budgets used to pass validation then get dropped
-     from the create body — now they block confirm with a stated reason. */
-  for (const bad of ["-5", "-0.5", "abc", "Infinity", "1e999"]) {
+     from the create body — now they block confirm with a stated reason.
+     Overflow values are worse: 1e308*1e6 = Infinity → JSON null → the
+     canonical ceiling would silently become 0. All blocked up front. */
+  for (const bad of ["-5", "-0.5", "abc", "Infinity", "1e308", "1e309", "1e13"]) {
     await budget.fill(bad);
     await expect(confirmBtn, `budget "${bad}" must block confirm`).toBeDisabled();
   }
   await expect(page.getByText(/Nhập số USD hợp lệ/)).toBeVisible();
 
-  /* Empty = unset (allowed); zero and positive are explicit values that
-     must actually reach the canonical create body — not be dropped. */
+  /* Empty = unset (allowed). Boundary: max safe-integer microusd ≈
+     $9,007,199,254,740.99 — just above it is unrepresentable → blocked. */
+  await budget.fill("9007199254741");
+  await expect(confirmBtn, "above safe-integer microusd bound").toBeDisabled();
   await budget.fill("");
   await expect(confirmBtn).toBeEnabled();
+
+  /* Zero and positive are explicit values that must actually reach the
+     canonical create body — never dropped, truncated, or nulled. */
   let body: Record<string, unknown> | null = null;
   await page.route("**/api/vnext/objectives", async (route) => {
     body = route.request().postDataJSON() as Record<string, unknown>;
     await route.continue();
   });
+  await budget.fill("0");
+  await confirmBtn.click();
+  await page.locator(".cdlg-f button.primary").click();
+  await expect(page.locator(".pstate", { hasText: "Objective đã được tạo" })).toBeVisible({ timeout: 15000 });
+  expect(body).toBeTruthy();
+  expect(body!.budget_ceiling_microusd, "zero is an explicit 0 ceiling on the wire").toBe(0);
+
   await budget.fill("25");
   await confirmBtn.click();
   await expect(page.locator(".cdlg")).toBeVisible();
   await page.locator(".cdlg-f button.primary").click();
   await expect(page.locator(".pstate", { hasText: "Objective đã được tạo" })).toBeVisible({ timeout: 15000 });
-  expect(body).toBeTruthy();
   expect(body!.budget_ceiling_microusd, "positive budget reaches the canonical body as microusd").toBe(25_000_000);
   expect(body!.currency).toBe("USD");
 });

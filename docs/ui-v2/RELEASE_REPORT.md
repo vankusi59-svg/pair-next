@@ -200,9 +200,11 @@ surfaces; the gap is documented above.
   existing mission detail + autonomous-loop graph are the current
   surfaces.
 - Legacy advanced pages keep their design; only nav/style alignment.
-- 22 e2e failures = verified environment baseline + 5 stale-spec
-  defects (pre-existing; fixing them or qualifying a planner is out of
-  scope).
+- 22 e2e failures = 21 planner-environment (`FAIL_CLOSED_PLANNER_NO_ELIGIBLE`,
+  no qualified planner on this box) + 1 pre-existing spec/data defect
+  (`p184-operations` `mission_id` shape) — all identical-signature at BASE
+  per `evidence/e2e-signature-audit.json`; fixing them or qualifying a
+  planner is out of scope.
 - Tab row uses buttons without full APG arrow-key semantics (keyboard
   reachable, `?tab=` deep-linkable).
 - NUM_RE first-numeral KPI target is advisory-only (`suggested`

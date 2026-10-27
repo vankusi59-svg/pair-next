@@ -134,11 +134,15 @@ export function Intake() {
 
   /* Numeric fields must be valid-or-empty — a malformed value silently
      dropped at commit is dishonest. Block confirm with a stated reason.
-     Negative budgets are finite but uncommittable (canonical create
-     fails closed on <0 microusd): flag them instead of dropping them. */
+     The canonical ceiling is an integer microusd: negative, non-finite,
+     and overflow inputs (usd*1e6 not a safe integer — e.g. 1e308 →
+     Infinity → JSON null → ceiling 0) are all uncommittable; flag them
+     instead of dropping or truncating them. */
   const budgetUsdNum = draft ? Number(draft.budgetUsd) : NaN;
+  const budgetMicro = Math.round(budgetUsdNum * 1_000_000);
   const budgetInvalid =
-    !!draft && draft.budgetUsd.trim() !== "" && (!Number.isFinite(budgetUsdNum) || budgetUsdNum < 0);
+    !!draft && draft.budgetUsd.trim() !== "" &&
+    (!Number.isFinite(budgetUsdNum) || budgetUsdNum < 0 || !Number.isSafeInteger(budgetMicro));
   /* Canonical create requires a numeric target for every named KPI —
      flag it instead of letting the whole create fail server-side. */
   const kpiTargetInvalid =
@@ -152,7 +156,7 @@ export function Intake() {
     !busy && !bizDrift && !budgetInvalid && !kpiTargetInvalid;
 
   const confirmObjective = async () => {
-    if (!draft || !biz || busy || bizDrift) return;
+    if (!draft || !biz || busy || bizDrift || budgetInvalid || kpiTargetInvalid) return;
     setBusy(true);
     setErr(null);
     try {
@@ -164,9 +168,8 @@ export function Intake() {
       };
       const dl = draft.deadline.trim();
       if (dl) body.deadline = dl;
-      const usd = Number(draft.budgetUsd);
-      if (draft.budgetUsd.trim() !== "" && Number.isFinite(usd) && usd >= 0) {
-        body.budget_ceiling_microusd = Math.round(usd * 1_000_000);
+      if (draft.budgetUsd.trim() !== "" && Number.isSafeInteger(budgetMicro) && budgetMicro >= 0) {
+        body.budget_ceiling_microusd = budgetMicro;
         body.currency = "USD";
       }
       const kpis = draft.kpis
@@ -323,7 +326,7 @@ export function Intake() {
                     />
                     {budgetInvalid ? (
                       <div className="hint" style={{ color: "var(--danger)" }}>
-                        Nhập số USD hợp lệ (≥ 0) hoặc để trống — ví dụ: 20
+                        Nhập số USD hợp lệ (≥ 0, không vượt giới hạn canonical) hoặc để trống — ví dụ: 20
                       </div>
                     ) : resp.draft.budget_hint.value ? (
                       <div className="hint">từ văn bản: “{resp.draft.budget_hint.value}”</div>
