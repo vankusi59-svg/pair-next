@@ -376,3 +376,60 @@ approvals fail closed and need re-approval (pre-merge only).
 Independent audit round 5 verdict: **SHIP** — all four collision
 classes reproduced at 48ceba6 via extracted old code and verified
 distinct at HEAD through the real seam; no exploitable hole found.
+
+---
+
+## Round 5 — lossless approval identity (canonicalization correction)
+
+### Finding
+
+`canonicalIssueStatement()` still created false equivalence: NFD +
+combining-mark stripping folded Vietnamese diacritics (`bán` ≡ `bàn`
+— different words), punctuation→space removal merged currencies,
+dimensions and identifiers (`$500` ≡ `€500`, `5%` ≡ `5`, `C++` ≡
+`C#`), and lowercasing merged case-sensitive identifiers
+(`US` ≡ `us`, `API` ≡ `api`).
+
+### Reproduction (red probes, pre-remediation @d87a0f8)
+
+- `"số bán unclear"` ≡ `"số bàn unclear"` — mark-strip → SAME KEY.
+- `"budget $500 unclear"` ≡ `"budget €500 unclear"` — symbol-strip →
+  SAME KEY.
+- `"margin 5% unclear"` ≡ `"margin 5 unclear"` — SAME KEY.
+- `"port to C++ unclear"` ≡ `"port to C# unclear"` — SAME KEY.
+- `"region US unclear"` ≡ `"region us unclear"` — lowercase → SAME.
+- Same statement under `P1` ≡ under `P2` — scope absent from key.
+
+### Remediation
+
+`issueKeyFor(item, scope)` = `category | canonicalScopeKey(scope) |
+canonicalIssueStatement(statement)`:
+
+- `canonicalIssueStatement` — ONLY Unicode NFC + whitespace collapse
+  (runs → single space, edges trim) + ≤640 bound. No lowercase, no
+  diacritic folding, no punctuation/symbol stripping, no token
+  sorting, no stopword removal, no fuzzy matching — authorization
+  identity is byte-exact modulo whitespace/NFC.
+- `canonicalScopeKey` — `b=…;o=…;w=…;p=…` with `""`-normalized
+  dimensions (same semantics as the replan snapshot binding); the
+  scope lineage the issue was reviewed under is part of the
+  fingerprint.
+- `issueCoveredBy(item, approved, scope)` threads the CONFIRMED
+  revision's analysis scope — a review under one project/lineage
+  never covers an issue under another.
+- Mint stores `resolutions[].issue_key` under the new scheme; verify
+  re-derives keys from the pinned analysis — rows carrying any
+  previous key format disagree and fail closed (no silent migration).
+
+### Closure verification
+
+- 60/60 `pair-semantic-goal-understanding.test.ts` green incl. the
+  `P18.6-IDENTITY-R5` block (diacritic/currency/dimension/identifier/
+  case/scope collisions all distinct; whitespace+NFC positive
+  controls collapse) and `R5b` (old-format stored key → fail closed).
+- approve→amend→re-preview→confirm E2E green: whitespace-identical
+  variant confirms; paraphrase/case/scope-variant items blocked.
+- `npx tsc --noEmit` clean; adjacent suites 132/132.
+
+Upgrade note: rows minted under any prior key format fail re-proof —
+re-approval required (pre-merge only; no production exposure).
