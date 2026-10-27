@@ -199,3 +199,86 @@ test("v2: keyboard — skip link + VN nav focusable", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/app\/inbox/);
 });
+
+// ---------- Blocker A: workstreams are suggestion-only ----------
+test("v2 intake: analyzing a goal issues ZERO canonical creates — suggestion never writes", async ({ page }) => {
+  const biz = await mkBusiness(page, "nowrite");
+  const creates: string[] = [];
+  await page.route("**/api/**", (route) => {
+    const u = route.request().url();
+    const m = route.request().method();
+    /* The intake draft call itself is the only sanctioned POST; every
+       other write surface is a violation. */
+    if (m !== "GET" && !u.includes("/v1/intake/draft")) creates.push(`${m} ${u}`);
+    return route.fallback();
+  });
+  await seedBiz(page, biz.id);
+  await page.goto("/app/new");
+  await page.locator(".v2hero-in").fill(GOAL);
+  await page.getByRole("button", { name: /Phân tích yêu cầu/ }).click();
+  await expect(page.locator(".draftwrap")).toBeVisible();
+  await expect(page.locator(".draftwrap")).toContainText("Bản nháp");
+  expect(creates).toEqual([]);
+});
+
+test("v2 intake: workstream suggestions are honest — nothing persisted without owner confirm", async ({ page }) => {
+  const biz = await mkBusiness(page, "wshint");
+  /* Fixture response carrying workstreams — semantic OFF in e2e means
+     the real server returns a manual draft without them, so the copy
+     is verified against a shaped advisory payload. */
+  await page.route("**/api/v1/intake/draft", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        schema_version: "pair.intake-draft.v1",
+        mode: "guarded",
+        status: "analyzed",
+        unavailable_reason: null,
+        analysis_digest: "a".repeat(64),
+        source_goal_sha: "g".repeat(64),
+        provider_requests: 1,
+        ambiguity_class: "TRIVIAL",
+        items: [],
+        draft: {
+          suggested_kind: "objective",
+          title: { value: "Test objective", provenance: "suggested" },
+          statement: { value: "goal text", provenance: "explicit" },
+          deadline: { value: null, provenance: "unresolved" },
+          budget_ceiling_microusd: { value: null, provenance: "unresolved" },
+          budget_hint: { value: null, provenance: "unresolved" },
+          kpis: [],
+          hard_constraints: [],
+          success_conditions: [],
+          workstreams: [
+            { statement: "ws one", provenance: "suggested" },
+            { statement: "ws two", provenance: "suggested" },
+          ],
+          questions: [],
+        },
+      }),
+    }),
+  );
+  await seedBiz(page, biz.id);
+  await page.goto("/app/new");
+  await page.locator(".v2hero-in").fill(GOAL);
+  await page.getByRole("button", { name: /Phân tích yêu cầu/ }).click();
+  await expect(page.locator(".draftwrap")).toBeVisible();
+  /* Honest copy: labeled suggestion-only, explicitly not persisted,
+     explicitly not auto-created as work items. */
+  await expect(page.getByText("Kế hoạch gợi ý")).toBeVisible();
+  await expect(page.getByText(/KHÔNG được lưu hay tự tạo công việc/)).toBeVisible();
+  await expect(page.getByText(/không tạo work item\/mission từ danh sách này/i)).toBeVisible();
+  /* Objective path: confirm dialog discloses exactly what is persisted. */
+  await page.getByRole("radio", { name: /Objective/ }).click();
+  await page.getByRole("button", { name: "Tạo Objective →" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("dialog")).toContainText("Kế hoạch gợi ý");
+  await expect(page.getByRole("dialog")).toContainText("KHÔNG được lưu");
+  await page.getByRole("button", { name: "Cancel" }).click();
+  /* Mission path: only the goal statement travels. */
+  await page.getByRole("radio", { name: /Mission/ }).click();
+  await expect(page.getByText(/Chỉ nội dung mục tiêu được chuyển sang Task Entry/)).toBeVisible();
+  await page.getByRole("button", { name: /Tiếp tục — xem trước kế hoạch Mission/ }).click();
+  await expect(page).toHaveURL(/\/app\/missions\/new\?goal=goal%20text/);
+});

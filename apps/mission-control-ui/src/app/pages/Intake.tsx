@@ -499,9 +499,16 @@ export function Intake() {
                 {draft.workstreams.length ? (
                   <>
                     <h3 className="drh">
-                      Kế hoạch triển khai sơ bộ
-                      <span className="hint"> — gợi ý, sẽ thành công việc sau khi xác nhận</span>
+                      Kế hoạch gợi ý
+                      <span className="hint">
+                        {" "}— chỉ là đề xuất tham khảo, KHÔNG được lưu hay tự tạo công việc
+                      </span>
                     </h3>
+                    <div className="hint drpad">
+                      PairNext không tạo work item/mission từ danh sách này. Sau khi bạn xác nhận
+                      Objective/Mission, bạn tự tạo công việc cụ thể khi cần (Workforce Admin /
+                      Task Entry).
+                    </div>
                     <ol className="wsstep">
                       {draft.workstreams.map((w, i) => (
                         <li key={i}>
@@ -575,6 +582,11 @@ export function Intake() {
               ) : !biz && kind === "objective" ? (
                 <div className="hint" style={{ marginTop: 8 }}>
                   Chọn business ở góc trái sidebar để tạo Objective.
+                </div>
+              ) : kind === "mission" ? (
+                <div className="hint" style={{ marginTop: 8 }}>
+                  Chỉ nội dung mục tiêu được chuyển sang Task Entry — kế hoạch gợi ý ở trên là
+                  tham khảo, không đi kèm.
                 </div>
               ) : null}
             </div>
@@ -651,7 +663,7 @@ export function Intake() {
       <ConfirmDialog
         open={confirmOpen}
         title="Tạo Objective"
-        body={`Tạo Objective "${draft?.title ?? ""}" trong business ${biz}? Bản nháp sẽ trở thành objective canonical — các KPI/ràng buộc bạn để trống sẽ không được ghi.`}
+        body={`Tạo Objective "${draft?.title ?? ""}" trong business ${biz}? Chỉ tiêu đề, mục tiêu, thời hạn, ngân sách và các KPI/ràng buộc/điều kiện bạn nhập được ghi canonical — các ô trống và phần Kế hoạch gợi ý KHÔNG được lưu.`}
         confirmLabel="Tạo Objective"
         busy={busy}
         onCancel={() => setConfirmOpen(false)}
