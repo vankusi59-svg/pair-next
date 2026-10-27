@@ -433,3 +433,24 @@ canonicalIssueStatement(statement)`:
 
 Upgrade note: rows minted under any prior key format fail re-proof —
 re-approval required (pre-merge only; no production exposure).
+
+### Round-5 audit residuals — all folded (independent audit: SHIP)
+
+- **minor — scope-key delimiter ambiguity:** `canonicalScopeKey` now
+  JSON-encodes the scope tuple — dimension values can never smuggle
+  `;`/`=`/`|` segments regardless of future id alphabets.
+- **minor — invisible-whitespace fold:** collapse restricted to ASCII
+  whitespace `[ \t\n\r\f\v]` — NBSP/ZWSP/invisible variants stay
+  byte-distinct and identity-bearing (stricter than the declared
+  contract; unprovable → review).
+- **minor/latent — 640 truncation:** oversized canonical statements
+  hash via `digest({issue})` instead of truncating — the latent
+  shared-prefix collision class is closed (unreachable via the
+  clampText-bounded seam anyway; defense in depth).
+- **minor test gap closed:** case-variant and work_item-scope-variant
+  negatives added to the real confirm seam; whitespace-identical
+  positive unchanged.
+
+Audit notes kept as documentation: canonical equivalence limited to
+NFC + ASCII-whitespace (compatibility chars, ligatures, full-width all
+distinct); scope bound at digest + stored-key + re-derivation layers.
