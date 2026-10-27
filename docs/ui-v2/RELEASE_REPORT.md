@@ -1,7 +1,7 @@
 # UI-V2 Owner-First Experience — Release Report
 
 - **BASE SHA:** `ab0fccf79b2ac5ed045e948a0402ecbaa889c439`
-- **HEAD SHA (last functional commit):** `d5c5f19` — later commits on
+- **HEAD SHA (last functional commit):** `eb58b96` — later commits on
   this branch are docs-only; the PR commits tab shows the exact tip.
 - **PR:** https://github.com/vankusi59-svg/pair-next/pull/157 — **open,
   unmerged.** Owner retains merge authority; no merge/deploy/release
