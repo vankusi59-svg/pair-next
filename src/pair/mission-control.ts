@@ -40,6 +40,11 @@ import {
 import { detectOutputLanguage } from "./output-language.js";
 import { operatorGoalOf } from "./goal-contract.js";
 import {
+  assertGuardedIntentConfirmed,
+  verifyGoalIntentApproval,
+  type ApprovedIssue,
+} from "./semantic-goal-understanding.js";
+import {
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
   resolveDeliveryAttempt as resolveDeliveryAttemptEntity,
@@ -894,6 +899,51 @@ export class MissionControl {
       operator_id: input.operator_id,
       ttlSeconds: this.deps.planPreviewTtlSeconds,
     });
+    // P18.6 — project the pinned interpretation evidence (read model,
+    // bounded) from the run row — advisory only, same axis as
+    // coverage_report. Absent in OFF mode / pre-upgrade runs.
+    const intentRunRow =
+      plannerEvidence?.planner_run_id != null
+        ? (this.store.tryGet(
+            "planner_run",
+            String(plannerEvidence.planner_run_id),
+          ) as Record<string, unknown> | null)
+        : null;
+    const gi = (intentRunRow?.goal_intent ?? null) as Record<string, unknown> | null;
+    const giAnalysis = (gi?.analysis ?? null) as {
+      items?: Array<Record<string, unknown>>;
+      reconciliation?: Record<string, unknown>;
+    } | null;
+    const goalIntentEvidence = gi
+      ? {
+          analysis_digest: gi.analysis_digest ?? null,
+          status: gi.status ?? null,
+          unavailable_reason: gi.unavailable_reason ?? null,
+          ambiguity_class: gi.ambiguity_class ?? null,
+          mode: gi.mode ?? null,
+          model: gi.model ?? null,
+          provider_id: gi.provider_id ?? null,
+          provider_requests: gi.provider_requests ?? null,
+          analysis_ms: gi.analysis_ms ?? null,
+          from_cache: gi.from_cache ?? null,
+          source_goal_sha: gi.source_goal_sha ?? null,
+          context_digest: gi.context_digest ?? null,
+          items: Array.isArray(giAnalysis?.items)
+            ? giAnalysis!.items!.slice(0, 24).map((i) => ({
+                id: i.id ?? null,
+                category: i.category ?? null,
+                source_span: i.source_span ?? null,
+                statement: i.statement ?? null,
+                authority: i.authority ?? null,
+                confidence: i.confidence ?? null,
+                ...(Array.isArray(i.alternatives)
+                  ? { alternatives: i.alternatives.slice(0, 4) }
+                  : {}),
+              }))
+            : [],
+          reconciliation: giAnalysis?.reconciliation ?? null,
+        }
+      : null;
     return {
       preview_id: row.preview_id,
       plan_digest: row.plan_digest,
@@ -907,6 +957,13 @@ export class MissionControl {
       // evidence for the operator's review surface; confirm still binds
       // digests, never this field.
       coverage_report: row.coverage_report ?? null,
+      // P18.6 — the pinned semantic goal-interpretation evidence for
+      // this preview's planner run. Advisory-only read model (same
+      // discipline as coverage_report): the operator sees what PAIR
+      // understood — primary intent, constraints, preferences,
+      // ambiguity and authority classes — while confirm still binds
+      // digests, never this field.
+      goal_interpretation: goalIntentEvidence,
       expires_at: row.expires_at,
       state: row.state,
       // Phase C — the TEMPLATE source is gone: a preview that reached
@@ -972,6 +1029,44 @@ export class MissionControl {
           outputLanguage: detectOutputLanguage(operatorGoalOf(mi)),
         },
       );
+      /* P18.6 — semantic governance at confirm:
+         1. A mission_input carrying goal_intent_approval metadata must
+            prove a REAL persisted approval row binding the persisted
+            goal text AND the run's pinned analysis — forged approval
+            metadata fails closed (replay/substitution impossible:
+            approval binds analysis_digest + goal sha).
+         2. GUARDED-pinned interpretations carrying MATERIAL /
+            AUTHORITY_CRITICAL ambiguity (or an unavailable analysis)
+            can never be confirmed without a verified owner amendment.
+            OFF/SHADOW-pinned evidence and absent evidence never gate
+            (shadow is evidence-only by contract; OFF == P18.5). */
+      const intentRun =
+        v.preview.planner_run_id != null
+          ? (this.store.tryGet(
+              "planner_run",
+              String(v.preview.planner_run_id),
+            ) as Record<string, unknown> | null)
+          : null;
+      let approvedAmendment: { approved_issues: ApprovedIssue[] } | null = null;
+      if (
+        ((mi.metadata as Record<string, unknown> | undefined) ?? {})
+          .goal_intent_approval != null
+      ) {
+        // A verified owner-approved amendment on this preview's revision
+        // IS the review act MATERIAL ambiguity requires — the row binds
+        // the persisted goal sha + the pinned analysis that minted it,
+        // so a forged or replayed reference already threw above. The
+        // gate still compares THIS revision's material items against
+        // the approved issue identities: ambiguity the owner never
+        // reviewed stays blocked.
+        const approval = verifyGoalIntentApproval(this.store, { mission_input: mi });
+        approvedAmendment = { approved_issues: approval.approved_issues };
+      }
+      // The run's durably-stamped semantic_mode decides whether evidence
+      // is REQUIRED (guarded) or optional (off/shadow/legacy). An
+      // amendment resolves only the ambiguity its statements cover;
+      // AUTHORITY_CRITICAL (a live contradiction) always fails closed.
+      assertGuardedIntentConfirmed(intentRun, approvedAmendment);
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
       // validate what was pinned, never widen it. A READY preview without

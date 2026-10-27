@@ -25,6 +25,11 @@ import type { ConversationSessionService } from "./conversation-session.js";
 import type { ConversationReadGrantService } from "./conversation-read-grant.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
 import { classifyRequestCredential } from "./operational-query.js";
+import {
+  approveGoalIntentItems,
+  GOAL_INTENT_APPROVAL_ENTITY,
+  type GoalIntentApproval,
+} from "./semantic-goal-understanding.js";
 import type { MissionDraftService } from "./mission-draft.js";
 import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
@@ -411,6 +416,63 @@ function rejectCallerOperatorGoal(body: Record<string, unknown>): void {
       "operator_goal is reserved canonical authority — direct submissions derive it from goal",
     );
   }
+}
+
+/** P18.6 — resolve a `goal_intent_approval_id` carried on a preview
+ *  request into the GOVERNED amended goal revision. Server-side only:
+ *  the caller names an approval row id; the persisted approval row
+ *  supplies the amended goal text (never client-supplied text). Scope
+ *  and operator binding are re-proven here — a cross-project or
+ *  cross-operator replay fails closed before any planner spend. */
+function resolveGoalIntentApprovalBody(
+  store: PairEvidenceStore | undefined,
+  body: Record<string, unknown>,
+  operator: string | undefined,
+): Record<string, unknown> {
+  const approvalId = body.goal_intent_approval_id;
+  if (approvalId == null || approvalId === "") return body;
+  if (!store) {
+    throw new IntegrityError("FAIL_CLOSED_GOAL_INTENT_APPROVAL", "store unavailable");
+  }
+  const approval = store.tryGet(
+    GOAL_INTENT_APPROVAL_ENTITY,
+    String(approvalId),
+  ) as unknown as GoalIntentApproval | undefined;
+  if (!approval) {
+    throw new IntegrityError("FAIL_CLOSED_GOAL_INTENT_APPROVAL", "approval row not found");
+  }
+  const projectId = body.project_id != null ? String(body.project_id) : null;
+  // Strict scope equality — an approval minted under one project never
+  // replays under another, and an unscoped approval never widens into a
+  // scoped one (null binds null only).
+  if ((approval.scope?.project_id ?? null) !== projectId) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_APPROVAL",
+      "approval scope does not bind this project",
+    );
+  }
+  const opRef = operator != null ? String(operator) : null;
+  // A non-null operator binding must match exactly — a null request
+  // operator can never satisfy it. A null-bound approval is adoptable
+  // (the new preview's own operator binding governs).
+  if (approval.operator_id != null && approval.operator_id !== opRef) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_GOAL_INTENT_APPROVAL",
+      "approval binds a different operator",
+    );
+  }
+  return {
+    ...body,
+    operator_goal: approval.amended_goal,
+    metadata: {
+      ...((body.metadata as Record<string, unknown> | undefined) ?? {}),
+      goal_intent_approval: {
+        approval_id: approval.approval_id,
+        revision_digest: approval.revision_digest,
+        analysis_digest: approval.analysis_digest,
+      },
+    },
+  };
 }
 
 /* Coercion artifacts that must never become an operator identity. A
@@ -1022,10 +1084,61 @@ export function createMissionControlServer(
       // mission_plan_preview (READY); confirm consumes exactly it.
       if (method === "POST" && p === "/api/missions/preview") {
         rejectCallerOperatorGoal(body);
-        const ex = deps.planExpander ? await deps.planExpander(body) : { input: body };
+        /* P18.6 — a governed owner-approved goal amendment: the caller
+           references an APPROVAL ROW by id; the server resolves the
+           persisted amended goal (never client text), binds the
+           approval evidence into mission metadata for confirm-time
+           re-proof, and lets the amended revision drive planning
+           through the normal operator_goal authority seam. */
+        const previewBody = resolveGoalIntentApprovalBody(
+          deps.store,
+          body,
+          operator,
+        );
+        const ex = deps.planExpander ? await deps.planExpander(previewBody) : { input: previewBody };
         const expanded = (ex as { input?: Record<string, unknown> }).input ?? (ex as Record<string, unknown>);
         const planner = (ex as { planner?: never }).planner;
         return void json(res, 200, c.createPlanPreview({ ...expanded, operator_id: operator } as never, planner as never));
+      }
+      // P18.6 — approve material interpretation items minted by a
+      // preview's pinned run: server-side only, bound to the pinned
+      // analysis + persisted goal text. The mint enforces the
+      // authenticated actor's authority over the referenced preview
+      // (READY lifecycle + operator ownership) inside the store seam.
+      // `supplied` distinguishes supplying missing information from
+      // accepting an assumption. Returns the approval row; the operator
+      // then previews the amended revision via goal_intent_approval_id.
+      if (method === "POST" && p === "/api/goal-intent/approve") {
+        const previewId = String(body.preview_id ?? "");
+        const preview = deps.store?.tryGet("mission_plan_preview", previewId) as
+          | Record<string, unknown>
+          | null
+          | undefined;
+        if (!preview) {
+          throw new IntegrityError("FAIL_CLOSED_PREVIEW_MISSING", `preview ${previewId}`);
+        }
+        const mi = (preview.mission_input ?? {}) as Record<string, unknown>;
+        const baseGoal = String(mi.operator_goal ?? mi.goal ?? "");
+        const approval = approveGoalIntentItems(deps.store!, {
+          preview_id: previewId,
+          base_goal: baseGoal,
+          item_ids: Array.isArray(body.item_ids) ? body.item_ids.map(String) : [],
+          supplied:
+            body.supplied != null && typeof body.supplied === "object" && !Array.isArray(body.supplied)
+              ? (body.supplied as Record<string, unknown>)
+              : null,
+          operator_id: operator ?? null,
+          actor: `operator:${operatorRef(operator, p)}`,
+        });
+        return void json(res, 200, {
+          approval_id: approval.approval_id,
+          revision_digest: approval.revision_digest,
+          analysis_digest: approval.analysis_digest,
+          item_ids: approval.item_ids,
+          item_statements: approval.item_statements,
+          resolutions: approval.resolutions,
+          amended_goal_sha256: approval.amended_goal_sha256,
+        });
       }
       if (method === "GET" && p.match(/^\/api\/plan-previews\/[^/]+$/)) {
         const id = p.split("/")[3];

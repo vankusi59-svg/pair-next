@@ -1,6 +1,6 @@
 {
-  "claim_id": "P18_5_GOVERNANCE_TEST_HARDENING",
-  "title": "P18.5 — F10 deterministic numeric-ceiling enforcement (money/task-count/object-count) + test temp-dir lifecycle remediation (mkTmpDir factory, registry cleanup, stale sweep)",
+  "claim_id": "P18_6_SEMANTIC_FIRST_GOAL_UNDERSTANDING",
+  "title": "P18.6 — Semantic-First Goal Understanding + closures: guarded evidence binding, strict snapshot scope, LOSSLESS approval identity (category + canonical text + scope fingerprint; NFC/whitespace only; no folding, sorting or symbol stripping)",
   "affected_surfaces": [
     "PLANNER",
     "MISSION_DRAFT",
@@ -8,6 +8,8 @@
   ],
   "required_tests": [
     "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-semantic-goal-understanding.test.ts",
+    "src/__tests__/pair-goal-intent-benchmark.test.ts",
     "src/__tests__/pair-semantic-coverage.test.ts",
     "src/__tests__/pair-goal-contract-produce-binding.test.ts",
     "src/__tests__/pair-goal-context-authority.test.ts",
@@ -23,6 +25,6 @@
     "INV_EXEC_001",
     "INV_REPLAY_001"
   ],
-  "description": "P18.5 on base 2174e91 (post-#154 main). F10: dimension-aware numeric ceilings on constraint requirements - ceiling{amount,kind:money|task-count|object-count,unit} extracted from EN/VI ceiling markers (at most/no more than/up to/max/toi da/khong qua/khong vuot qua/nhieu nhat/khong hon/<=/<=) with grouped numbers; money ceilings feed legacy maxAmount, enforced via currency-tagged instructionAmounts - over bound VIOLATES (fail-closed), at/under PROVEN, no evidence PRESERVED (never fabricated); task-count ceilings enforce plan task count; object-count ceilings bind numbers to the same unit noun; duration/frequency/percent never mint ceilings; quantity.max enforced by contradiction via bound numbers; ceilings never invert into floors. Runtime note: plan-time inspection proves declared plan evidence only; unverifiable limits stay PRESERVED. Test infra: src/test-utils/tmpdir.ts factory (mkTmpDir registry + idempotent cleanupTmpDirs + exit hook + marker-gated sweepStaleTestDirs - VALID .pair-tmp-owner with ESRCH-confirmed dead pid mandatory; missing/malformed markers and live/EPERM-uncertain pids SKIP; prefix+age never proof; opt-in tmp-recover.mts for unmarked residue (dry-run + explicit --paths + --confirm + realpath containment); top-level links rejected pre-inspection via lstat+realpath; removal aborts on ununlinkable links (no unsafe rmSync); dirSize lstat-safe; mkTmpDir rejects escaping prefixes; oversized markers invalid), vitest setupFiles/globalSetup wiring, codemod of literal-prefix mkdtempSync callsites; measured residuals. No planner/canonicalizer/executor refactor; deterministic authority + fail-closed preserved; zero new provider invocations; no auto-merge",
+  "description": "P18.6 LOSSLESS-IDENTITY closure on base cabd25d - final approval-identity correction. Even canonical-statement keys still lost semantics: Vietnamese diacritic stripping merged DISTINCT words (bán vs bàn), punctuation/symbol removal merged currencies ($500 vs €500), dimensions (5% vs 5) and identifiers (C++ vs C#), case folding merged case-sensitive identifiers (US vs us). Replaced with a LOSSLESS fingerprint: issueKeyFor = category + canonical scope lineage (b/o/w/p, ''-normalized, unknown never silently matches) + canonical issue text where canonicalization is ONLY Unicode NFC + whitespace collapse/trim - no lowercase, no diacritic folding, no punctuation/symbol stripping, no token sorting, no stopword removal, no fuzzy matching. Identical issues under identical scope reuse approval (idempotent retries intact); anything not byte-identical requires fresh owner review - paraphrase similarity is never approval evidence. Coverage threads the confirmed revision's analysis scope into issueCoveredBy so cross-scope reviews never cover. Stored approvals with previous key formats fail re-proof closed (no silent migration; resolutions verify re-derives keys against pinned analysis). Adversarial probes: diacritic (bán/bàn, không/khong), currency ($/€/£), dimension (5%/5, 10°C/10C), identifier (C++/C#, node.js), case (US/us, API/api), scope lineage - plus approve->amend->re-preview->confirm positive (whitespace-variant reuse) and negative E2E over the real seam. Prior closures unchanged. Baseline: interpretation ADVISORY only; OFF default; no auto-merge.",
   "risk_override": "HIGH"
 }

@@ -65,6 +65,7 @@ import { probeModel, qualifyModel } from "./model-probing.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import type { PlannerCandidate } from "./planner-pool.js";
 import type { PlannerEligibilityRejection } from "./model-role.js";
+import { semanticAnalysisPrompt } from "./semantic-goal-understanding.js";
 
 // The canonical codex-cli provider identity + the generic spawn/auth/
 // scratch mechanics live in codex-cli-transport.ts (P15.3 R2 addendum §C —
@@ -131,6 +132,10 @@ export interface CodexPlannerInvokeConfig {
    *  transport uses (drift between transports is a contract
    *  violation). */
   planningContextBlock?: LlmPlannerConfig["planningContextBlock"];
+  /** P18.6 — the pre-rendered advisory semantic goal-interpretation
+   *  block. Same single canonical prompt builder, same advisory-only
+   *  discipline. */
+  semanticIntentBlock?: LlmPlannerConfig["semanticIntentBlock"];
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -303,6 +308,7 @@ export function buildCodexPlannerPrompt(
     | "authorityGoal"
     | "externalInputArtifacts"
     | "planningContextBlock"
+    | "semanticIntentBlock"
   >,
 ): string {
   const authorityGoal = cfg.authorityGoal ?? goal;
@@ -315,6 +321,7 @@ export function buildCodexPlannerPrompt(
     authorityGoal,
     externalInputArtifacts: cfg.externalInputArtifacts,
     planningContextBlock: cfg.planningContextBlock,
+    semanticIntentBlock: cfg.semanticIntentBlock,
   })}`;
 }
 
@@ -411,6 +418,94 @@ export async function codexPlannerPlan(
     return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE], ...em };
   }
   return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings], ...em };
+}
+
+/** P18.6 — strict structured schema for the semantic goal-analysis
+ *  invocation. Same additionalProperties/required discipline as
+ *  PLAN_SCHEMA (strict-output API rejects uncovered properties). */
+const INTENT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["items"],
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["category", "source_span", "statement", "confidence", "alternatives"],
+        properties: {
+          category: { type: "string" },
+          // strict-output API rejects union types + optional props:
+          // every property is required; empty string = absent span.
+          source_span: { type: "string" },
+          statement: { type: "string" },
+          confidence: { type: "string" },
+          alternatives: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+  },
+};
+
+/** P18.6 — the bounded semantic-analysis provider call: ONE spawn under
+ *  the SAME planner isolation profile, model pin, scratch sandbox and
+ *  providerCounter accounting as codexPlannerPlan. Returns the raw
+ *  items payload for the caller's strict schema validation — a
+ *  malformed/absent response is a typed unavailable, never a
+ *  fabricated interpretation. */
+export async function codexSemanticAnalyze(
+  goal: string,
+  contextBlock: string | null,
+  cfg: {
+    model: string;
+    timeoutMs?: number;
+    scratchDir: string;
+    executable?: string;
+    env?: CodexPlannerEnv;
+    providerCounter?: { requests: number };
+  },
+): Promise<{ items: unknown; latency_ms: number } | { unavailable: string }> {
+  const exe = cfg.executable ?? resolveExecutable(cfg.env);
+  if (!exe) return { unavailable: "codex:cli_missing" };
+  const t0 = Date.now();
+  let out: Awaited<ReturnType<typeof invokeRaw>>;
+  try {
+    if (cfg.providerCounter) cfg.providerCounter.requests += 1;
+    out = await invokeRaw(
+      {
+        executable: exe,
+        model: cfg.model,
+        timeoutMs: cfg.timeoutMs ?? CODEX_PLANNER_DEFAULT_TIMEOUT_MS,
+        scratchDir: cfg.scratchDir,
+        schema: INTENT_SCHEMA,
+      },
+      semanticAnalysisPrompt(goal, contextBlock),
+      cfg.env,
+    );
+  } catch (e) {
+    return { unavailable: `codex:spawn_${String(e).slice(0, 60)}` };
+  }
+  const latency_ms = Date.now() - t0;
+  const { result, finalText } = out;
+  if (result.status === "TIMEOUT") return { unavailable: "codex:timeout" };
+  if (result.status === "SPAWN_FAILED") {
+    if (/ENOENT|not found/i.test(result.error ?? "")) return { unavailable: "codex:cli_missing" };
+    return { unavailable: `codex:spawn_${(result.error ?? "").slice(0, 60)}` };
+  }
+  if (result.status === "FAILED") {
+    return { unavailable: `codex:exit_${classifyCodexCliExit(result.code, result.stderrTail)}` };
+  }
+  if (!finalText || !finalText.trim()) return { unavailable: "codex:empty_output" };
+  let parsed: unknown;
+  try {
+    parsed = extractPlanJson(finalText);
+  } catch {
+    return { unavailable: "codex:malformed_json" };
+  }
+  const items = (parsed as { items?: unknown })?.items;
+  if (!Array.isArray(items)) return { unavailable: "codex:schema_invalid" };
+  return { items, latency_ms };
 }
 
 /** argv the planner child runs under — exposed for evidence/tests: proves

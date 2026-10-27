@@ -50,6 +50,47 @@ export const RUN_STATE = {
  * evidence instead of pretending the invocation never happened.
  */
 
+/** P18.6 — the single bounded shape every goal-intent pin conforms to.
+ *  Both write paths (beginPlannerRun creation arg and the post-analysis
+ *  pinPlannerRunGoalIntent) pass through this clamp — unbounded or
+ *  unnormalized evidence never reaches the store. */
+function clampGoalIntentEvidence(g: {
+  analysis_digest: string;
+  block: string;
+  ambiguity_class: string;
+  status: "analyzed" | "unavailable";
+  unavailable_reason: string | null;
+  model: string;
+  provider_id: string;
+  provider_requests: number;
+  analysis_ms: number;
+  from_cache: boolean;
+  source_goal_sha: string;
+  context_digest: string | null;
+  mode: string;
+  source_mode?: string | null;
+  analysis?: Record<string, unknown> | null;
+}): Record<string, unknown> {
+  return {
+    analysis_digest: String(g.analysis_digest),
+    block: typeof g.block === "string" ? g.block.slice(0, 4096) : "",
+    ambiguity_class: String(g.ambiguity_class),
+    status: g.status === "analyzed" ? "analyzed" : "unavailable",
+    unavailable_reason:
+      g.unavailable_reason != null ? String(g.unavailable_reason).slice(0, 200) : null,
+    model: String(g.model).slice(0, 120),
+    provider_id: String(g.provider_id).slice(0, 120),
+    provider_requests: Math.max(0, Math.floor(Number(g.provider_requests) || 0)),
+    analysis_ms: Math.max(0, Math.floor(Number(g.analysis_ms) || 0)),
+    from_cache: g.from_cache === true,
+    source_goal_sha: String(g.source_goal_sha),
+    context_digest: g.context_digest != null ? String(g.context_digest) : null,
+    mode: String(g.mode),
+    source_mode: g.source_mode != null ? String(g.source_mode).slice(0, 40) : null,
+    analysis: g.analysis ?? null,
+  };
+}
+
 export function beginPlannerRun(
   store: PairEvidenceStore,
   args: {
@@ -65,6 +106,35 @@ export function beginPlannerRun(
     /** The bounded advisory context block actually rendered into the
      *  prompts (≤4096 chars — evidence of what the planner saw). */
     planning_context_block?: string | null;
+    /** P18.6 — pinned semantic goal-interpretation evidence for this
+     *  run: the bounded GoalIntentAnalysis snapshot + rendered advisory
+     *  block + ambiguity classification. Advisory-only — never bound
+     *  into effective_input/plan digests. */
+    goal_intent?: {
+      analysis_digest: string;
+      block: string;
+      ambiguity_class: string;
+      status: "analyzed" | "unavailable";
+      unavailable_reason: string | null;
+      model: string;
+      provider_id: string;
+      provider_requests: number;
+      analysis_ms: number;
+      from_cache: boolean;
+      source_goal_sha: string;
+      context_digest: string | null;
+      mode: string;
+      /** Provenance only — the mode the snapshot was produced under
+       *  (replan pins stamp live `mode` for gating, this records the
+       *  originating run's mode). */
+      source_mode?: string | null;
+      analysis?: Record<string, unknown> | null;
+    } | null;
+    /** P18.6 closure — the effective semantic mode durably bound at
+     *  run creation. Trustworthy provenance the swallowed-exception
+     *  path cannot lose: a "guarded"-stamped run with no pinned
+     *  goal_intent evidence fails closed at confirm. */
+    semantic_mode?: string | null;
   },
 ): Record<string, unknown> {
   return store.immediate(() => {
@@ -73,6 +143,8 @@ export function beginPlannerRun(
       planner_run_id: newId("PRN"),
       state: RUN_STATE.RUNNING,
       project_id: args.project_id != null ? String(args.project_id) : null,
+      semantic_mode:
+        args.semantic_mode != null ? String(args.semantic_mode).slice(0, 24) : null,
       operator_id: args.operator_id ?? null,
       routes: args.routes,
       planning_context_digest: args.planning_context_digest ?? null,
@@ -80,11 +152,17 @@ export function beginPlannerRun(
         typeof args.planning_context_block === "string"
           ? args.planning_context_block.slice(0, 4096)
           : null,
+      // P18.6 — pinned advisory interpretation snapshot (evidence only;
+      // authority-binding digests deliberately exclude it). Same clamp
+      // contract as pinPlannerRunGoalIntent.
+      goal_intent: args.goal_intent != null ? clampGoalIntentEvidence(args.goal_intent) : null,
       attempts: 0,
       // AUDIT R1 F4 — provider requests PROVABLY initiated across all
       // attempts (transport-reported, never inferred from attempt rows).
-      // Settlement reads THIS field — never `attempts`.
-      provider_requests: 0,
+      // Settlement reads THIS field — never `attempts`. P18.6 — the
+      // bounded semantic-analysis request counts against the run's
+      // provider request total from row creation.
+      provider_requests: Number(args.goal_intent?.provider_requests ?? 0),
       winner_attempt_no: null,
       preview_id: null,
       error_code: null,
@@ -106,6 +184,72 @@ export function beginPlannerRun(
       },
     });
     return row;
+  });
+}
+
+/** P18.6 — pin the bounded semantic goal-interpretation snapshot onto an
+ *  open run row AFTER the (already-admitted) analysis step, and fold its
+ *  proven provider requests into the run's canonical count so cost
+ *  settlement accounts the call exactly like a plan-transport request.
+ *  Evidence-only: digests that bind authority deliberately exclude it. */
+export function pinPlannerRunGoalIntent(
+  store: PairEvidenceStore,
+  args: {
+    planner_run_id: string;
+    goal_intent: {
+      analysis_digest: string;
+      block: string;
+      ambiguity_class: string;
+      status: "analyzed" | "unavailable";
+      unavailable_reason: string | null;
+      model: string;
+      provider_id: string;
+      provider_requests: number;
+      analysis_ms: number;
+      from_cache: boolean;
+      source_goal_sha: string;
+      context_digest: string | null;
+      mode: string;
+      source_mode?: string | null;
+      /** The bounded GoalIntentAnalysis itself — persisted so preview
+       *  projection and governed amendment can resolve exact items
+       *  against pinned evidence (never a client-supplied analysis). */
+      analysis: Record<string, unknown> | null;
+    };
+    actor?: string;
+    now?: () => string;
+  },
+): void {
+  return store.immediate(() => {
+    const run = store.tryGet(RUN_ENTITY, String(args.planner_run_id)) as
+      | Record<string, unknown>
+      | undefined;
+    if (!run) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_RUN_MISSING",
+        `planner_run ${args.planner_run_id} not found`,
+      );
+    }
+    const g = args.goal_intent;
+    run.goal_intent = clampGoalIntentEvidence(g);
+    run.provider_requests =
+      Number(run.provider_requests ?? 0) +
+      Math.max(0, Math.floor(Number(g.provider_requests) || 0));
+    store.put(RUN_ENTITY, String(run.planner_run_id), run, Number(run.version ?? 0));
+    store.event({
+      entity_type: RUN_ENTITY,
+      entity_id: String(run.planner_run_id),
+      event_type: "PLANNER_RUN_GOAL_INTENT_PINNED",
+      new_state: String(run.state),
+      actor: args.actor ?? "PAIR_PLANNER",
+      metadata: {
+        analysis_digest: g.analysis_digest,
+        ambiguity_class: g.ambiguity_class,
+        status: g.status,
+        from_cache: g.from_cache === true,
+        provider_requests: g.provider_requests,
+      },
+    });
   });
 }
 

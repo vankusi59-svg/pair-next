@@ -870,6 +870,14 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
     expect(blob).not.toContain(FAKE_SECRET);
     expect(blob).not.toContain("P5_TEST_SECRET_VALUE");
     // env var NAMES may appear (credential_env), values may not.
-    expect(blob).toContain("GEMINI_API_KEY");
+    // The expected name is derived from the adapter's own probe — the
+    // host's DSH provider config decides which credential env it
+    // declares (gemini→GEMINI_API_KEY, agnes→AGNES_API_KEY, …); the
+    // invariant under test is that NAMES reach evidence, never values.
+    const rawCredEnv = ctx.dsh!.probe().credential_env as unknown;
+    const credNames = (Array.isArray(rawCredEnv) ? rawCredEnv : [rawCredEnv])
+      .map(String).filter(Boolean);
+    expect(credNames.length).toBeGreaterThan(0);
+    expect(blob).toContain(credNames[0]);
   }, 40_000);
 });

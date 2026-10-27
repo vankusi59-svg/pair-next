@@ -92,8 +92,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ reason: reason ?? "", scope }),
     }, { noAuthPrompt: true }),
-  previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
-    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null; coverage_report?: { verdict: string; contractDigest: string | null; rows: Array<{ requirement_id: string; kind: string; state: string; task_keys: string[] }> } | null }>("/missions/preview", {
+  /* P18.6 — owner-approved interpretation amendment: binds the pinned
+     analysis + persisted goal server-side; the returned approval id is
+     then carried into a re-preview via goal_intent_approval_id. */
+  approveGoalIntent: (input: { preview_id: string; item_ids: string[] }) =>
+    req<{ approval_id: string; revision_digest: string; analysis_digest: string; item_ids: string[]; item_statements: string[] }>("/goal-intent/approve", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown>; goal_intent_approval_id?: string }) =>
+    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null; coverage_report?: { verdict: string; contractDigest: string | null; rows: Array<{ requirement_id: string; kind: string; state: string; task_keys: string[] }> } | null; goal_interpretation?: { analysis_digest: string | null; ambiguity_class: string | null; status: string | null; unavailable_reason: string | null; mode: string | null; items: Array<{ id: string | null; category: string | null; statement: string | null; authority: string | null; confidence: string | null; source_span: string | null; alternatives?: string[] }> } | null }>("/missions/preview", {
       method: "POST",
       body: JSON.stringify(input),
     }),
@@ -577,10 +585,22 @@ export const apiAdmin = {
     project_id: string; goal: string;
     granted_permissions?: string[]; authorized_workspaces?: string[];
     risk_ceiling?: string; metadata?: Record<string, unknown>;
+    /* P18.6 — server-resolved amended revision: names a REAL
+       goal_intent_approval row (never client-supplied goal text). */
+    goal_intent_approval_id?: string;
   }, signal?: AbortSignal) =>
     req<import("./app/types").MissionPreview>(
       "/missions/preview",
       { method: "POST", body: JSON.stringify(body), ...(signal ? { signal } : {}) },
+      { noAuthPrompt: true },
+    ),
+  /* P18.6 — owner approve of advisory interpretation items: mints a
+     digest-bound amended revision (append-only); re-preview via
+     goal_intent_approval_id. */
+  approveGoalIntent: (body: { preview_id: string; item_ids: string[] }) =>
+    req<{ approval_id: string; revision_digest: string; analysis_digest: string; item_ids: string[]; item_statements: string[] }>(
+      "/goal-intent/approve",
+      { method: "POST", body: JSON.stringify(body) },
       { noAuthPrompt: true },
     ),
   confirmMission: (body: { preview_id: string; plan_digest: string }) =>

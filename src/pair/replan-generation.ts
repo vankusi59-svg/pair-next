@@ -161,6 +161,29 @@ export type ReplanGenerationRecord = {
    *  durable record claims) plus the envelope's evidence-class digest.
    *  Never authority — advisory context only. */
   planning_context: { context_digest: string; block: string } | null;
+  /** P18.6 — pinned semantic goal-interpretation snapshot for the
+   *  SAME authorized goal revision: minted at REQUEST time from the
+   *  mission's newest analyzed planner_run (same goal sha), so the
+   *  async generation replays the exact interpretation evidence the
+   *  authorized input produced — a replan must never silently
+   *  reinterpret a failed mission. Advisory-only; null when no pinned
+   *  snapshot exists (mode OFF or pre-upgrade lineage). */
+  goal_intent: {
+    analysis_digest: string;
+    block: string;
+    ambiguity_class: string;
+    source_goal_sha: string;
+    /** The context snapshot the interpretation was produced against —
+     *  copied from the SOURCE run's pin (never the replan request's
+     *  context, which the analysis never saw). */
+    context_digest?: string | null;
+    /** The semantic mode the interpretation was produced under —
+     *  provenance only; gating follows the live mode at action time. */
+    mode?: string;
+    /** The bounded GoalIntentAnalysis itself — item-level evidence for
+     *  preview projection and governed amendment resolution. */
+    analysis?: Record<string, unknown> | null;
+  } | null;
   staged_candidate: {
     tasks: Array<Record<string, unknown>>;
     plan_source: string;
@@ -324,6 +347,21 @@ export class ReplanGenerationService {
     private readonly planningContext?: {
       envelopeFor(req: PlanningContextRequest): PlanningContextEnvelope;
     },
+    /** P18.6 — optional snapshot resolver: returns the newest pinned
+     *  planner_run goal-intent evidence for the mission's authorized
+     *  goal revision (server-side store read only). Absent → null,
+     *  identical prior behavior. */
+    private readonly goalIntentFor?: (
+      mission: Record<string, unknown>,
+    ) => {
+      analysis_digest: string;
+      block: string;
+      ambiguity_class: string;
+      source_goal_sha: string;
+      context_digest?: string | null;
+      mode?: string;
+      analysis?: Record<string, unknown> | null;
+    } | null,
   ) {}
 
   private ledger(): ReplanAttemptLedger {
@@ -417,6 +455,18 @@ export class ReplanGenerationService {
           planningContext = null;
         }
       }
+      /* P18.6 — pin the goal-interpretation snapshot for the SAME
+         authorized goal revision at request time. Advisory evidence
+         only; absent seam or absent snapshot → null (OFF / pre-upgrade
+         lineage replans proceed exactly like P18.5). */
+      let goalIntent: ReplanGenerationRecord["goal_intent"] = null;
+      if (this.goalIntentFor) {
+        try {
+          goalIntent = this.goalIntentFor(input.mission);
+        } catch {
+          goalIntent = null;
+        }
+      }
       const deadlineMs = this.opts.deadlineMs ?? 1_800_000;
       const now = Date.now();
       const record: ReplanGenerationRecord = {
@@ -444,6 +494,7 @@ export class ReplanGenerationService {
         deadline_at: isoAfter(now, deadlineMs),
         planner_run_id: null,
         planning_context: planningContext,
+        goal_intent: goalIntent,
         staged_candidate: null,
         outcome: null,
         created_at: utcnow(),

@@ -34,6 +34,21 @@ type Pinned = {
   /* Semantic Planning V1 (G′) — deterministic coverage report the
      winning plan proved; read-only review evidence, never authority. */
   coverage_report: { verdict: string; rows: CoverageRow[] } | null;
+  /* P18.6 — pinned semantic goal-interpretation evidence (advisory
+     read model: what PAIR understood — never authority). */
+  goal_interpretation: {
+    analysis_digest: string | null;
+    ambiguity_class: string | null;
+    status: string | null;
+    unavailable_reason: string | null;
+    mode: string | null;
+    items: Array<{
+      id: string | null; category: string | null;
+      statement: string | null; authority: string | null;
+      confidence: string | null; source_span: string | null;
+      alternatives?: string[];
+    }>;
+  } | null;
   /* effective inputs pinned at preview time — any change invalidates */
   project_id: string;
   goal: string;
@@ -65,6 +80,9 @@ export function MissionNew() {
   const [previewErr, setPreviewErr] = useState<string | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  /* P18.6 — owner-approval selection over advisory interpretation items */
+  const [intentSel, setIntentSel] = useState<Record<string, boolean>>({});
+  const [intentBusy, setIntentBusy] = useState(false);
   const [mutNote, setMutNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [autoConfirm, setAutoConfirm] = useState(false); /* opt-in, default OFF */
@@ -123,6 +141,7 @@ export function MissionNew() {
     setPreviewBusy(false);
     setPreview(null);
     setConfirming(false);
+    setIntentSel({});
     if (confirmFlight.current) {
       setMutNote("Inputs changed while a confirmation was in flight — outcome unknown; the mission may have been committed. Check Mission Operations before resubmitting. No automatic retry.");
     }
@@ -134,6 +153,86 @@ export function MissionNew() {
     granted_permissions: ["FILE_WRITE", "FILE_READ"],
     authorized_workspaces: project ? [String(project.root_location ?? "")].filter(Boolean) : [],
   });
+
+  /* persisted-preview validation + pinned construction — shared by the
+     normal preview edge AND the P18.6 amended-revision re-preview so a
+     malformed response is INVALID identically on both paths. */
+  const pinnedFrom = (r: MissionPreview | null | undefined): Pinned | null => {
+    if (!r || typeof r !== "object" || !r.preview_id || !r.plan_digest
+      || !r.plan || !Array.isArray(r.plan.tasks) || r.plan.tasks.length === 0
+      || !taskRows(r.plan.tasks)) return null;
+    const cov = (r as { coverage_report?: unknown }).coverage_report;
+    const gi = (r as { goal_interpretation?: unknown }).goal_interpretation;
+    return {
+      preview_id: String(r.preview_id),
+      plan_digest: String(r.plan_digest),
+      tasks: r.plan.tasks,
+      source: r.plan_source ?? null,
+      model: r.plan_model ?? null,
+      coverage_report:
+        cov &&
+        typeof cov === "object" &&
+        (cov as { verdict?: unknown }).verdict === "PASS" &&
+        Array.isArray((cov as { rows?: unknown }).rows)
+          ? (cov as Pinned["coverage_report"])
+          : null,
+      goal_interpretation:
+        gi &&
+        typeof gi === "object" &&
+        Array.isArray((gi as { items?: unknown }).items)
+          ? (gi as Pinned["goal_interpretation"])
+          : null,
+      project_id: projectId,
+      goal: goal.trim(),
+    };
+  };
+
+  /* P18.6 — approve selected advisory interpretation items → the server
+     mints a digest-bound amended goal revision → re-preview that exact
+     revision. The original operator request stays immutable; approval
+     binds the pinned analysis + preview + operator + scope. */
+  const APPROVABLE = new Set(["MODEL_INFERRED", "PROPOSED_AMENDMENT", "UNRESOLVED"]);
+  const doApproveIntent = async () => {
+    if (!preview || intentBusy || confirmFlight.current) return;
+    const ids = Object.keys(intentSel).filter((k) => intentSel[k]);
+    if (!ids.length) return;
+    previewReq.current?.ctl.abort();
+    const ctl = new AbortController();
+    const s = ++seq.current;
+    const mine = { id: s, ctl };
+    previewReq.current = mine;
+    const pinnedInputs = { project_id: preview.project_id, goal: preview.goal };
+    setIntentBusy(true);
+    setPreviewErr(null);
+    setMutNote(null);
+    try {
+      const ap = await apiAdmin.approveGoalIntent({ preview_id: preview.preview_id, item_ids: ids });
+      const r: MissionPreview = await apiAdmin.previewMission(
+        { ...payload(), goal_intent_approval_id: ap.approval_id },
+        ctl.signal,
+      );
+      if (s !== seq.current) return;
+      if (pinnedInputs.project_id !== inputsRef.current.projectId
+        || pinnedInputs.goal !== inputsRef.current.goal.trim()) return;
+      const pinned = pinnedFrom(r);
+      if (!pinned) {
+        setPreview(null);
+        setPreviewErr("INVALID_PREVIEW — amended revision preview failed validation.");
+        return;
+      }
+      setIntentSel({});
+      setMutNote(`Owner-approved ${ids.length} interpretation${ids.length > 1 ? "s" : ""} — new governed revision previewed (approval ${String(ap.approval_id).slice(0, 14)}…).`);
+      setPreview(pinned);
+    } catch (e) {
+      if (s !== seq.current) return;
+      setPreviewErr(e instanceof ApiError ? `${e.detail || e.message} (${e.code})` : String(e));
+    } finally {
+      if (previewReq.current === mine) {
+        previewReq.current = null;
+        setIntentBusy(false);
+      }
+    }
+  };
 
   const doPreview = async () => {
     if (!inputsValid || previewBusy || confirmFlight.current) return;
@@ -160,33 +259,14 @@ export function MissionNew() {
       if (s !== seq.current) return;
       if (pinnedInputs.project_id !== inputsRef.current.projectId
         || pinnedInputs.goal !== inputsRef.current.goal.trim()) return;
-      /* persisted-preview validation: needs preview_id + digest + a
-         non-empty valid task list — else it is an invalid preview, never
-         rendered as a valid empty plan */
-      if (!r || typeof r !== "object" || !r.preview_id || !r.plan_digest
-        || !r.plan || !Array.isArray(r.plan.tasks) || r.plan.tasks.length === 0
-        || !taskRows(r.plan.tasks)) {
+      /* persisted-preview validation via the shared seam — invalid
+         responses are never rendered as a valid empty plan */
+      const pinned = pinnedFrom(r);
+      if (!pinned) {
         setPreview(null);
         setPreviewErr("INVALID_PREVIEW — response missing preview_id, plan_digest or a valid task list. Nothing to confirm.");
         return;
       }
-      const cov = (r as { coverage_report?: unknown }).coverage_report;
-      const pinned: Pinned = {
-        preview_id: String(r.preview_id),
-        plan_digest: String(r.plan_digest),
-        tasks: r.plan.tasks,
-        source: r.plan_source ?? null,
-        model: r.plan_model ?? null,
-        coverage_report:
-          cov &&
-          typeof cov === "object" &&
-          (cov as { verdict?: unknown }).verdict === "PASS" &&
-          Array.isArray((cov as { rows?: unknown }).rows)
-            ? (cov as Pinned["coverage_report"])
-            : null,
-        project_id: projectId,
-        goal: goal.trim(),
-      };
       /* auto-confirm toggled OFF while the request was in flight → the
          late response renders as a normal manual preview, never commits */
       if (wasAuto && inputsRef.current.auto) {
@@ -356,6 +436,64 @@ export function MissionNew() {
                   </span>
                 </div>
               ))}
+            </div>
+          ) : null}
+          {preview.goal_interpretation ? (
+            <div className="need">
+              <div className="nrow">
+                <span className="note mono">
+                  PairNext understood your goal — advisory interpretation evidence, never authority
+                  {preview.goal_interpretation.ambiguity_class
+                    ? ` · ambiguity: ${preview.goal_interpretation.ambiguity_class}`
+                    : ""}
+                  {preview.goal_interpretation.status === "unavailable"
+                    ? ` · unavailable: ${preview.goal_interpretation.unavailable_reason ?? "unknown"}`
+                    : ""}
+                </span>
+              </div>
+              {preview.goal_interpretation.items.map((i) => {
+                const iid = String(i.id ?? "");
+                const approvable = APPROVABLE.has(String(i.authority ?? ""));
+                return (
+                  <div className="nrow" key={iid}>
+                    {approvable ? (
+                      <input
+                        type="checkbox"
+                        checked={intentSel[iid] === true}
+                        disabled={intentBusy}
+                        onChange={() => setIntentSel((s) => ({ ...s, [iid]: !s[iid] }))}
+                        title="Select for owner approval"
+                      />
+                    ) : (
+                      <span className="note mono" style={{ width: 13 }} />
+                    )}
+                    <code className="mono">{iid}</code>
+                    <span className="note mono">{String(i.category ?? "")}</span>
+                    <span className="note" style={{ flex: 1 }}>{String(i.statement ?? "")}</span>
+                    <StatusBadge
+                      tone={i.authority === "EXPLICIT_OPERATOR" || i.authority === "OWNER_APPROVED" ? "ok" : i.authority === "UNRESOLVED" ? "warn" : "unknown"}
+                      label={String(i.authority ?? "")}
+                    />
+                    <span className="note mono">{String(i.confidence ?? "")}</span>
+                  </div>
+                );
+              })}
+              {preview.goal_interpretation.items.some((i) => APPROVABLE.has(String(i.authority ?? ""))) ? (
+                <div className="nrow">
+                  <button
+                    className="tbtn"
+                    disabled={intentBusy || !Object.values(intentSel).some(Boolean)}
+                    onClick={doApproveIntent}
+                  >
+                    {intentBusy
+                      ? "Approving…"
+                      : `Approve ${Object.values(intentSel).filter(Boolean).length || ""} interpretation${Object.values(intentSel).filter(Boolean).length === 1 ? "" : "s"} & re-preview`}
+                  </button>
+                  <span className="note">
+                    approval mints a new governed goal revision — digest-bound, append-only; the original request stays immutable.
+                  </span>
+                </div>
+              ) : null}
             </div>
           ) : null}
           <DagView dag={{
