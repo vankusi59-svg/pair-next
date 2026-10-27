@@ -832,7 +832,13 @@ export function approveGoalIntentItems(
         );
       }
       const suppliedRaw = suppliedMap[id];
-      const supplied = suppliedRaw != null ? clampText(suppliedRaw, INTENT_MAX_TEXT) : null;
+      // Goal lines are single-line records — a newline inside supplied
+      // text would write extra lines into the amended goal and could
+      // forge an `Operator-*:` line. Collapse all whitespace first so
+      // the recorded decision text is exactly the goal line's content.
+      const supplied = suppliedRaw != null
+        ? clampText(String(suppliedRaw).replace(/\s+/g, " "), INTENT_MAX_TEXT)
+        : null;
       if (suppliedRaw != null && (supplied == null || supplied.trim() === "")) {
         throw new PolicyError(
           "FAIL_CLOSED_GOAL_INTENT_ITEMS",
@@ -854,7 +860,7 @@ export function approveGoalIntentItems(
       amendmentLines.push(
         supplied != null
           ? `Operator-supplied: ${supplied}`
-          : `Operator-approved: ${item.statement}`,
+          : `Operator-approved: ${item.statement.replace(/\s+/g, " ").trim()}`,
       );
     }
     const revisionDigest = approvalDigest({
@@ -1059,7 +1065,9 @@ export function verifyGoalIntentApproval(
         String(r.issue_key) === d.issue_key &&
         (r.decision === "accepted_assumption"
           ? r.supplied == null &&
-            goalLines.has(`Operator-approved: ${d.statement}`)
+            goalLines.has(
+              `Operator-approved: ${d.statement.replace(/\s+/g, " ").trim()}`,
+            )
           : r.decision === "supplied_value"
             ? typeof r.supplied === "string" &&
               r.supplied !== "" &&
