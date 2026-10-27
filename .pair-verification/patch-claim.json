@@ -1,6 +1,6 @@
 {
   "claim_id": "UI_V2_OWNER_EXPERIENCE",
-  "title": "UI-V2 — owner-first experience: VN-first shell (Tổng quan/Mục tiêu/Công việc/Phê duyệt/Nhân sự AI + Nâng cao), governed NL intake (/api/v1/intake/draft advisory seam + Intake page + canonical objective commit), owner cockpit Home, ObjectiveDetail owner tabs, dark-navy theme — incl. independent-audit fixes (stale-scope guards, manual:true, typed failure reasons)",
+  "title": "UI-V2 owner-first experience + audit fixes: VN shell, governed NL intake, owner cockpit, ObjectiveDetail tabs, stale-scope guards, manual:true, typed failure reasons",
   "affected_surfaces": [
     "MISSION_CONTROL",
     "MISSION_DRAFT",
