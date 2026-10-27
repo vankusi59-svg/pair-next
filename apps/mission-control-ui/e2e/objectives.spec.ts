@@ -102,16 +102,19 @@ test("owned detail renders: header sections, KPI claimed-unverifiable, pre-bindi
   await expect(page.getByRole("heading", { name: title })).toBeVisible();
   await expect(page.getByText(`owner ${OWNER}`)).toBeVisible();
   await expect(page.getByText("terms v", { exact: false })).toBeVisible();
-  // KPI: created objective has no proven evidence → UNVERIFIED, never MET.
+  // KPI (Tổng quan, default tab): created objective has no proven
+  // evidence → UNVERIFIED, never MET.
   await expect(page.getByText("deliverables", { exact: true })).toBeVisible();
   await expect(page.getByText("UNVERIFIED").first()).toBeVisible();
-  // Pre-binding → no canonical plan yet (not fabricated workstreams).
-  await expect(page.getByText("no canonical plan yet")).toBeVisible();
   // Budget display in USD.
   await expect(page.getByText("$0.00 / $0.50")).toBeVisible();
   // Fresh pending flag absent → "no pending owner action".
   await expect(page.getByText("no pending owner action")).toBeVisible();
-  // Reviews link works.
+  // Kế hoạch tab: pre-binding → no canonical plan yet (not fabricated workstreams).
+  await page.getByRole("tab", { name: "Kế hoạch" }).click();
+  await expect(page.getByText("no canonical plan yet")).toBeVisible();
+  // Kết quả tab: reviews link works.
+  await page.getByRole("tab", { name: "Kết quả" }).click();
   await page.getByText("view all reviews").click();
   await expect(page).toHaveURL(new RegExp(`/app/objectives/${oid}/reviews`));
   await expect(page.getByRole("heading", { name: "Reviews" })).toBeVisible();
@@ -143,7 +146,7 @@ test("fixture: verified MET KPI + workstreams still converging + CANDIDATE vs AC
   // MET + workstreams converging → informational note.
   await expect(page.getByText("workstreams still converging")).toBeVisible();
   // Fresh pending.
-  await expect(page.getByText("owner action REQUIRED")).toBeVisible();
+  await expect(page.getByText("owner action REQUIRED (fresh)")).toBeVisible();
   // MET KPI rendered proven.
   await expect(page.getByText("MET").first()).toBeVisible();
 });
@@ -169,7 +172,11 @@ test("fixture: observation_error → UnverifiedPanel, claims labeled unverified"
   await expect(page.getByText("Observation failed integrity check")).toBeVisible();
   await expect(page.getByText("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW")).toBeVisible();
   await expect(page.getByText("UNVERIFIED").first()).toBeVisible();
+  // Kế hoạch tab: workstream claims blocked fail-closed
+  await page.getByRole("tab", { name: "Kế hoạch" }).click();
   await expect(page.getByText("Workstream state unverified")).toBeVisible();
+  // Kết quả tab: dropped artifacts disclosed honestly
+  await page.getByRole("tab", { name: "Kết quả" }).click();
   await expect(page.getByText("+3 dropped unverifiable")).toBeVisible();
 });
 
@@ -195,7 +202,7 @@ test("fixture: expiry_pending → advisory chip, canonical policy-status GET iss
         auto_driver: { status: { scheduled: false } },
       } }) }));
   await seedBiz(page, biz);
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await expect(page.getByText("policy expired — awaiting canonical commit")).toBeVisible();
   await expect(page.getByText("ENABLED", { exact: true })).toBeVisible();
   /* Auto-run controls card: the canonical GET is the control-plane
@@ -264,9 +271,8 @@ test("mutations: CEO pass requires confirm, posts once, refetches; A2 disabled",
   });
   await page.goto(`/app/objectives/${oid}`);
   await expect(page.getByRole("heading", { name: /mut-/ })).toBeVisible();
-  // A2 actions are disabled/labeled, never fake POSTs.
-  await expect(page.getByRole("button", { name: "Accept ACHIEVED (A2)" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Amend objective (A2)" })).toBeDisabled();
+  // A2 review sign-off lives in the Inbox, never on the detail page —
+  // no fabricated accept/reject controls are offered here.
   const before = cockpitCalls;
   await page.getByRole("button", { name: "Run CEO pass" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
@@ -325,7 +331,14 @@ test("read-only pages generate no unintended POST/write calls", async ({ page })
   const writes: string[] = [];
   await page.route("**/api/**", (route) => {
     const m = route.request().method();
-    if (m !== "GET") writes.push(`${m} ${route.request().url()}`);
+    const url = route.request().url();
+    const postBody = route.request().postData() ?? "";
+    /* The canonical KPI-verification status check is intentionally a
+       POST action:"status" (pre-P15.9 contract) — a read, not a
+       mutation. Everything else non-GET is an unintended write. */
+    if (m !== "GET" && !(url.includes("/kpi-verification") && postBody.includes('"status"'))) {
+      writes.push(`${m} ${url}`);
+    }
     return route.fallback();
   });
   await seedBiz(page, biz);
@@ -372,13 +385,13 @@ test("policy HALT on real backend: capture UI request, replay same op/key — no
     return route.fallback();
   });
 
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await page.getByRole("button", { name: "Halt policy (objective scope)" }).click();
   // duplicate-submit protection: rapid second click on confirm sends nothing extra
   const confirm = page.getByRole("dialog").getByRole("button", { name: "Commit halt" });
   await Promise.all([confirm.click(), confirm.click().catch(() => {})]);
   await expect(page.getByText("Policy halt committed")).toBeVisible();
-  await expect(page.getByText("HALTED", { exact: true })).toBeVisible();
+  await expect(page.locator(".need").first().getByText("HALTED", { exact: true })).toBeVisible();
 
   expect(captured).toHaveLength(1);
   const body = captured[0]!;
@@ -574,7 +587,7 @@ test("auto-run card: canonical policy state + limits + driver readiness rendered
     action: "enable", policy_version: 1, idempotency_key: `en-${uniq()}`,
   });
   await seedBiz(page, biz);
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
   await expect(page.getByText("ENABLED", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("7 ceo calls · 3 missions")).toBeVisible();
@@ -587,7 +600,7 @@ test("configure dialog: defaults proposed from objective terms, editable", async
   const biz = await mkBusiness(page, "poldef");
   const oid = await mkObjective(page, biz, `poldef-${uniq()}`); // deadline 2030-12-31, ceiling $0.50
   await seedBiz(page, biz);
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await page.getByRole("button", { name: "Configure policy" }).click();
   const dlg = page.getByRole("dialog");
   // datetime-local renders LOCAL time — compare the instant, not the
@@ -625,7 +638,7 @@ test("ambiguous failure retry keeps the same idempotency key", async ({ page }) 
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await page.getByRole("button", { name: "Enable policy" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
   await expect(page.getByText("Policy enable failed")).toBeVisible();
@@ -659,7 +672,7 @@ test("CAS 409 conflict → canonical refetch + honest note, key kept", async ({ 
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   const before = policyGets;
   await page.getByRole("button", { name: "Enable policy" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
@@ -698,16 +711,16 @@ test("EXPIRED → Re-arm (configure) only; REVOKED → no re-enable offered", as
     if (route.request().method() === "GET") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(polShape(state)) });
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await expect(page.getByText("EXPIRED", { exact: true })).toBeVisible();
   // configure legal from EXPIRED but labeled truthfully as a re-arm
   await expect(page.getByRole("button", { name: "Re-arm policy (new limits)" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Enable policy" })).toHaveCount(0);
   state = "REVOKED";
   await page.reload();
-  await expect(page.getByText("REVOKED", { exact: true })).toBeVisible();
-  // terminal: the actions row offers nothing (no silent re-enable path)
-  await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+  await expect(page.locator(".need").first().getByText("REVOKED", { exact: true })).toBeVisible();
+  // terminal: the policy actions row offers nothing (no silent re-enable path)
+  await expect(page.locator(".policy-actions").locator("button")).toHaveCount(0);
 });
 
 test("policy card polls canonical GET ~every 5s while page is active", async ({ page }) => {
@@ -719,7 +732,7 @@ test("policy card polls canonical GET ~every 5s while page is active", async ({ 
     if (route.request().method() === "GET") policyGets++;
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
   await expect.poll(() => policyGets, { timeout: 12000, intervals: [5500, 7000, 9000, 11000] }).toBeGreaterThanOrEqual(2);
 });
@@ -741,16 +754,16 @@ test("canonical GET failure → zero policy mutations possible (403 and 500)", a
       if (route.request().method() === "POST") posts.push(route.request().postDataJSON());
       return route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: `E${status}`, detail: "denied" }) });
     });
-    await page.goto(`/app/objectives/${oid}`);
+    await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
     // error surfaced + explicit retry offered; no action buttons render
     await expect(page.getByText("policy mutations blocked until a canonical status loads")).toBeVisible();
     await expect(page.getByRole("button", { name: "Retry status" })).toBeVisible();
-    await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+    await expect(page.locator(".policy-actions").locator("button")).toHaveCount(0);
     // even a forced enable attempt cannot exist — nothing to click
     expect(posts).toHaveLength(0);
     // retry still fails → still blocked
     await page.getByRole("button", { name: "Retry status" }).click();
-    await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+    await expect(page.locator(".policy-actions").locator("button")).toHaveCount(0);
     expect(posts).toHaveLength(0);
     await page.unrouteAll();
   }
@@ -776,7 +789,7 @@ test("driver_ready=true renders eligibility, never a running-work claim", async 
       } }) });
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   const row = page.locator(".nrow", { hasText: "driver" }).first();
   await expect(row.getByText("READY", { exact: true })).toBeVisible();
   await expect(row.getByText("eligible — the driver may act")).toBeVisible();
@@ -805,9 +818,9 @@ test("auto-policy identity mismatch → typed failure, controls stay closed", as
         terms_digest_binding: null, terms_current: true,
       } }) });
   });
-  await page.goto(`/app/objectives/${oid}`);
-  await expect(page.getByText("IDENTITY_MISMATCH")).toBeVisible();
-  await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
+  await expect(page.locator(".need").first().getByText("IDENTITY_MISMATCH")).toBeVisible();
+  await expect(page.locator(".policy-actions").locator("button")).toHaveCount(0);
   expect(posts).toHaveLength(0);
 });
 
@@ -825,7 +838,7 @@ test("hidden tab does not poll; restoring visibility resumes refresh", async ({ 
     if (route.request().method() === "GET") policyGets++;
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
   const initial = policyGets;
   await page.waitForTimeout(6500); // > one poll interval while hidden
@@ -850,7 +863,7 @@ test("configure ambiguous failure → reopen restores submitted limits + exact-b
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   // defaults propose 20; owner edits to 9
   await page.getByRole("button", { name: "Configure policy" }).click();
   await page.getByLabel("max ceo calls").fill("9");
@@ -891,7 +904,7 @@ test("POST committed but response lost → exact-body retry, no duplicate transi
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   await page.getByRole("button", { name: "Enable policy" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
   await expect(page.getByText("Policy enable failed")).toBeVisible();
@@ -927,7 +940,7 @@ test("open dialog is locked when canonical GET fails; recovers when restored", a
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   // canonical OK → open Enable dialog → then the next GET fails
   await page.getByRole("button", { name: "Enable policy" }).click();
   const commit = page.getByRole("dialog").getByRole("button", { name: "Commit enable" });
@@ -965,7 +978,7 @@ test("R3: normalized inputs ('09','0.50') retry identical body+key; explicit cha
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   // owner types non-normalized equivalents: "09"→9, "0.50"→0.5
   await page.getByRole("button", { name: "Configure policy" }).click();
   await page.getByLabel("max ceo calls").fill("09");
@@ -1023,7 +1036,7 @@ test("R4: Enable v1 lost → Pause v3 → new Enable binds v3 new key → ENABLE
     }
     return route.fallback();
   });
-  await page.goto(`/app/objectives/${oid}`);
+  await page.goto(`/app/objectives/${oid}?tab=nang-cao`);
   // Enable v1 commits but response lost
   await page.getByRole("button", { name: "Enable policy" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import http from "node:http";
 import type { Server } from "node:http";
 import { createMissionControlServer } from "../pair/mission-control-server.js";
+import { NotFoundError } from "../pair/errors.js";
 import type { GoalIntentAnalysis, IntentItem } from "../pair/semantic-goal-understanding.js";
 
 const item = (partial: Partial<IntentItem>): IntentItem => ({
@@ -78,7 +79,7 @@ const post = (
 const OP = { "x-operator-id": "op:e2e" };
 const fakeBiz = {
   getBusiness: (id: string) => {
-    if (id !== "BIZ_ok") throw new Error("not found");
+    if (id !== "BIZ_ok") throw new NotFoundError(`business:${id}`);
     return { business_id: id };
   },
 };
@@ -212,12 +213,68 @@ describe("UI-V2 /api/v1/intake/draft", () => {
     const { server, port } = await boot({
       business: fakeBiz,
       intakeAnalyze: async () => {
-        throw new Error("provider blew up");
+        throw new Error("provider blew up at /secret/path");
       },
     });
     try {
       const r = await post(port, { goal: "g objective", business_id: "BIZ_ok" }, OP);
       expect(r.status).toBe(200);
+      expect(r.json.status).toBe("unavailable");
+      /* typed reason only — provider internals (paths, stderr) are
+         never echoed to the client. */
+      expect(r.json.unavailable_reason).toBe("intake_analyze:error");
+      expect(String(r.json.unavailable_reason)).not.toContain("/secret/path");
+      const d = r.json.draft as Record<string, { value?: unknown }>;
+      expect((d.statement as { value?: unknown }).value).toBe("g objective");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("manual:true skips the analyzer entirely — zero provider spend", async () => {
+    let called = 0;
+    const { server, port } = await boot({
+      business: fakeBiz,
+      intakeAnalyze: async () => {
+        called++;
+        return null;
+      },
+    });
+    try {
+      const r = await post(
+        port,
+        { goal: "g objective", business_id: "BIZ_ok", manual: true },
+        OP,
+      );
+      expect(r.status).toBe(200);
+      expect(called).toBe(0);
+      expect(r.json.mode).toBe("manual");
+      expect(r.json.status).toBe("manual");
+      const d = r.json.draft as Record<string, { value?: unknown }>;
+      expect((d.statement as { value?: unknown }).value).toBe("g objective");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("malformed advisory payload → unavailable + manual draft, never 'analyzed' dishonesty", async () => {
+    const { server, port } = await boot({
+      business: fakeBiz,
+      intakeAnalyze: async () => ({
+        mode: "guarded",
+        status: "analyzed",
+        analysis_digest: null,
+        source_goal_sha: null,
+        provider_requests: 1,
+        ambiguity_class: "MATERIAL",
+        analysis: { items: "not-an-array" },
+      }),
+    });
+    try {
+      const r = await post(port, { goal: "g objective", business_id: "BIZ_ok" }, OP);
+      expect(r.status).toBe(200);
+      expect(r.json.status).toBe("unavailable");
+      expect(r.json.unavailable_reason).toBe("intake_analyze:malformed_response");
       const d = r.json.draft as Record<string, { value?: unknown }>;
       expect((d.statement as { value?: unknown }).value).toBe("g objective");
     } finally {

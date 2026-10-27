@@ -24,7 +24,7 @@ Owner/Advanced mode is a **presentation toggle** (`pair.owner_mode` localStorage
 ```
 Owner nav (VN-first):
   Tổng quan        /app/home            (new — dashboard + NL hero entry; /app index redirects here)
-  Mục tiêu         /app/objectives      (existing list; + /app/objectives/new = intake entry with objective bias)
+  Mục tiêu         /app/objectives      (existing list; Objective intake happens at /app/new via the kind toggle)
   Công việc        /app/missions        (existing Missions; relabeled)
   Phê duyệt        /app/inbox           (existing Owner Inbox; relabeled)
   Nhân sự AI       /app/workforce       (existing; /app/workforce/admin reachable contextually)

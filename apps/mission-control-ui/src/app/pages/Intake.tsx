@@ -78,12 +78,15 @@ export function Intake() {
   const [err, setErr] = useState<{ code: string; detail: string } | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
+  /* The business the displayed draft was analyzed against — confirm must
+     commit into THAT scope or fail closed, never silently re-scope. */
+  const [analyzedBiz, setAnalyzedBiz] = useState<string | null>(null);
   const dedupRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  const analyze = async () => {
+  const analyze = async (manual = false) => {
     const g = goal.trim();
     if (!g || busy) return;
     abortRef.current?.abort();
@@ -93,15 +96,18 @@ export function Intake() {
     setErr(null);
     setResp(null);
     setDraft(null);
+    setCreated(null);
     try {
       const r = await api.intakeDraft({
         goal: g,
         business_id: biz || null,
+        ...(manual ? { manual: true } : {}),
       });
       if (ctl.signal.aborted) return;
       setResp(r);
       setDraft(toDraftState(r));
       setKind(r.draft.suggested_kind);
+      setAnalyzedBiz(biz || null);
       dedupRef.current = `intake-${crypto.randomUUID()}`;
     } catch (e) {
       if (ctl.signal.aborted) return;
@@ -110,12 +116,6 @@ export function Intake() {
     } finally {
       if (!ctl.signal.aborted) setBusy(false);
     }
-  };
-
-  const manualDraft = async () => {
-    /* Governed manual path — same endpoint returns the manual draft even
-       when interpretation is off; keeps ONE seam for provenance. */
-    await analyze();
   };
 
   const explicitItems = useMemo(
@@ -132,11 +132,23 @@ export function Intake() {
     [resp],
   );
 
+  /* Numeric fields must be valid-or-empty — a malformed value silently
+     dropped at commit is dishonest. Block confirm with a stated reason. */
+  const budgetInvalid = !!draft && draft.budgetUsd.trim() !== "" && !Number.isFinite(Number(draft.budgetUsd));
+  /* Canonical create requires a numeric target for every named KPI —
+     flag it instead of letting the whole create fail server-side. */
+  const kpiTargetInvalid =
+    !!draft &&
+    draft.kpis.some(
+      (k) => k.name.trim() !== "" && (k.target.trim() === "" || !Number.isFinite(Number(k.target))),
+    );
+  const bizDrift = resp !== null && analyzedBiz !== (biz || null);
   const canConfirmObjective =
-    !!biz && !!draft && draft.title.trim() !== "" && draft.statement.trim() !== "" && !busy;
+    !!biz && !!draft && draft.title.trim() !== "" && draft.statement.trim() !== "" &&
+    !busy && !bizDrift && !budgetInvalid && !kpiTargetInvalid;
 
   const confirmObjective = async () => {
-    if (!draft || !biz || busy) return;
+    if (!draft || !biz || busy || bizDrift) return;
     setBusy(true);
     setErr(null);
     try {
@@ -168,7 +180,7 @@ export function Intake() {
       if (hc.length) body.hard_constraints = hc;
       const sc = draft.successConditions.map((c) => c.text.trim()).filter(Boolean);
       if (sc.length) body.success_conditions = sc;
-      const o = await api.createVnextObjective(body);
+      const o = await api.createObjectiveApp(body);
       setCreated(String(o.objective_id));
       setConfirmOpen(false);
     } catch (e) {
@@ -216,7 +228,7 @@ export function Intake() {
           </button>
           <button
             className="v2btn"
-            onClick={() => void manualDraft()}
+            onClick={() => void analyze(true)}
             disabled={busy || goal.trim() === ""}
             title="Bản nháp trực tiếp từ văn bản — không cần phân tích AI"
           >
@@ -305,7 +317,11 @@ export function Intake() {
                         setDraft({ ...draft, budgetUsd: e.target.value, budgetProv: "edited" })
                       }
                     />
-                    {resp.draft.budget_hint.value ? (
+                    {budgetInvalid ? (
+                      <div className="hint" style={{ color: "var(--danger)" }}>
+                        Nhập số USD hợp lệ hoặc để trống — ví dụ: 20
+                      </div>
+                    ) : resp.draft.budget_hint.value ? (
                       <div className="hint">từ văn bản: “{resp.draft.budget_hint.value}”</div>
                     ) : null}
                   </div>
@@ -401,6 +417,11 @@ export function Intake() {
                 >
                   + Thêm KPI
                 </button>
+                {kpiTargetInvalid ? (
+                  <div className="hint" style={{ color: "var(--danger)" }}>
+                    Mỗi KPI có tên cần một mục tiêu số — hoặc xoá KPI đó.
+                  </div>
+                ) : null}
 
                 {draft.hardConstraints.length || draft.successConditions.length ? (
                   <div className="grid2">
@@ -518,7 +539,15 @@ export function Intake() {
                   <button
                     className="v2btn primary"
                     disabled={!canConfirmObjective}
-                    title={biz ? "" : "Chọn business trước (góc trái sidebar)"}
+                    title={
+                      bizDrift
+                        ? "Business đã đổi sau khi phân tích — phân tích lại để gắn đúng phạm vi"
+                        : budgetInvalid || kpiTargetInvalid
+                          ? "Sửa giá trị số chưa hợp lệ (hoặc để trống)"
+                          : biz
+                            ? ""
+                            : "Chọn business trước (góc trái sidebar)"
+                    }
                     onClick={() => setConfirmOpen(true)}
                   >
                     Tạo Objective →
@@ -538,7 +567,12 @@ export function Intake() {
                   Hủy
                 </button>
               </div>
-              {!biz && kind === "objective" ? (
+              {bizDrift ? (
+                <div className="hint" style={{ marginTop: 8, color: "var(--danger)" }}>
+                  Business đã đổi từ <code>{analyzedBiz ?? "—"}</code> sang{" "}
+                  <code>{biz || "—"}</code> — bấm “Phân tích yêu cầu” lại để gắn đúng phạm vi.
+                </div>
+              ) : !biz && kind === "objective" ? (
                 <div className="hint" style={{ marginTop: 8 }}>
                   Chọn business ở góc trái sidebar để tạo Objective.
                 </div>
@@ -619,6 +653,7 @@ export function Intake() {
         title="Tạo Objective"
         body={`Tạo Objective "${draft?.title ?? ""}" trong business ${biz}? Bản nháp sẽ trở thành objective canonical — các KPI/ràng buộc bạn để trống sẽ không được ghi.`}
         confirmLabel="Tạo Objective"
+        busy={busy}
         onCancel={() => setConfirmOpen(false)}
         onConfirm={() => void confirmObjective()}
       />

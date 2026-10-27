@@ -35,50 +35,73 @@ export function Home() {
   const [missions, setMissions] = useState<Array<Record<string, unknown>> | null>(null);
   const [missionsDown, setMissionsDown] = useState(false);
   const [approvals, setApprovals] = useState<Array<Record<string, unknown>> | null>(null);
+  const [approvalsDown, setApprovalsDown] = useState(false);
   const [reviewsPending, setReviewsPending] = useState<number | null>(null);
   const [agents, setAgents] = useState<import("../types").OrgAgentRow[] | null>(null);
   const [workItems, setWorkItems] = useState<import("../types").WorkItemRow[] | null>(null);
   const [bizDown, setBizDown] = useState(false);
 
+  const isAbort = (e: unknown) =>
+    e instanceof DOMException && e.name === "AbortError";
+
+  /* Global reads run once — not re-fetched on business switch. */
   useEffect(() => {
     const ctl = new AbortController();
     const s = ctl.signal;
+    const live = () => !s.aborted;
     apiAdmin
       .operationsOverview(s)
-      .then((r) => setOps(r.operations))
-      .catch(() => setOpsDown(true));
+      .then((r) => { if (live()) setOps(r.operations); })
+      .catch((e) => { if (!isAbort(e) && live()) setOpsDown(true); });
     api
-      .missions()
-      .then((r) => setMissions((r.missions as Array<Record<string, unknown>>) ?? []))
-      .catch(() => setMissionsDown(true));
+      .missions({ noAuthPrompt: true })
+      .then((r) => { if (live()) setMissions((r.missions as Array<Record<string, unknown>>) ?? []); })
+      .catch((e) => { if (!isAbort(e) && live()) setMissionsDown(true); });
     api
       .approvalsNoPrompt()
-      .then((a) => setApprovals(Array.isArray(a) ? a : []))
-      .catch(() => setApprovals(null));
-    if (biz) {
-      api
-        .vnextObjectives(biz)
-        .then((r) => setObjectives(r.objectives as Array<Record<string, unknown>>))
-        .catch(() => setObjDown(true));
-      api
-        .businessCompany(biz, s)
-        .then((r) => setReviewsPending(r.company.counts.targets_met_pending))
-        .catch(() => setReviewsPending(null));
-      api
-        .orgAgents(s)
-        .then((r) => setAgents((r.agents ?? []).filter((a) => a.business_id === biz)))
-        .catch(() => setBizDown(true));
-      api
-        .workItems(biz, s)
-        .then((r) => setWorkItems(r.work_items ?? []))
-        .catch(() => setBizDown(true));
-    } else {
+      .then((a) => { if (live()) setApprovals(Array.isArray(a) ? a : []); })
+      .catch((e) => { if (!isAbort(e) && live()) setApprovalsDown(true); });
+    return () => ctl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* Business-scoped reads — reset on every switch so tenant A's rows can
+     never render under tenant B, and stale responses are dropped by the
+     abort guard (last-write-wins). */
+  useEffect(() => {
+    const ctl = new AbortController();
+    const s = ctl.signal;
+    const live = () => !s.aborted;
+    setObjectives(null);
+    setObjDown(false);
+    setReviewsPending(null);
+    setAgents(null);
+    setWorkItems(null);
+    setBizDown(false);
+    if (!biz) {
       setObjectives([]);
-      setReviewsPending(null);
       setAgents([]);
       setWorkItems([]);
+      return;
     }
+    api
+      .vnextObjectives(biz, { noAuthPrompt: true })
+      .then((r) => { if (live()) setObjectives(r.objectives as Array<Record<string, unknown>>); })
+      .catch((e) => { if (!isAbort(e) && live()) setObjDown(true); });
+    api
+      .businessCompany(biz, s)
+      .then((r) => { if (live()) setReviewsPending(r.company.counts.targets_met_pending); })
+      .catch((e) => { if (!isAbort(e) && live()) setReviewsPending(null); });
+    api
+      .orgAgents(s)
+      .then((r) => { if (live()) setAgents((r.agents ?? []).filter((a) => a.business_id === biz)); })
+      .catch((e) => { if (!isAbort(e) && live()) setBizDown(true); });
+    api
+      .workItems(biz, s)
+      .then((r) => { if (live()) setWorkItems(r.work_items ?? []); })
+      .catch((e) => { if (!isAbort(e) && live()) setBizDown(true); });
     return () => ctl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [biz]);
 
   const activeObjectives = useMemo(
@@ -88,7 +111,7 @@ export function Home() {
   const runningMissions = useMemo(
     () =>
       (missions ?? []).filter((m) =>
-        ["RUNNING", "CREATED", "PAUSED"].includes(String(m.status ?? m.runtime_state ?? "")),
+        ["RUNNING", "CREATED"].includes(String(m.status ?? m.runtime_state ?? "")),
       ),
     [missions],
   );
@@ -113,6 +136,8 @@ export function Home() {
     return byAgent;
   }, [workItems]);
 
+  /* Blocked work items only count when the ops rollup actually loaded —
+     a failed read contributes an unknown amount, marked with "+". */
   const needCount =
     pendingApprovals.length + (reviewsPending ?? 0) +
     (ops?.work_items_blocked ?? 0);
@@ -169,7 +194,13 @@ export function Home() {
         </Link>
         <Link className="stat" to="/app/inbox">
           <div className="k">Cần phê duyệt</div>
-          <div className="v">{approvals === null ? "—" : needCount}</div>
+          <div className="v">
+            {approvals === null
+              ? approvalsDown
+                ? "—"
+                : "…"
+              : `${needCount}${opsDown || reviewsPending === null ? "+" : ""}`}
+          </div>
           <div className="n">
             {biz
               ? `approvals ${pendingApprovals.length} · reviews ${reviewsPending ?? "—"} · blocked ${ops?.work_items_blocked ?? "—"}`

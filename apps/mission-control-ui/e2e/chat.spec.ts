@@ -105,11 +105,11 @@ test("chat: >200 messages — tail window renders newest, earlier reachable, no 
 });
 
 test("task entry: reachable from nav and submits without any chat/draft", async ({ page }) => {
-  await page.goto("/");
-  await page.getByRole("link", { name: "Task Entry" }).click();
+  await page.goto("/app/missions");
+  await page.getByRole("link", { name: /New mission.*Task Entry/ }).click();
   await expect(page.getByRole("heading", { name: "Task entry" })).toBeVisible();
   await page.getByLabel(/goal/i).fill("e2e task entry direct");
-  await page.locator("#project").selectOption({ index: 1 });
+  await page.getByLabel("project").selectOption({ index: 1 });
   await page.getByRole("button", { name: /plan & run|preview plan/i }).click();
   await expect(page.getByText(/COMPLETED|RUNNING|WAITING/i).first()).toBeVisible({ timeout: 10_000 });
 });

@@ -11,7 +11,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { IntegrityError, PairError, PolicyError } from "./errors.js";
+import { IntegrityError, NotFoundError, PairError, PolicyError } from "./errors.js";
 import { compatOutboxBasename } from "./canonical.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import { ulid } from "ulid";
@@ -1178,6 +1178,9 @@ export function createMissionControlServer(
           body.business_id == null ? null : String(body.business_id).trim() || null;
         const projectId =
           body.project_id == null ? null : String(body.project_id).trim() || null;
+        /* manual:true → the owner asked for a text-only draft: skip the
+           advisory provider call entirely (no spend, no model). */
+        const manualOnly = body.manual === true;
         if (businessId) {
           /* Scope binding must be real — an unknown business_id fails
              closed rather than binding interpretation evidence to a
@@ -1185,17 +1188,24 @@ export function createMissionControlServer(
           if (!deps.business) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
           try {
             deps.business.getBusiness(businessId);
-          } catch {
-            return void json(res, 404, { error: "BUSINESS_NOT_FOUND", business_id: businessId });
+          } catch (e) {
+            /* Only a missing business maps to 404 — integrity/policy
+               failures propagate as their own typed error, never
+               masquerade as an ordinary not-found. */
+            if (e instanceof NotFoundError) {
+              return void json(res, 404, { error: "BUSINESS_NOT_FOUND", business_id: businessId });
+            }
+            throw e;
           }
         }
         /* Advisory seam must never block the manual path — a provider
            * failure degrades to typed unavailable evidence + manual
            * draft, mirroring the run-pinned seam's fail-open-advisory /
-           * fail-closed-authority contract. */
+           * fail-closed-authority contract. Provider internals are never
+           * echoed to the client — typed reasons only. */
         let interpreted: Record<string, unknown> | null = null;
         let intakeError: string | null = null;
-        if (deps.intakeAnalyze) {
+        if (deps.intakeAnalyze && !manualOnly) {
           try {
             interpreted = await deps.intakeAnalyze({
               goal,
@@ -1204,13 +1214,23 @@ export function createMissionControlServer(
               operator_id: actor,
             });
           } catch (e) {
-            intakeError = `intake_analyze:${e instanceof Error ? e.message.slice(0, 120) : "unknown"}`;
+            intakeError = `intake_analyze:${e instanceof PairError ? e.code : "error"}`;
             interpreted = null;
           }
         }
-        const analysis =
+        /* A malformed advisory payload is unavailable evidence — degrade
+           to the manual draft + typed reason, never present an
+           "analyzed" status alongside a manual draft. */
+        const rawAnalysis =
           interpreted && typeof interpreted === "object"
-            ? (interpreted.analysis as Record<string, unknown> | null | undefined) ?? null
+            ? (interpreted.analysis as { items?: unknown } | null | undefined)
+            : null;
+        const analysisMalformed =
+          interpreted != null && interpreted.status === "analyzed" &&
+          !Array.isArray(rawAnalysis?.items);
+        const analysis =
+          !analysisMalformed && Array.isArray(rawAnalysis?.items)
+            ? (rawAnalysis as Record<string, unknown>)
             : null;
         const draft =
           analysis != null
@@ -1218,12 +1238,20 @@ export function createMissionControlServer(
             : deriveManualDraft(goal);
         return void json(res, 200, {
           schema_version: INTAKE_DRAFT_SCHEMA,
-          mode: (interpreted?.mode as string | undefined) ?? semanticMode(),
-          status: intakeError
-            ? "unavailable"
-            : (interpreted?.status as string | undefined) ?? "off",
+          mode: manualOnly ? "manual" : (interpreted?.mode as string | undefined) ?? semanticMode(),
+          status: manualOnly
+            ? "manual"
+            : intakeError
+              ? "unavailable"
+              : analysisMalformed
+                ? "unavailable"
+                : (interpreted?.status as string | undefined) ??
+                  (semanticMode() === "off" || !deps.intakeAnalyze ? "off" : "unavailable"),
           unavailable_reason:
-            intakeError ?? ((interpreted?.unavailable_reason as string | undefined) ?? null),
+            intakeError ??
+            (analysisMalformed
+              ? "intake_analyze:malformed_response"
+              : ((interpreted?.unavailable_reason as string | undefined) ?? null)),
           analysis_digest: (interpreted?.analysis_digest as string | undefined) ?? null,
           source_goal_sha: (interpreted?.source_goal_sha as string | undefined) ?? null,
           provider_requests: (interpreted?.provider_requests as number | undefined) ?? 0,

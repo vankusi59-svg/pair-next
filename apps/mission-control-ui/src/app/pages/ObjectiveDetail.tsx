@@ -874,7 +874,16 @@ export function ObjectiveDetail() {
             role="tab"
             aria-selected={tab === key}
             className={tab === key ? "on" : ""}
-            onClick={() => setParams({ tab: key }, { replace: true })}
+            onClick={() =>
+              setParams(
+                (prev) => {
+                  const next = new URLSearchParams(prev);
+                  next.set("tab", key);
+                  return next;
+                },
+                { replace: true },
+              )
+            }
           >
             {label}
           </button>
@@ -1124,7 +1133,7 @@ export function ObjectiveDetail() {
           <div className="nrow"><span className="tt">status fetch</span><span className="note">loading canonical status — controls stay closed until verified.</span></div>
         ) : null}
       </div>
-      <div className="actions">
+      <div className="actions policy-actions">
         {polCtl === null ? null : (
           !polCtl.configured ? ["configure"] : Object.keys(POLICY_TRANSITIONS).filter((a) => POLICY_TRANSITIONS[a].includes(String(polCtl.state)))
         ).map((a) => (
