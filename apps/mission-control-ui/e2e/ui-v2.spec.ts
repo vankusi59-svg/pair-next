@@ -123,6 +123,45 @@ test("v2 intake: objective path fails closed when no business selected", async (
   await expect(page.locator(".dractions .hint")).toContainText(/chọn business/i);
 });
 
+// ---------- Intake numeric honesty: negative/invalid budget never silently dropped ----------
+test("v2 intake: negative budget blocked — invalid values never silently dropped", async ({ page }) => {
+  const biz = await mkBusiness(page, "negbudget");
+  await seedBiz(page, biz.id);
+  await page.goto("/app/new");
+  await page.locator(".v2hero-in").fill(GOAL);
+  await page.getByRole("button", { name: /Phân tích yêu cầu/ }).click();
+  await expect(page.locator(".draftwrap")).toBeVisible({ timeout: 15000 });
+  await page.getByRole("radio", { name: /Objective — mục tiêu kinh doanh/ }).click();
+  const budget = page.getByLabel("Ngân sách trần USD");
+  const confirmBtn = page.getByRole("button", { name: "Tạo Objective →" });
+
+  /* Finite-but-negative budgets used to pass validation then get dropped
+     from the create body — now they block confirm with a stated reason. */
+  for (const bad of ["-5", "-0.5", "abc", "Infinity", "1e999"]) {
+    await budget.fill(bad);
+    await expect(confirmBtn, `budget "${bad}" must block confirm`).toBeDisabled();
+  }
+  await expect(page.getByText(/Nhập số USD hợp lệ/)).toBeVisible();
+
+  /* Empty = unset (allowed); zero and positive are explicit values that
+     must actually reach the canonical create body — not be dropped. */
+  await budget.fill("");
+  await expect(confirmBtn).toBeEnabled();
+  let body: Record<string, unknown> | null = null;
+  await page.route("**/api/vnext/objectives", async (route) => {
+    body = route.request().postDataJSON() as Record<string, unknown>;
+    await route.continue();
+  });
+  await budget.fill("25");
+  await confirmBtn.click();
+  await expect(page.locator(".cdlg")).toBeVisible();
+  await page.locator(".cdlg-f button.primary").click();
+  await expect(page.locator(".pstate", { hasText: "Objective đã được tạo" })).toBeVisible({ timeout: 15000 });
+  expect(body).toBeTruthy();
+  expect(body!.budget_ceiling_microusd, "positive budget reaches the canonical body as microusd").toBe(25_000_000);
+  expect(body!.currency).toBe("USD");
+});
+
 // ---------- Intake fail-closed: analysis error never commits ----------
 test("v2 intake: analyze failure shows error, creates nothing", async ({ page }) => {
   await page.route("**/api/v1/intake/draft", (route) =>

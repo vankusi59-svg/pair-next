@@ -1,8 +1,9 @@
 # UI-V2 Owner-First Experience — Release Report
 
 - **BASE SHA:** `ab0fccf79b2ac5ed045e948a0402ecbaa889c439`
-- **HEAD SHA (last functional commit):** `5f1870c` — later commits on this
-  branch add evidence/docs only; the PR commits tab shows the exact tip.
+- **HEAD SHA (last functional commit):** see below — the report commit is
+  docs-only; the PR commits tab shows the exact tip. Functional tip at
+  this report: the intake negative-budget fix commit (see commit log).
 - **PR:** https://github.com/vankusi59-svg/pair-next/pull/157 — **open,
   unmerged.** Owner retains merge authority; no merge/deploy/release
   action was performed.
@@ -97,7 +98,7 @@
 | build (backend + UI) | **PASS** |
 | Full unit suite | **PASS_WITH_KNOWN_BASELINE** (+134 baseline) |
 | Focused: intake unit + endpoint | `pair-objective-intake.test.ts` + `pair-intake-draft-endpoint.test.ts` — **17/17 PASS** |
-| Focused: `ui-v2.spec.ts` | **11/11 PASS** |
+| Focused: `ui-v2.spec.ts` | **12/12 PASS** (re-run at post-audit HEAD incl. negative-budget regression — [`evidence/e2e-head-focused-uiv2.txt`](./evidence/e2e-head-focused-uiv2.txt)) |
 | Reconciled legacy specs (objectives + company + inbox-ceo) | **68/68 PASS** |
 
 ### Playwright BASE-vs-HEAD (full suite, identical harness)
@@ -129,13 +130,24 @@ manifests (zero diff BASE..HEAD).
 | **REGRESSION** | **0** |
 | **NEW-FAIL** | **0** |
 
-Remaining 22 failures, all verified identical at BASE:
-- **17× planner-environment:** `preview → 409
-  FAIL_CLOSED_PLANNER_NO_ELIGIBLE` — this box has no qualified planner
-  candidate; specs are untouched by this diff.
-- **5× pre-existing stale-spec defects:** `p184-operations` ×1,
-  `system.spec` ×2, `workforce-admin` ×1, plus one `missions.spec`
-  preview-409 counted above.
+Signature audit of the 22 fail-both — per-test:
+[`evidence/e2e-signature-audit.json`](./evidence/e2e-signature-audit.json).
+Full error heads compared after normalizing only provably-dynamic tokens
+(generated IDs, digests, UUIDs, abs paths) and dropping stack frames:
+**20/22 identical; 2 differ only in dynamic tokens** (fixture row-count
+`181`→`136`; a code-frame of the spec line this diff fixed). Locators,
+expected/received values, status/error codes are never normalized —
+**0 genuinely-different signatures**.
+
+Remaining 22 failures, counted per-test by failure mechanism:
+- **21× planner-environment** (`FAIL_CLOSED_PLANNER_NO_ELIGIBLE`, no
+  qualified planner on this box; specs untouched by this diff):
+  9× explicit `preview -> 409`, 9× downstream `element not found` on
+  post-preview elements, 3× the same gate on other seams
+  (`system.spec` ×2 `mkMission pv.ok`, `workforce-admin` work-item open).
+- **1× pre-existing spec/data defect:** `p184-operations` —
+  `execution_health.executions[].mission_id` is `undefined`; identical
+  at BASE.
 
 ## Independent audit — findings → fixes
 
@@ -151,6 +163,7 @@ Remaining 22 failures, all verified identical at BASE:
 | LOW | ConfirmDialog double-fire, stale banner, param loss, doc drift | `busy`, `setCreated(null)`, `setParams` merge, blueprint corrected |
 | LOW | Malformed budget/KPI silently dropped | Inline validation blocks confirm |
 | REVIEW | Workstream promise vs actual behavior (Blocker A) | Suggestion-only copy + zero-write E2E proof (`5f1870c`) |
+| REVIEW | Negative budget finite-valid → silently dropped at confirm | `budgetInvalid` now covers `< 0`; hint states ≥ 0; e2e proves blocked confirm + positive value reaches canonical body |
 
 ## Screenshots
 

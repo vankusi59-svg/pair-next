@@ -133,8 +133,12 @@ export function Intake() {
   );
 
   /* Numeric fields must be valid-or-empty — a malformed value silently
-     dropped at commit is dishonest. Block confirm with a stated reason. */
-  const budgetInvalid = !!draft && draft.budgetUsd.trim() !== "" && !Number.isFinite(Number(draft.budgetUsd));
+     dropped at commit is dishonest. Block confirm with a stated reason.
+     Negative budgets are finite but uncommittable (canonical create
+     fails closed on <0 microusd): flag them instead of dropping them. */
+  const budgetUsdNum = draft ? Number(draft.budgetUsd) : NaN;
+  const budgetInvalid =
+    !!draft && draft.budgetUsd.trim() !== "" && (!Number.isFinite(budgetUsdNum) || budgetUsdNum < 0);
   /* Canonical create requires a numeric target for every named KPI —
      flag it instead of letting the whole create fail server-side. */
   const kpiTargetInvalid =
@@ -319,7 +323,7 @@ export function Intake() {
                     />
                     {budgetInvalid ? (
                       <div className="hint" style={{ color: "var(--danger)" }}>
-                        Nhập số USD hợp lệ hoặc để trống — ví dụ: 20
+                        Nhập số USD hợp lệ (≥ 0) hoặc để trống — ví dụ: 20
                       </div>
                     ) : resp.draft.budget_hint.value ? (
                       <div className="hint">từ văn bản: “{resp.draft.budget_hint.value}”</div>

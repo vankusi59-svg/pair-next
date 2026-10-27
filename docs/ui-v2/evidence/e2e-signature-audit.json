@@ -1,0 +1,202 @@
+[
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: draft card full terms → pinned confirm → CONFIRMED + canonical mission link",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: locator('.draftcard').getByText('CONFIRMED', { exact: true }) Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" locator('.draftcard').getByText('CONFIRMED', { exact: true }) with timeout 15000ms - wait",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: locator('.draftcard').getByText('CONFIRMED', { exact: true }) Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" locator('.draftcard').getByText('CONFIRMED', { exact: true }) with timeout 15000ms - wait",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "chat: draft → confirm mints exactly one mission with a detail link",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: locator('.draft-card').getByText('CONFIRMED') Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" locator('.draft-card').getByText('CONFIRMED') with timeout 15000ms - waiting for locator('.draft-card').g",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: locator('.draft-card').getByText('CONFIRMED') Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" locator('.draft-card').getByText('CONFIRMED') with timeout 15000ms - waiting for locator('.draft-card').g",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "task entry: reachable from nav and submits without any chat/draft",
+  "cls": "DIFFERS",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText(/COMPLETED|RUNNING|WAITING/i).first() Expected: visible Timeout: 10000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText(/COMPLETED|RUNNING|WAITING/i).first() with timeout 10000ms - waiting for getByText(/COMPLETED",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText(/COMPLETED|RUNNING|WAITING/i).first() Expected: visible Timeout: 10000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText(/COMPLETED|RUNNING|WAITING/i).first() with timeout 10000ms - waiting for getByText(/COMPLETED",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true,
+  "sig_note": "error heads differ only in the code-frame snippet of the spec line itself (#project->getByLabel fix); same element-not-found failure"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "missions list: global label, search/filter/sort, deep links, cards",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: preview → pinned confirm → detail (single seam)",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 122 | // preview — creates no mission",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 122 | // preview — creates no mission",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: stale/invalid digest → canonical failure, no retry",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 159 | await page.getByLabel(\"project\"",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 159 | await page.getByLabel(\"project\"",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: double-confirm click yields exactly one POST",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 180 | await page.getByLabel(\"project\"",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 180 | await page.getByLabel(\"project\"",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: 5xx on confirm → outcome unknown, no auto-retry",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 195 | await page.getByLabel(\"project\"",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 195 | await page.getByLabel(\"project\"",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: all sections on canonical reads + file viewer",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: malformed DAG fails only that section (adversarial)",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: lifecycle pause via pinned dialog",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: failed action reports error, no optimistic flip (adversarial)",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: switching id discards previous payload",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: identity mismatch fails closed (adversarial)",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "read-only pages issue zero POSTs",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F4: late file result for A never lands on B",
+  "cls": "same-substance",
+  "bhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "hhead": "Error: preview -> 409 expect(received).toBeTruthy() Received: false 36 | }; 37 | const pv = await api(page, \"POST\", \"/missions/preview\", body); > 38 | expect(pv.ok, `preview -> ${pv.status}`).toBeTruthy(); | ^ 39 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 40 | preview_id: String(pv.",
+  "cause": "explicit-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-A: confirm in-flight + input change → unknown outcome, no dup POST",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 588 | await page.getByLabel(\"project\"",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText('Proposed plan') Expected: visible Timeout: 5000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText('Proposed plan') with timeout 5000ms - waiting for getByText('Proposed plan') 588 | await page.getByLabel(\"project\"",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "p184-operations.spec.ts",
+  "title": "p184: mission detail ops sections render canonical evidence",
+  "cls": "same-substance",
+  "bhead": "Error: expect(received).toBe(expected) // Object.is equality Expected: \"<ID>\" Received: undefined 92 | expect(ops.recovery_ops?.mission_id).toBe(mid); 93 | const execs = ops.execution_health?.executions ?? []; > 94 | for (const e of execs) expect(e.mission_id).toBe(mid); | ^ 95 | const signal = ops.",
+  "hhead": "Error: expect(received).toBe(expected) // Object.is equality Expected: \"<ID>\" Received: undefined 92 | expect(ops.recovery_ops?.mission_id).toBe(mid); 93 | const execs = ops.execution_health?.executions ?? []; > 94 | for (const e of execs) expect(e.mission_id).toBe(mid); | ^ 95 | const signal = ops.",
+  "cause": "spec-data-defect",
+  "planner_related": false
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "task entry: preview -> confirm -> detail shows runtime state",
+  "cls": "same-substance",
+  "bhead": "Error: expect(locator).toBeVisible() failed Locator: getByText(/COMPLETED|RUNNING|WAITING/i).first() Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText(/COMPLETED|RUNNING|WAITING/i).first() with timeout 15000ms - waiting for getByText(/COMPLETED",
+  "hhead": "Error: expect(locator).toBeVisible() failed Locator: getByText(/COMPLETED|RUNNING|WAITING/i).first() Expected: visible Timeout: 15000ms Error: element(s) not found Call log: - Expect \"toBeVisible\" getByText(/COMPLETED|RUNNING|WAITING/i).first() with timeout 15000ms - waiting for getByText(/COMPLETED",
+  "cause": "downstream-of-preview-409",
+  "planner_related": true
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "observability: evidence pinned to selected mission; late response A never overwrites B; export carries selected id",
+  "cls": "same-substance",
+  "bhead": "Error: expect(received).toBeTruthy() Received: false 124 | authorized_workspaces: [String(p.root_location ?? \"\")], 125 | }); > 126 | expect(pv.ok).toBeTruthy(); | ^ 127 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 128 | preview_id: String(pv.json.preview_id), plan_digest: String(pv.js",
+  "hhead": "Error: expect(received).toBeTruthy() Received: false 124 | authorized_workspaces: [String(p.root_location ?? \"\")], 125 | }); > 126 | expect(pv.ok).toBeTruthy(); | ^ 127 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 128 | preview_id: String(pv.json.preview_id), plan_digest: String(pv.js",
+  "cause": "planner-no-eligible-other-seam",
+  "planner_related": true
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings R1-F3: token save clears the previously-authenticated SSE buffer; clear fails closed, never stale-live",
+  "cls": "same-substance",
+  "bhead": "Error: expect(received).toBeTruthy() Received: false 124 | authorized_workspaces: [String(p.root_location ?? \"\")], 125 | }); > 126 | expect(pv.ok).toBeTruthy(); | ^ 127 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 128 | preview_id: String(pv.json.preview_id), plan_digest: String(pv.js",
+  "hhead": "Error: expect(received).toBeTruthy() Received: false 124 | authorized_workspaces: [String(p.root_location ?? \"\")], 125 | }); > 126 | expect(pv.ok).toBeTruthy(); | ^ 127 | const cf = await api(page, \"POST\", \"/missions/confirm\", { 128 | preview_id: String(pv.json.preview_id), plan_digest: String(pv.js",
+  "cause": "planner-no-eligible-other-seam",
+  "planner_related": true
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: agent + work-item lifecycle (create/open/block/unblock/comment)",
+  "cls": "DIFFERS",
+  "bhead": "Error: expect(locator).toContainText(expected) failed Locator: locator('.page') Expected substring: \"Open committed\" Received string: \"Workforce AdministrationAgents come from GET /api/org-agents — a global, unfiltered read filtered client-side to <ID> (181 row(s) of other businesses hidden). This i",
+  "hhead": "Error: expect(locator).toContainText(expected) failed Locator: locator('.page') Expected substring: \"Open committed\" Received string: \"Workforce AdministrationAgents come from GET /api/org-agents — a global, unfiltered read filtered client-side to <ID> (136 row(s) of other businesses hidden). This i",
+  "cause": "planner-no-eligible-other-seam",
+  "planner_related": true,
+  "sig_note": "error heads differ only in dynamic fixture row-count (181 vs 136 other-business rows); same missing-substring assertion"
+ }
+]
