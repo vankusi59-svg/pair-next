@@ -305,3 +305,54 @@ cross-project generic wording passed confirm unreviewed.
 Upgrade note: approvals minted between the tokenizer change and this
 fix hold stale issue_keys and fail closed at verify — re-approval
 required (pre-merge only; no production exposure).
+
+---
+
+## Round 4 — exact approval identity (canonical statement)
+
+### Finding
+
+The discriminating-token-SET identity still lost provable identity
+information: sorting discarded word ORDER and direction, generic-vocab
+filtering discarded NEGATION markers, and length floors discarded
+single-letter identifiers. Opposite or permuted statements produced
+identical issue keys and reused approval without owner review.
+
+### Reproduction (red probes, pre-remediation @48ceba6)
+
+- `"no send to alice allowed unclear"` ≡ `"send to alice allowed
+  unclear"` — 'no' generic-filtered → SAME KEY (negation flip).
+- `"alice notifies bob unclear"` ≡ `"bob notifies alice unclear"` —
+  sorted set → SAME KEY (direction flip).
+- `"tier a limit unclear"` ≡ `"tier b limit unclear"` — len-1 letter
+  dropped → SAME KEY.
+- `"migrate mysql to postgres"` ≡ `"migrate postgres to mysql"` —
+  permutation → SAME KEY.
+
+### Remediation
+
+`issueKeyFor = category + "|" + canonicalIssueStatement(statement)` —
+a deterministic, order-preserving normalization: NFC → lowercase →
+đ→d → NFD strip combining marks (accented/unaccented VN collapse) →
+punctuation→space → whitespace collapse → ≤640. Negation, direction,
+entity, quantity, unit, relationship and scope words preserved
+verbatim; no generic-vocab filter, no set/dedup, no length floor.
+Coverage requires byte-identical canonical statements — paraphrase
+similarity is never approval evidence; unprovable identity → explicit
+owner review. Canonical surface variants (case, punctuation, spacing,
+diacritic spelling) of the SAME statement still reuse approval;
+idempotent retries unchanged.
+
+### Closure verification
+
+- 51/51 `pair-semantic-goal-understanding.test.ts` green incl. the
+  `P18.6-IDENTITY-R4` block (negation/order/single-letter/direction
+  collisions now distinct; canonical-surface controls still collapse;
+  paraphrase control asserts NON-collapse).
+- Real approve→amend→re-preview→confirm E2E green — the confirm seam
+  passes only on canonical-identical coverage.
+- `npx tsc --noEmit` clean; adjacent suites 130/130.
+
+Upgrade note: rows minted before this change carry token-set
+issue_keys; verify re-derives with the current function, so pre-R4
+approvals fail closed and need re-approval (pre-merge only).
