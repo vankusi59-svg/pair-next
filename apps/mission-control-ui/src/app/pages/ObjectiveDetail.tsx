@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../../api";
 import { useSelectedBusiness } from "../AppShell";
 import type { CockpitPayload } from "../types";
@@ -67,9 +67,18 @@ type DlgCtx =
   | { kind: "measure" | "evidence" | "amend" | "kpi-grant"; biz: string; oid: string }
   | { kind: "kpi-control"; action: "revoke" | "disable"; biz: string; oid: string; authorization_id: string };
 
+const OBJ_TABS = ["tong-quan", "ke-hoach", "thuc-thi", "ket-qua", "nang-cao"] as const;
+type ObjTab = (typeof OBJ_TABS)[number];
+
 export function ObjectiveDetail() {
   const { id = "" } = useParams();
   const { biz } = useSelectedBusiness();
+  const [params, setParams] = useSearchParams();
+  /* V2 IA — ?tab= deep link; unknown values fall back to Tổng quan. */
+  const rawTab = params.get("tab") ?? "tong-quan";
+  const tab: ObjTab = (OBJ_TABS as readonly string[]).includes(rawTab)
+    ? (rawTab as ObjTab)
+    : "tong-quan";
   const [st, setSt] = useState<LoadState>({ kind: "loading" });
   const [tick, setTick] = useState(0);
   const [dlg, setDlg] = useState<DlgCtx | null>(null);
@@ -850,8 +859,69 @@ export function ObjectiveDetail() {
 
       {loopInputs ? <ObjectiveAutonomousLoop inputs={loopInputs} nowMs={nowMs} /> : null}
 
-      <h2 className="sech">Owner actions</h2>
-      <div className="actions">
+      {/* UI-V2 Phase D — Tổng quan / Kế hoạch / Thực thi / Kết quả / Nâng
+          cao over the SAME canonical payload. ?tab= keeps deep links. */}
+      <div className="otabs" role="tablist" aria-label="Objective sections">
+        {([
+          ["tong-quan", "Tổng quan"],
+          ["ke-hoach", "Kế hoạch"],
+          ["thuc-thi", "Thực thi"],
+          ["ket-qua", "Kết quả"],
+          ["nang-cao", "Nâng cao"],
+        ] as const).map(([key, label]) => (
+          <button
+            key={key}
+            role="tab"
+            aria-selected={tab === key}
+            className={tab === key ? "on" : ""}
+            onClick={() => setParams({ tab: key }, { replace: true })}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "tong-quan" ? (
+        <>
+          <ol className="ostep" aria-label="Vòng đời objective">
+            {([
+              ["Yêu cầu", true],
+              ["Kế hoạch", c.binding !== null],
+              ["Thực thi", c.missions.length > 0],
+              ["Kết quả", c.review_count > 0 || c.artifacts.length > 0],
+              ["Đạt mục tiêu", o.status === "ACHIEVED"],
+            ] as const).map(([label, done], i, arr) => {
+              const cur = !done && arr.slice(0, i).every(([, d]) => d);
+              return (
+                <li key={label} className={cur ? "cur" : ""}>
+                  <div className="ost-n">{i + 1}</div>
+                  <div className="ost-t">{label}</div>
+                  <div className="ost-s">
+                    <StatusBadge
+                      tone={done ? "ok" : cur ? "info" : "unknown"}
+                      label={done ? "xong" : cur ? "đang ở đây" : "chờ"}
+                    />
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+          <h2 className="sech">KPIs</h2>
+          <div className="need">
+            {o.kpis.length === 0 ? <div className="nrow"><span className="note">No KPIs declared.</span></div> : null}
+            {o.kpis.map((k) => (
+              <div className="nrow" key={k.kpi_id}>
+                <span className="tt">{k.name}</span>
+                <span className="note">
+                  {k.current ?? "—"}/{k.target} {k.unit} · {k.direction} · baseline {k.baseline}
+                </span>
+                <StatusBadge tone={k.canonically_proven ? (S_TONE[k.assessment] ?? "unknown") : "unknown"} label={k.canonically_proven ? k.assessment : "UNVERIFIED"} />
+                <ProofChip state={k.canonically_proven ? "proven" : "unverifiable"} />
+              </div>
+            ))}
+          </div>
+          <h2 className="sech">Owner actions</h2>
+          <div className="actions">
         <button className="primary" disabled={mutBusy} onClick={() => setDlg({ kind: "ceo", biz: biz!, oid: id })}>Run CEO pass</button>
         <button
           className="ghost" disabled={mutBusy || o.kpis.length === 0}
@@ -877,22 +947,11 @@ export function ObjectiveDetail() {
         through the canonical owner-verifier seam — never model output. Grants below delegate that same
         write to the KPI verifier under a bounded rule.
       </div>
+      </>
+      ) : null}
 
-      <h2 className="sech">KPIs</h2>
-      <div className="need">
-        {o.kpis.length === 0 ? <div className="nrow"><span className="note">No KPIs declared.</span></div> : null}
-        {o.kpis.map((k) => (
-          <div className="nrow" key={k.kpi_id}>
-            <span className="tt">{k.name}</span>
-            <span className="note">
-              {k.current ?? "—"}/{k.target} {k.unit} · {k.direction} · baseline {k.baseline}
-            </span>
-            <StatusBadge tone={k.canonically_proven ? (S_TONE[k.assessment] ?? "unknown") : "unknown"} label={k.canonically_proven ? k.assessment : "UNVERIFIED"} />
-            <ProofChip state={k.canonically_proven ? "proven" : "unverifiable"} />
-          </div>
-        ))}
-      </div>
-
+      {tab === "ke-hoach" ? (
+      <>
       <h2 className="sech">Plan & workstreams</h2>
       {obsErr ? (
         <EmptyState title="Workstream state unverified" detail="Observation integrity failed — claims are not rendered as verified." />
@@ -922,7 +981,11 @@ export function ObjectiveDetail() {
           </div>
         </>
       )}
+      </>
+      ) : null}
 
+      {tab === "thuc-thi" ? (
+      <>
       <h2 className="sech">Missions</h2>
       <div className="need">
         {c.missions.length === 0 ? <div className="nrow"><span className="note">No missions bound yet — they appear when the CEO plan delegates work.</span></div> : null}
@@ -935,7 +998,12 @@ export function ObjectiveDetail() {
           </div>
         ))}
       </div>
+      <ObjectiveOpsMonitor objectiveId={o.objective_id} />
+      </>
+      ) : null}
 
+      {tab === "ket-qua" ? (
+      <>
       <div className="grid2">
         <section>
           <h2 className="sech">Artifacts{c.artifacts_dropped_unverified > 0 ? ` (+${c.artifacts_dropped_unverified} dropped unverifiable)` : ""}</h2>
@@ -964,7 +1032,11 @@ export function ObjectiveDetail() {
           </div>
         </section>
       </div>
+      </>
+      ) : null}
 
+      {tab === "nang-cao" ? (
+      <>
       <h2 className="sech">Auto-run controls</h2>
       <div className="need">
         <div className="nrow">
@@ -1082,8 +1154,6 @@ export function ObjectiveDetail() {
         onChanged={refetch}
       />
 
-      <ObjectiveOpsMonitor objectiveId={o.objective_id} />
-
       <IntegrityPanel objectiveId={o.objective_id} />
 
       <h2 className="sech">KPI verifier grants</h2>
@@ -1150,6 +1220,8 @@ export function ObjectiveDetail() {
           onClick={() => { setGrantF({ kpi: o.kpis[0]?.kpi_id ?? "", count: "", keys: "", value: "", expires: "" }); setDlg({ kind: "kpi-grant", biz: biz!, oid: id }); }}
         >Grant KPI verification</button>
       </div>
+      </>
+      ) : null}
 
       <ConfirmDialog
         open={dlg?.kind === "ceo"}

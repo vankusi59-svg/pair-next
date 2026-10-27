@@ -146,6 +146,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  /* UI-V2 — governed NL intake draft (advisory). Returns the bounded
+     interpretation evidence + deterministic non-authoritative draft;
+     nothing canonical is created server-side. */
+  intakeDraft: (input: { goal: string; business_id?: string | null; project_id?: string | null }) =>
+    req<import("./app/types").IntakeDraftResponse>("/v1/intake/draft", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, { noAuthPrompt: true }),
   runCeoCycle: (id: string) =>
     req<import("./types").OperatingPassResult>(`/vnext/objectives/${id}/ceo-cycle`, {
       method: "POST",

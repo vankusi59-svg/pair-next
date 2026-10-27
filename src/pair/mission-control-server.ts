@@ -28,8 +28,15 @@ import { classifyRequestCredential } from "./operational-query.js";
 import {
   approveGoalIntentItems,
   GOAL_INTENT_APPROVAL_ENTITY,
+  semanticMode,
   type GoalIntentApproval,
 } from "./semantic-goal-understanding.js";
+import {
+  deriveIntakeDraft,
+  deriveManualDraft,
+  INTAKE_DRAFT_SCHEMA,
+  INTAKE_MAX_GOAL,
+} from "./objective-intake.js";
 import type { MissionDraftService } from "./mission-draft.js";
 import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
@@ -150,6 +157,18 @@ export interface MissionControlServerDeps {
    *  sets it (the route resolves the real codex-cli model); HTTP
    *  callers can never inject it — it is a server-wiring dep only. */
   ceoInvoker?: CeoDecisionInvoker;
+  /** UI-V2 (Phase B) — bounded advisory interpretation for the NL intake
+   *  draft seam. Server wiring only (serve-mission-control owns the
+   *  provider lane); absent → /api/v1/intake/draft reports mode:"off"
+   *  honestly and still serves the manual draft. The result is
+   *  NON-AUTHORITATIVE evidence — never pinned to a run, never
+   *  persisted as canonical input. */
+  intakeAnalyze?: (input: {
+    goal: string;
+    business_id: string | null;
+    project_id: string | null;
+    operator_id: string;
+  }) => Promise<Record<string, unknown> | null>;
   /** P15.8-D — conversation layer composition (chat + governed mission
    *  drafts). Absent entirely → every /api/conversations* route is
    *  CONVERSATION_DISABLED; `reasoning` absent → only the /turns route
@@ -1138,6 +1157,79 @@ export function createMissionControlServer(
           item_statements: approval.item_statements,
           resolutions: approval.resolutions,
           amended_goal_sha256: approval.amended_goal_sha256,
+        });
+      }
+      /* UI-V2 Phase B — governed NL intake DRAFT seam. Read-only +
+         advisory: bounded interpretation + deterministic draft proposal
+         for owner review. Nothing canonical is created here — the commit
+         stays on /api/vnext/objectives (canonical service, dedup_key) or
+         the mission preview/confirm path. Mode OFF or unavailable wiring
+         still serves the manual draft honestly. */
+      if (method === "POST" && p === "/api/v1/intake/draft") {
+        const actor = canonicalOperatorActor(operator, p);
+        const goal = String(body.goal ?? "").trim();
+        if (!goal || goal.length > INTAKE_MAX_GOAL) {
+          return void json(res, 400, {
+            error: "INVALID_GOAL",
+            detail: `goal must be 1..${INTAKE_MAX_GOAL} chars`,
+          });
+        }
+        const businessId =
+          body.business_id == null ? null : String(body.business_id).trim() || null;
+        const projectId =
+          body.project_id == null ? null : String(body.project_id).trim() || null;
+        if (businessId) {
+          /* Scope binding must be real — an unknown business_id fails
+             closed rather than binding interpretation evidence to a
+             tenant that may not exist. */
+          if (!deps.business) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+          try {
+            deps.business.getBusiness(businessId);
+          } catch {
+            return void json(res, 404, { error: "BUSINESS_NOT_FOUND", business_id: businessId });
+          }
+        }
+        /* Advisory seam must never block the manual path — a provider
+           * failure degrades to typed unavailable evidence + manual
+           * draft, mirroring the run-pinned seam's fail-open-advisory /
+           * fail-closed-authority contract. */
+        let interpreted: Record<string, unknown> | null = null;
+        let intakeError: string | null = null;
+        if (deps.intakeAnalyze) {
+          try {
+            interpreted = await deps.intakeAnalyze({
+              goal,
+              business_id: businessId,
+              project_id: projectId,
+              operator_id: actor,
+            });
+          } catch (e) {
+            intakeError = `intake_analyze:${e instanceof Error ? e.message.slice(0, 120) : "unknown"}`;
+            interpreted = null;
+          }
+        }
+        const analysis =
+          interpreted && typeof interpreted === "object"
+            ? (interpreted.analysis as Record<string, unknown> | null | undefined) ?? null
+            : null;
+        const draft =
+          analysis != null
+            ? deriveIntakeDraft(analysis as never)
+            : deriveManualDraft(goal);
+        return void json(res, 200, {
+          schema_version: INTAKE_DRAFT_SCHEMA,
+          mode: (interpreted?.mode as string | undefined) ?? semanticMode(),
+          status: intakeError
+            ? "unavailable"
+            : (interpreted?.status as string | undefined) ?? "off",
+          unavailable_reason:
+            intakeError ?? ((interpreted?.unavailable_reason as string | undefined) ?? null),
+          analysis_digest: (interpreted?.analysis_digest as string | undefined) ?? null,
+          source_goal_sha: (interpreted?.source_goal_sha as string | undefined) ?? null,
+          provider_requests: (interpreted?.provider_requests as number | undefined) ?? 0,
+          ambiguity_class: (interpreted?.ambiguity_class as string | undefined) ?? null,
+          items: (analysis?.items as unknown[] | undefined) ?? [],
+          draft,
         });
       }
       if (method === "GET" && p.match(/^\/api\/plan-previews\/[^/]+$/)) {

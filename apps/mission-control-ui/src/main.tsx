@@ -45,7 +45,7 @@ const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { path: "/", element: <OptInRedirect to="/app/company"><Dashboard /></OptInRedirect> },
+      { path: "/", element: <OptInRedirect to="/app/home"><Dashboard /></OptInRedirect> },
       { path: "/missions/new", element: <OptInRedirect to="/app/missions/new"><MissionNew /></OptInRedirect> },
       { path: "/missions/:id", element: <OptInRedirect to={(id) => `/app/missions/${id}`}><MissionDetail /></OptInRedirect> },
       { path: "/approvals", element: <OptInRedirect to="/app/inbox"><Approvals /></OptInRedirect> },

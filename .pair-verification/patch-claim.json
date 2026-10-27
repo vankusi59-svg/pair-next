@@ -1,30 +1,25 @@
 {
-  "claim_id": "P18_6_SEMANTIC_FIRST_GOAL_UNDERSTANDING",
-  "title": "P18.6 — Semantic-First Goal Understanding + closures: guarded evidence binding, strict snapshot scope, LOSSLESS approval identity (category + canonical text + scope fingerprint; NFC/whitespace only; no folding, sorting or symbol stripping)",
+  "claim_id": "UI_V2_OWNER_EXPERIENCE",
+  "title": "UI-V2 — owner-first experience: VN-first shell (Tổng quan/Mục tiêu/Công việc/Phê duyệt/Nhân sự AI + Nâng cao), governed NL intake (/api/v1/intake/draft advisory seam + Intake page + canonical objective commit), owner cockpit Home, ObjectiveDetail owner tabs, dark-navy theme",
   "affected_surfaces": [
-    "PLANNER",
+    "MISSION_CONTROL",
     "MISSION_DRAFT",
+    "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-objective-intake.test.ts",
+    "src/__tests__/pair-intake-draft-endpoint.test.ts",
     "src/__tests__/pair-semantic-goal-understanding.test.ts",
     "src/__tests__/pair-goal-intent-benchmark.test.ts",
-    "src/__tests__/pair-semantic-coverage.test.ts",
-    "src/__tests__/pair-goal-contract-produce-binding.test.ts",
-    "src/__tests__/pair-goal-context-authority.test.ts",
-    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
-    "src/__tests__/pair-planner-contract-simplify.test.ts",
-    "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-tmpdir-lifecycle.test.ts",
+    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
+    "src/__tests__/tools-security.test.ts",
     "src/__tests__/dev-verification.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
-    "INV_SECRETS_001",
-    "INV_EXEC_001",
-    "INV_REPLAY_001"
+    "INV_SECRETS_001"
   ],
-  "description": "P18.6 LOSSLESS-IDENTITY closure on base cabd25d - final approval-identity correction. Even canonical-statement keys still lost semantics: Vietnamese diacritic stripping merged DISTINCT words (bán vs bàn), punctuation/symbol removal merged currencies ($500 vs €500), dimensions (5% vs 5) and identifiers (C++ vs C#), case folding merged case-sensitive identifiers (US vs us). Replaced with a LOSSLESS fingerprint: issueKeyFor = category + canonical scope lineage (b/o/w/p, ''-normalized, unknown never silently matches) + canonical issue text where canonicalization is ONLY Unicode NFC + whitespace collapse/trim - no lowercase, no diacritic folding, no punctuation/symbol stripping, no token sorting, no stopword removal, no fuzzy matching. Identical issues under identical scope reuse approval (idempotent retries intact); anything not byte-identical requires fresh owner review - paraphrase similarity is never approval evidence. Coverage threads the confirmed revision's analysis scope into issueCoveredBy so cross-scope reviews never cover. Stored approvals with previous key formats fail re-proof closed (no silent migration; resolutions verify re-derives keys against pinned analysis). Adversarial probes: diacritic (bán/bàn, không/khong), currency ($/€/£), dimension (5%/5, 10°C/10C), identifier (C++/C#, node.js), case (US/us, API/api), scope lineage - plus approve->amend->re-preview->confirm positive (whitespace-variant reuse) and negative E2E over the real seam. Prior closures unchanged. Baseline: interpretation ADVISORY only; OFF default; no auto-merge.",
+  "description": "Owner-first V2 UX on base ab0fccf. NEW governed NL intake: POST /api/v1/intake/draft returns a bounded deterministic draft + advisory semantic evidence (mode off/shadow/guarded; plannerRunId:null → evidence NEVER pinned to a run; provider failure degrades to typed unavailable + manual draft). Intake commits ONLY through canonical seams — objective → POST /api/vnext/objectives (dedup_key, existing service); mission → /app/missions/new?goal= prefill (existing preview/confirm). Model prose never self-authorizes: provenance tags per field (từ văn bản/AI đề xuất/chưa có/bạn đã sửa), explicit owner confirm, business required for objectives. Shell: owner-first VN nav + advanced Nâng cao disclosure (all legacy /app/* routes preserved), Owner/Advanced presentation toggle over the SAME authority, dark-navy + light theme, mobile rail/bottom-tabs/drawer. Home cockpit reads canonical aggregates only (objectives/missions/approvals/operations rollup) — honest —/… states, zero fabrication. ObjectiveDetail wraps existing canonical sections in owner tabs (Tổng quan/Kế hoạch/Thực thi/Kết quả/Nâng cao) via ?tab= deep links — legacy content fully reachable under Nâng cao. No P18.x behavior weakened: semantic modes unchanged, preview/confirm gates unchanged, fail-closed preserved. E2E: ui-v2.spec.ts (9 tests: intake draft/edit/confirm→canonical objective, mission handoff, fail-closed no-business + analyze-401, tabs, mobile 390×844, themes, keyboard); legacy specs reconciled to the V2 nav. Baseline: interpretation advisory only; OFF default; no auto-merge.",
   "risk_override": "HIGH"
 }

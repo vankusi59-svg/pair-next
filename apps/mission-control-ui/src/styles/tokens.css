@@ -513,3 +513,218 @@
   .aloop-inspector { flex: none; width: 100%; }
   .aloop-svg { height: 420px; }
 }
+
+/* ================= UI-V2 — owner-first experience =================
+   Hero, intake draft, dashboard cards, tabs. Same semantic tokens;
+   navy/violet-blue direction per design-references (restrained). */
+
+:root[data-theme="dark"] .appshell, .appshell {
+  --accent: #5b7cff;
+  --accent-strong: #7a93ff;
+  --accent-soft: rgba(91, 124, 255, 0.16);
+}
+:root[data-theme="light"] .appshell {
+  --accent: #4f5ed8;
+  --accent-strong: #4452c9;
+  --accent-soft: rgba(79, 94, 216, 0.12);
+}
+
+/* ---------- hero (NL entry) ---------- */
+.v2hero {
+  background:
+    radial-gradient(120% 160% at 85% -20%, var(--purple-soft) 0%, transparent 55%),
+    linear-gradient(160deg, var(--bg-raised) 0%, var(--bg-surface) 100%);
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 26px 28px 22px; margin-bottom: 18px;
+}
+.v2hero-t { font-size: 26px; font-weight: 750; letter-spacing: -0.02em; margin: 0 0 6px; }
+.v2hero-sub { color: var(--text-2); font-size: 13.5px; margin: 0 0 16px; max-width: 720px; }
+.v2hero-in {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--bg-inset); color: var(--text-1);
+  border: 1px solid var(--border-strong); border-radius: 10px;
+  padding: 12px 14px; font: inherit; font-size: 14px; line-height: 1.5;
+}
+.v2hero-in:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+.v2hero-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+
+.v2btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-raised); color: var(--text-1);
+  border: 1px solid var(--border); border-radius: 9px;
+  padding: 8px 16px; font: inherit; font-size: 13.5px; font-weight: 600;
+  cursor: pointer; text-decoration: none;
+}
+.v2btn:hover { border-color: var(--border-strong); }
+.v2btn.primary {
+  background: linear-gradient(135deg, var(--accent) 0%, #7b5cff 130%);
+  color: #fff; border-color: transparent;
+}
+.v2btn.primary:hover { filter: brightness(1.08); }
+.v2btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.lnkbtn {
+  background: none; border: none; color: var(--accent-strong);
+  font: inherit; font-size: 12.5px; cursor: pointer; padding: 2px 4px;
+}
+.lnkbtn:hover { text-decoration: underline; }
+
+/* ---------- dashboard cards ---------- */
+.hgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.hcard {
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px 16px;
+}
+.hcard .hh {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}
+.hcard .hh h2 { font-size: 14px; font-weight: 650; margin: 0; }
+.hcard .hh a { font-size: 12.5px; color: var(--accent-strong); text-decoration: none; }
+.hrow {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 10px; border-radius: 8px; text-decoration: none; color: inherit;
+}
+.hrow:hover { background: var(--bg-raised); }
+.hrow + .hrow { border-top: 1px solid var(--border); }
+.hr-t { font-size: 13px; font-weight: 600; }
+.hr-s { font-size: 11.5px; color: var(--text-3); margin-top: 1px; }
+.hint { color: var(--text-3); font-size: 11.5px; line-height: 1.45; }
+@media (max-width: 900px) { .hgrid { grid-template-columns: 1fr; } }
+
+/* ---------- intake draft ---------- */
+.draftwrap { display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }
+.drcard {
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 16px 18px; margin-bottom: 14px;
+}
+.drcard h2 { font-size: 14px; font-weight: 650; margin: 0 0 10px; }
+.drcard-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.drf-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+.drf-row label { font-size: 12px; color: var(--text-3); display: flex; align-items: center; gap: 8px; }
+.drf-row input, .drf-row textarea {
+  background: var(--bg-inset); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; color: var(--text-1); font: inherit; font-size: 13.5px;
+}
+.drf-chips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 4px 0 8px; }
+.drf-chip {
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 5px;
+}
+.drf-chip .ck { font-size: 11px; color: var(--text-3); }
+.drf-chip .cv { display: flex; align-items: center; gap: 8px; }
+.drf-chip input {
+  background: var(--bg-inset); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; color: var(--text-1); font: inherit; font-size: 13px; width: 100%;
+}
+.drh { font-size: 13px; font-weight: 650; margin: 16px 0 8px; }
+.drpad { padding: 4px 0 8px; }
+.kpicards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-bottom: 8px; }
+.kpicard { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.kpicard > input {
+  width: 100%; box-sizing: border-box; background: var(--bg-inset);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+  color: var(--text-1); font: inherit; font-size: 13px; margin-bottom: 8px;
+}
+.kpinum { display: flex; align-items: center; gap: 6px; }
+.kpinum input {
+  flex: 1; min-width: 0; background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 8px; color: var(--text-1); font: inherit; font-size: 13px;
+}
+.kpimeta { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+.conrow { display: flex; gap: 6px; margin-bottom: 6px; }
+.conrow input {
+  flex: 1; background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; color: var(--text-1); font: inherit; font-size: 13px;
+}
+.wsstep { display: flex; gap: 8px; list-style: none; padding: 0; margin: 4px 0 0; overflow-x: auto; }
+.wsstep li {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 130px;
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; font-size: 12.5px;
+}
+.wsn {
+  width: 22px; height: 22px; border-radius: 50%; flex: 0 0 22px;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.pvtag {
+  display: inline-flex; align-items: center; font-size: 10px; font-weight: 650;
+  padding: 1px 7px; border-radius: 999px; letter-spacing: 0.2px;
+}
+.pv-explicit { background: var(--ok-soft); color: var(--ok); }
+.pv-suggested { background: var(--purple-soft); color: var(--purple); }
+.pv-unresolved { background: var(--unknown-soft); color: var(--unknown); }
+.pv-edited { background: var(--info-soft); color: var(--info); }
+
+.draftside .sideg { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; }
+.draftside .sideg:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+.sideh { font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+.sideh.ok { color: var(--ok); } .sideh.warn { color: var(--warn); } .sideh.info { color: var(--info); }
+.siderow { font-size: 12.5px; padding: 4px 0; line-height: 1.45; }
+.siderow.q { border-left: 2px solid var(--warn); padding-left: 8px; margin: 4px 0; }
+.govlist { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--text-2); display: flex; flex-direction: column; gap: 7px; }
+
+.dractions { position: sticky; bottom: 0; background: var(--bg-app); padding: 10px 0 4px; }
+.kindtoggle { display: inline-flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; margin-bottom: 10px; }
+.kindtoggle button {
+  background: transparent; border: none; color: var(--text-2);
+  font: inherit; font-size: 13px; padding: 8px 14px; cursor: pointer;
+}
+.kindtoggle button.on { background: var(--accent-soft); color: var(--text-1); font-weight: 650; }
+.actrow { display: flex; gap: 10px; flex-wrap: wrap; }
+
+@media (max-width: 1100px) {
+  .draftwrap { grid-template-columns: 1fr; }
+  .draftside { order: -1; }
+}
+@media (max-width: 700px) {
+  .drf-chips { grid-template-columns: 1fr; }
+  .v2hero { padding: 18px 16px; }
+  .v2hero-t { font-size: 21px; }
+}
+
+/* ---------- ObjectiveDetail tabs (V2 IA) ---------- */
+.otabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border);
+  margin: 4px 0 18px; overflow-x: auto;
+}
+.otabs button {
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-2); font: inherit; font-size: 13.5px; font-weight: 550;
+  padding: 9px 14px; cursor: pointer; white-space: nowrap;
+}
+.otabs button.on { color: var(--text-1); border-bottom-color: var(--accent); font-weight: 700; }
+.otabs button:hover { color: var(--text-1); }
+
+/* objective lifecycle stepper (sourced, no invented progress) */
+.ostep { display: flex; gap: 8px; list-style: none; padding: 0; margin: 0 0 14px; overflow-x: auto; }
+.ostep li {
+  flex: 1; min-width: 110px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-surface); padding: 9px 12px; font-size: 12px;
+}
+.ostep li.cur { border-color: var(--accent); }
+.ostep .ost-n { color: var(--text-3); font-size: 11px; }
+.ostep .ost-t { font-weight: 650; margin-top: 2px; }
+.ostep .ost-s { margin-top: 3px; }
+
+/* shell V2 — topbar actions + collapsible advanced nav */
+.atopright { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.v2btn.small { padding: 5px 12px; font-size: 12.5px; }
+.modechip { font-size: 12px; }
+.anav .advtoggle {
+  background: none; border: none; color: var(--text-3); font: inherit;
+  font-size: 11px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: 0.06em; cursor: pointer; padding: 0;
+}
+.anav .advtoggle:hover { color: var(--text-1); }
+.anav .advitems:not(.open) { display: none; }
+@media (max-width: 1199px) {
+  .atopright .modechip { display: none; }
+  /* icon rail + drawer: collapse control is hidden, items stay reachable */
+  .aside .anav .advitems { display: block !important; }
+  .adrawer .anav .advitems { display: block !important; }
+}
+@media (max-width: 767px) {
+  .atopright .v2btn.small { display: none; }
+}

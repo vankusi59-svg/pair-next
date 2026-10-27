@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { ApiError, apiAdmin, getOperatorId } from "../../api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Skeleton } from "../components/states";
@@ -74,7 +74,10 @@ function taskRows(tasks: Array<Record<string, unknown>>) {
 export function MissionNew() {
   const nav = useNavigate();
   const [st, setSt] = useState<St>({ kind: "loading" });
-  const [goal, setGoal] = useState("");
+  /* UI-V2 — ?goal= prefill from the NL intake handoff (Mission kind).
+     Preview/confirm/digest checks are unchanged. */
+  const [searchParams] = useSearchParams();
+  const [goal, setGoal] = useState(() => searchParams.get("goal") ?? "");
   const [projectId, setProjectId] = useState("");
   const [preview, setPreview] = useState<Pinned | null>(null);
   const [previewErr, setPreviewErr] = useState<string | null>(null);
