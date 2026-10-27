@@ -1,0 +1,2189 @@
+[
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: list → create → select → deep-link restore, real counts",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: turn renders operator + assistant chronologically; survives reload",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: double-click Send fires exactly one turn POST, zero mission POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: turn 500 → honest note, composer kept, retry replays SAME idempotency key",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: close via dialog → CLOSED state, composer disabled, sends blocked",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: >200 messages — tail, Load Earlier, dedup, reload restores tail",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: ambiguous proposal → verified picker → draft via proposal:<mid> binding",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: malformed proposal candidates → blocked note, no picker, no draft POST",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: proposal rejected → canonical reason, zero drafts",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: draft card full terms → pinned confirm → CONFIRMED + canonical mission link",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms"
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: reject via dialog → REJECTED terminal, confirm never offered again",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: revise mints a NEW draft (supersedes) — old stays, distinct object",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: wall-clock-expired pending draft → badge + disabled confirm, zero confirm POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: malformed payloads → MALFORMED panels, never fabricated empties",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: canonical empty list → genuine EmptyState (no fake data)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: 401 → visible Unauthorized/Forbidden error, no fabricated data",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: switch A→B while A loads — late A response never touches B",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: confirm in-flight during switch → result never paints into the new session",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: mobile viewport keeps sessions + composer usable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat: different session → fresh idempotency key",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R1-F1: unsent composer text never crosses into another session",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R1-F1: late failing turn paints only on its own session; deliberate retry on return replays the same key",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R1-F1: late failing confirm paints no A-specific note or dialog inside B",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R1-F2: new proposal resets the pick; held validation keeps Create disabled; verified pick → exactly one draft POST",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R1-F3: malformed 200 on a committed turn → unverified outcome; deliberate retry replays same key, one canonical pair",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R2-F1: ambiguous A keeps its key across a completed B turn — retry replays K_A, K_A != K_B, one canonical pair",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R2-F2: GET returning a different session fails closed — B's metadata never renders under A",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R2-F2: committed turn whose returned operator body contradicts the submission → unverified; retry replays key, one pair",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app-chat.spec.ts",
+  "title": "app-chat R2-F2: committed turn with contradictory identities/ordering → unverified; retry replays key, no duplicate pair",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "/app/company renders new shell + honest no-business state",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "no placeholder pages remain on the /app route tree",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "business switcher stores manual business_id, never enumerates",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "/ still serves the legacy dashboard unchanged under the rollback flag",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "theme toggle works in the new shell",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "mobile viewport: bottom tab bar + drawer",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "tablet: icon rail links have accessible names + topbar switcher",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "switcher state syncs across desktop -> tablet -> desktop without reload",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "drawer: focus in, Esc out, Tab trapped, focus returns to More",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "legacy theme tokens are not overridden by the new shell",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "text-3 / unknown tokens meet 4.5:1 contrast in both themes",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "app.spec.ts",
+  "title": "keyboard: skip link + nav landmarks focusable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: every /app deep link loads a real page (no placeholder, no crash)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: /app index lands on Company Cockpit",
+  "base": "passed",
+  "head": "-",
+  "cls": "removed",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: legacy deep links still work + back/forward across the two trees",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: production default — absent preference redirects mapped legacy routes to /app",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: opt-in redirect ON maps each legacy route to its /app destination (isolated)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: redirect preserves dynamic mission id + query + hash, unmapped routes never redirect",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: flag removal restores production default (no sticky state)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "a2: explicit legacy override keeps classic routes accessible after cutover",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "chat: new session → send → stub reply → history survives reload",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "chat: draft → confirm mints exactly one mission with a detail link",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms"
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "chat: mobile viewport keeps sessions + composer usable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "chat: >200 messages — tail window renders newest, earlier reachable, no dups after reload",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "chat.spec.ts",
+  "title": "task entry: reachable from nav and submits without any chat/draft",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 10000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 10000ms"
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "company with real objectives: header, exact stats, unverified chips",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoHaveLength\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m | Expected length: \u001b[32m2\u001b[39m | Received length: \u001b[31m6\u001b[39m",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "non-owner business -> DeniedState (FAIL_CLOSED_COMPANY_SCOPE)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "no business selected -> honest empty state",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "switching business discards previous data; slow stale response never overwrites",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "pending review + truncation (contract-shaped fixture)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "integrity error after a good load renders fail-closed error, no stale data",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "no unexpected API mutations from the cockpit page",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "microusd always displays as USD, never business.currency (audit F1)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "401 on BOTH company + approvals -> honest state; no prompt, no reload, no prior data",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "company.spec.ts",
+  "title": "legacy routes keep the old 401 window.prompt behavior",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: fresh pending reviews render with exact count; terminal stale pins never shown",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeDisabled\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: disabled | Received: enabled",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: adversarial terminal+flag row never renders as pending",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: stale pending disappears after canonical flag flips",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: global approvals labeled, approve+deny confirm → refetch; reject shows error",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: empty {} scope is valid and posted verbatim",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: missing/malformed canonical scope fails closed — confirm disabled, zero POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: row vanished after dialog open — confirm still posts the PINNED scope",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: badge failure states — unavailable on failed read, partial without business",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "mobile: inbox badge on tab bar — count, partial and failure states",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "badge: business-bound counts — A's count never renders under B; late A cannot overwrite",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "badge: invalidation generation — stale count hidden during refetch; failed refetch → unavailable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "badge: ABA reuse — stale A resolution never repaints across lifecycle generations",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: approval rejection reports error without optimistic resolve",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: approvals 401 → credential state, no prompt, no reload",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: HALT lane is API_MISSING — never a fabricated count",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: no business → reviews lane honest; global approvals still work",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: business switch clears stale pending rows",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "inbox: read renders no unintended POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "ceo: selector scoped to owned objectives; cockpit projection renders",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "ceo: workstreams + review timeline from canonical projections (fixtures)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "ceo: manual pass — confirm dialog, distinct result panel, refetch",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "ceo: in-flight pass result cannot pollute another objective",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "inbox-ceo.spec.ts",
+  "title": "ceo: foreign objective id via deep link → denied, never rendered",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "missions list: global label, search/filter/sort, deep links, cards",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "missions list: routing unavailable disclosed, never zero (adversarial)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "missions list: malformed payload fails closed (adversarial)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: preview → pinned confirm → detail (single seam)",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: stale/invalid digest → canonical failure, no retry",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: double-confirm click yields exactly one POST",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: 5xx on confirm → outcome unknown, no auto-retry",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: malformed project list blocks entry (adversarial)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "task entry: invalid preview payload rejected (adversarial)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: all sections on canonical reads + file viewer",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: malformed DAG fails only that section (adversarial)",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: lifecycle pause via pinned dialog",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: failed action reports error, no optimistic flip (adversarial)",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: switching id discards previous payload",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "mission detail: identity mismatch fails closed (adversarial)",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "read-only pages issue zero POSTs",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "canonical failure codes surface honestly",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F1: objective backlink requires full canonical chain",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F1: non-objective bound_open_id never becomes an Objective URL",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F1: bound_open_id + WI without objective → still no link",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F2: delayed preview for goal A discarded after edit to B",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F2: auto-confirm toggled OFF mid-flight → manual preview, zero confirm POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F3: malformed detail collections fail per-section",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F3: preview task with invalid caps/deps → INVALID_PREVIEW",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1-F4: late file result for A never lands on B",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m",
+  "hsig": "Error: preview -> 409 | \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R1: failed pause on verified RUNNING state → ambiguous, no optimistic flip",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-A: stale preview invalidated → fresh B preview + confirm (1 POST)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-A: confirm in-flight + input change → unknown outcome, no dup POST",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 5000ms"
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-B: malformed work-items rows → lineage unproven, sections live",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-B: wrong-business work item → scope unproven, no link",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-B: work-items API down → evidence unavailable, no link",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R2-C: preview task missing caps/deps → INVALID_PREVIEW, 0 POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R3-F1: preview B proceeds while obsolete A is still unresolved",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "missions.spec.ts",
+  "title": "R3-F1: obsolete preview error after B starts → B intact",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "terminal ACHIEVED overrides blocked headline, not blocked scheduler or unverified warning",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "loop dashboard renders on objective detail with real node/edge graph",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "node click opens inspector with observed evidence",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "driver endpoint unavailable → explicit failure state, no silent empty",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "settlement node never fabricates completion",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "objective switch does not leak the previous objective's loop",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "branches toggle hides only inactive side branches and restores them",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "cockpit observation_error → Missions panel marked UNVERIFIED, no cockpit-derived claims verified",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "driver denials render as bounded historical table with real labels",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objective-loop.spec.ts",
+  "title": "polling preserves scroll position — page never collapses to top",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "objective list: real owned objectives render with KPI/budget chips",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "no business selected → honest empty state on all three routes",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "foreign-owned objective → 403 DeniedState on detail + reviews",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "objective in a different business → mismatch state, no leak",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "owned detail renders: header sections, KPI claimed-unverifiable, pre-binding, reviews link",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "fixture: verified MET KPI + workstreams still converging + CANDIDATE vs ACHIEVED",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Error: strict mode violation: getByText('owner action REQUIRED') resolved to 3 elements:",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "fixture: observation_error → UnverifiedPanel, claims labeled unverified",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "fixture: expiry_pending → advisory chip, canonical policy-status GET issued",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "reviews page: order, fields, truncation + limit refetch",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "mutations: CEO pass requires confirm, posts once, refetches; A2 disabled",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeDisabled\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: disabled | Timeout: 5000ms",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "create objective via selected business: confirm → backend refetch → card appears",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "401 on cockpit → no window.prompt/reload; reviews 401 honest",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "read-only pages generate no unintended POST/write calls",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoEqual\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // deep equality\u001b[22m | \u001b[32m- Expected - 1\u001b[39m | \u001b[31m+ Received + 3\u001b[39m",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "fast switching between objectives shows no stale overwrite",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "policy HALT on real backend: capture UI request, replay same op/key — no second transition",
+  "base": "timedOut",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "\u001b[31mTest timeout of 30000ms exceeded.\u001b[39m",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "create form parity: EXACT direction + constraints + success conditions post",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "dialog lifecycle: focus enters, Escape closes+returns focus, busy disables",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "SPA nav with dialog open (unconfirmed) invalidates it — no retarget",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "in-flight mutation result cannot update another objective's view",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "creation dedup identity: retry after lost response converges — one objective, one key per attempt",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "auto-run card: canonical policy state + limits + driver readiness rendered",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Error: strict mode violation: locator('.nrow').filter({ hasText: 'driver' }) resolved to 2 elements:",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "configure dialog: defaults proposed from objective terms, editable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "ambiguous failure retry keeps the same idempotency key",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "CAS 409 conflict → canonical refetch + honest note, key kept",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "EXPIRED → Re-arm (configure) only; REVOKED → no re-enable offered",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Error: strict mode violation: getByText('REVOKED', { exact: true }) resolved to 3 elements:",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "policy card polls canonical GET ~every 5s while page is active",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "canonical GET failure → zero policy mutations possible (403 and 500)",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoHaveCount\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed | Expected: \u001b[32m0\u001b[39m | Received: \u001b[31m1\u001b[39m",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "driver_ready=true renders eligibility, never a running-work claim",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "auto-policy identity mismatch → typed failure, controls stay closed",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Error: strict mode violation: getByText('IDENTITY_MISMATCH') resolved to 2 elements:",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "hidden tab does not poll; restoring visibility resumes refresh",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "configure ambiguous failure → reopen restores submitted limits + exact-body retry",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "POST committed but response lost → exact-body retry, no duplicate transition",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "open dialog is locked when canonical GET fails; recovers when restored",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "R3: normalized inputs ('09','0.50') retry identical body+key; explicit change mints new op",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "objectives.spec.ts",
+  "title": "R4: Enable v1 lost → Pause v3 → new Enable binds v3 new key → ENABLED v4 (stale op never replayed)",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "p184-operations.spec.ts",
+  "title": "p184: mission detail ops sections render canonical evidence",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m | Expected: \u001b[32m\"MSN_01M5YFS8661XMVAT27G2G0G84T\"\u001b[39m | Received: \u001b[31mundefined\u001b[39m",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m) // Object.is equality\u001b[22m | Expected: \u001b[32m\"MSN_01M5YFKWAMS4CDM6H5NADV8MN8\"\u001b[39m | Received: \u001b[31mundefined\u001b[39m"
+ },
+ {
+  "file": "p184-operations.spec.ts",
+  "title": "p184: malformed ops response renders unavailable panel",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "p184-operations.spec.ts",
+  "title": "p184: operations rollup shows bounded aggregate metrics",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "p184-operations.spec.ts",
+  "title": "p184: mutations require auth+operator identity; no forged client path",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "dashboard renders nav + mission table",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "task entry: preview -> confirm -> detail shows runtime state",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed | Expected: visible | Timeout: 15000ms"
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "observability event stream lists canonical events",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "providers page shows credential flags, never secret values",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "smoke.spec.ts",
+  "title": "theme toggle switches data-theme",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "providers: renders all four sections on the real backend; zero mutation POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "providers: 401 on one read shows honest error, never window.prompt, other sections intact",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "providers: failed models read does not fabricate an empty catalog",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "providers: route bindings show canonical gate values — non-PASS never rendered as PASS",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "observability: global event stream labeled global, live badge, never business-scoped",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "observability: routing and recovery tabs render independently",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "observability: evidence pinned to selected mission; late response A never overwrites B; export carries selected id",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m | > 126 | expect(pv.ok).toBeTruthy();",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m | > 126 | expect(pv.ok).toBeTruthy();"
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "schedules: global list renders, UTC label, zero tick calls",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "schedules: create requires confirmation; double-click = exactly one POST; refetch shows row",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "schedules: enable/disable/delete use pinned schedule identity + confirmation",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "schedules: failed mutation shows honest outcome, no auto-retry, canonical refetch",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "cost: guard + monetary + policies + profiles render; zero POSTs; no secrets",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "cost: malformed policies read = error state, never fabricated empty",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings: masked token editor, save → new requests use it, no token in DOM",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings: invalid token → honest Unauthorized state, never a prompt",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings: operator id propagates to header + shell chip; theme stays synced",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings: clear token requires confirmation; legacy link present; no credential backend POSTs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "cost R1-F1+R2-F1: canonical P13 fields — max_microusd, scope triple, period, hard_stop, profile pricing; null/noncanonical never $0",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings R1-F2: theme alternates across shell + settings — one transition each; reload preserves",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings R1-F3: operator change invalidates inbox counts — A's count never presented under B",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings R1-F3: delayed old-operator inbox read never repaints after identity switch",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "settings R1-F3: token save clears the previously-authenticated SSE buffer; clear fails closed, never stale-live",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m | > 126 | expect(pv.ok).toBeTruthy();",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeTruthy\u001b[2m()\u001b[22m | Received: \u001b[31mfalse\u001b[39m | > 126 | expect(pv.ok).toBeTruthy();"
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "observability R1-F3: stream status is a shared subscription — consumers converge; unmount stops observation",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "regression: legacy /providers /observability /schedules /chat still work",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "system.spec.ts",
+  "title": "regression: other /app routes unaffected + mobile layouts usable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "business-admin: create business, global list disclosure, select, inspect bundle",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: agent + work-item lifecycle (create/open/block/unblock/comment)",
+  "base": "failed",
+  "head": "failed",
+  "cls": "fail-both",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoContainText\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed | Expected substring: \u001b[32m\"Open committed\"\u001b[39m | Received string: \u001b[31m\"Workforce AdministrationAgents come from GET /api/org-agents — a global, unfiltered read filtered client-side to BIZ",
+  "hsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoContainText\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed | Expected substring: \u001b[32m\"Open committed\"\u001b[39m | Received string: \u001b[31m\"Workforce AdministrationAgents come from GET /api/org-agents — a global, unfiltered read filtered client-side to BIZ"
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: routine create/enable/disable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: legacy objective create labeled as compat API",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: business switch closes dialogs; no-biz hides forms",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: exact error on failed create; dup-submit sends one POST",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "business-admin: projects unavailable blocks creation; unauthenticated fails closed",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: selects offer only same-business candidates",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: SPA business switch resets forms — stale selections unsubmittable",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "business-admin: inspect clears stale detail — out-of-order + failure proof",
+  "base": "failed",
+  "head": "passed",
+  "cls": "FIXED",
+  "bsig": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoContainText\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed | Expected substring: \u001b[32m\"BIZ_missing_e2e\"\u001b[39m | Timeout: 5000ms",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "workforce-admin: malformed 200 payloads fail closed — no crash, no fake empty",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce-admin.spec.ts",
+  "title": "R2: malformed collection elements fail closed per-section",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: selected-business filtering, honest global-read label, honest states",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: foreign-business agent under selected business → denied, never rendered",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: detail canonical reads — contract, effective-policy, inbox, work items",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: unmaterialized contract → honest unavailable policy, no contract ops",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: pause/resume/terminate via pinned confirm; failure surfaced; no optimistic",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: mutation failure → error note, state not optimistically changed",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: contract enable/disable via pinned confirm",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: contract read states — success-null vs failed-GET vs canonical row",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: business switch during pending reads — stale agents never paint",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: agent switch via SPA nav during pending reads — no cross-agent pollution",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: dialog invalidated on identity change — cannot confirm stale op",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: 401 → credential state; integrity error → fail closed",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: business owner context unverified → labeled banner, list still honest",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: no mutation POSTs on pure reads; mobile viewport parity",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: R2-F1 foreign agent — fail closed with ZERO agent-specific GETs",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: R2-F2 inbox states — empty/pending/corrupt/malformed",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "workforce: R3 inbox element validation — malformed/indeterminate never exact",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "agent detail: R3 corruption predicate — body withheld under every marker",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "workforce.spec.ts",
+  "title": "agent detail: R4 malformed inbox — never empty, never skeleton, bodies withheld",
+  "base": "passed",
+  "head": "passed",
+  "cls": "pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "b6-acceptance.spec.ts",
+  "title": "b6: /app index lands on the owner home (Tổng quan)",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2: home renders hero, stats, VN nav — hero hands off to intake",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: VN goal → honest manual draft (semantic OFF) → mission confirm",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: draft → edit → explicit confirm → canonical objective created",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: objective path fails closed when no business selected",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: analyze failure shows error, creates nothing",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2: objective detail owner tabs + deep link to Nâng cao",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2: mobile 390×844 — rail hidden, bottom tabs, drawer reaches advanced",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2: dark + light themes render the owner cockpit",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2: keyboard — skip link + VN nav focusable",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: analyzing a goal issues ZERO canonical creates — suggestion never writes",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ },
+ {
+  "file": "ui-v2.spec.ts",
+  "title": "v2 intake: workstream suggestions are honest — nothing persisted without owner confirm",
+  "base": "-",
+  "head": "passed",
+  "cls": "new-pass",
+  "bsig": "",
+  "hsig": ""
+ }
+]
