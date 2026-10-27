@@ -1266,6 +1266,9 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
       "no telegram subscriber target of 500 specified",
       "no telegram follower target specified",
       "no subscriber target specified for project beta",
+      // Case is identity-bearing — even a case-only delta is a new,
+      // unreviewed issue.
+      "No telegram subscriber target specified",
     ];
     for (const v of variants) {
       const a2 = fakeAnalysis(
@@ -1301,6 +1304,49 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
       );
       expect(() =>
         control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: String(pv2.plan_digest) }),
+      ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
+    }
+    // SAME statement but under a DIFFERENT scope lineage — the
+    // approval reviewed this issue under another work item; the
+    // scope-bound fingerprint refuses cross-scope reuse.
+    {
+      const aScopeSwap = fakeAnalysis(
+        [item({ id: "i1", category: "missing_information", statement: "no telegram subscriber target specified", confidence: "high" })],
+        approval.amended_goal,
+      );
+      aScopeSwap.scope = {
+        ...aScopeSwap.scope,
+        project_id: String(project.project_id),
+        work_item_id: "WI_foreign",
+      };
+      const runS = beginPlannerRun(store, {
+        routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+        goal_intent: {
+          analysis_digest: aScopeSwap.analysis_digest, block: "b",
+          ambiguity_class: aScopeSwap.ambiguity.class, status: "analyzed",
+          unavailable_reason: null, model: "m", provider_id: "codex-cli",
+          provider_requests: 1, analysis_ms: 1, from_cache: false,
+          source_goal_sha: digest({ operator_goal: approval.amended_goal }),
+          context_digest: null, mode: "guarded",
+          analysis: aScopeSwap as unknown as Record<string, unknown>,
+        },
+      });
+      const pvS = control.createPlanPreview(
+        {
+          project_id: project.project_id, goal: GOALI,
+          operator_goal: approval.amended_goal, operator_id: "op1",
+          metadata: {
+            goal_intent_approval: {
+              approval_id: approval.approval_id,
+              revision_digest: approval.revision_digest,
+            },
+          },
+          granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+        },
+        { planner_run_id: String(runS.planner_run_id), attempts: [], winner: null, warnings: [] },
+      );
+      expect(() =>
+        control.confirmPlanPreview({ preview_id: String(pvS.preview_id), plan_digest: String(pvS.plan_digest) }),
       ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
     }
     // SAME issue, canonical-identical (whitespace-only surface

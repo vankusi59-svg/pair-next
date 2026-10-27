@@ -626,25 +626,36 @@ const APPROVABLE_AUTHORITIES = new Set<IntentAuthorityClass>([
  * owner review (fail closed by construction).
  * ------------------------------------------------------------------ */
 function canonicalIssueStatement(s: string): string {
-  return s
+  const canon = s
     .normalize("NFC")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 640);
+    // ASCII whitespace only — NBSP/ZWSP/invisible space-variants are
+    // byte-distinct and remain identity-bearing (stricter, fail
+    // closed; anything not provably identical needs fresh review).
+    .replace(/[ \t\n\r\f\v]+/g, " ")
+    .trim();
+  // Statements reach here only via clampText (<=INTENT_MAX_TEXT) so a
+  // canonical longer than the bound is already unreachable — but the
+  // fingerprint is an authorization identity, never a truncated form:
+  // an oversized input hashes instead of colliding on a shared prefix.
+  return canon.length <= 640 ? canon : digest({ issue: canon });
 }
 
-/** Canonical scope lineage for the fingerprint — same `""`-normalized
- *  semantics as the replan snapshot binding: an issue reviewed under
- *  one business/objective/work-item/project is never the issue
+/** Canonical scope lineage for the fingerprint — the tuple is JSON-
+ *  encoded so dimension values can never smuggle delimiter segments
+ *  (no `;`/`=`/`|` ambiguity regardless of id alphabet). `""`-normalized
+ *  semantics match the replan snapshot binding: an issue reviewed
+ *  under one business/objective/work-item/project is never the issue
  *  reviewed under another; unknown dimensions never silently match. */
 function canonicalScopeKey(
   scope?: GoalIntentAnalysis["scope"] | null,
 ): string {
   const n = (v: unknown) => (v == null ? "" : String(v));
-  return (
-    `b=${n(scope?.business_id)};o=${n(scope?.objective_id)};` +
-    `w=${n(scope?.work_item_id)};p=${n(scope?.project_id)}`
-  );
+  return JSON.stringify([
+    n(scope?.business_id),
+    n(scope?.objective_id),
+    n(scope?.work_item_id),
+    n(scope?.project_id),
+  ]);
 }
 
 /** The deterministic identity of an interpretation item's ISSUE —
