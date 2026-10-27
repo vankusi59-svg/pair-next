@@ -614,38 +614,55 @@ const APPROVABLE_AUTHORITIES = new Set<IntentAuthorityClass>([
  * "tier b"). None of that is provable identity — paraphrase similarity
  * is not approval evidence.
  *
- * The issue key is therefore the item's CANONICAL STATEMENT — a
- * deterministic, order-preserving normalization: NFC → lowercase →
- * đ→d (not NFD-decomposable) → NFD strip combining marks (accented and
- * unaccented Vietnamese spellings of the same word collapse) →
- * punctuation→space → whitespace collapse. Negation, direction,
- * entity, quantity, unit, relationship and scope words are all
- * preserved verbatim; only surface formatting varies. Two issues are
- * identical iff their canonical statements are byte-equal — anything
- * else requires explicit owner review (fail closed by construction).
+ * The issue key is therefore a LOSSLESS fingerprint of the issue's
+ * canonical text under its scope — the ONLY permitted normalization
+ * is Unicode NFC and whitespace collapsing (runs → single space,
+ * edges trimmed). Everything else is identity-bearing and preserved
+ * verbatim: Vietnamese diacritics (bán ≠ bàn), case (US ≠ us),
+ * punctuation and symbols ($500 ≠ €500, 5% ≠ 5, C++ ≠ C#), word
+ * order, negation, duplicates. No fuzzy matching, diacritic folding,
+ * stopword removal, token sorting or symbol stripping — authorization
+ * identity is exact. Anything not byte-identical requires explicit
+ * owner review (fail closed by construction).
  * ------------------------------------------------------------------ */
 function canonicalIssueStatement(s: string): string {
   return s
     .normalize("NFC")
-    .toLowerCase()
-    .replace(/đ/g, "d")
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 640);
 }
 
+/** Canonical scope lineage for the fingerprint — same `""`-normalized
+ *  semantics as the replan snapshot binding: an issue reviewed under
+ *  one business/objective/work-item/project is never the issue
+ *  reviewed under another; unknown dimensions never silently match. */
+function canonicalScopeKey(
+  scope?: GoalIntentAnalysis["scope"] | null,
+): string {
+  const n = (v: unknown) => (v == null ? "" : String(v));
+  return (
+    `b=${n(scope?.business_id)};o=${n(scope?.objective_id)};` +
+    `w=${n(scope?.work_item_id)};p=${n(scope?.project_id)}`
+  );
+}
+
 /** The deterministic identity of an interpretation item's ISSUE —
- *  `category|canonical statement`. Identical issues reuse approval;
- *  any provable difference — negation, ordering, entity, quantity,
- *  identifier — is a different issue requiring fresh owner review. */
-export function issueKeyFor(item: {
-  category: string;
-  statement: string;
-}): string {
-  return `${item.category}|${canonicalIssueStatement(item.statement)}`;
+ *  `category | scope | canonical statement`. Identical issues under
+ *  identical scope reuse approval; any provable difference — case,
+ *  diacritics, symbols, ordering, entity, quantity, identifier or
+ *  scope — is a different issue requiring fresh owner review. */
+export function issueKeyFor(
+  item: {
+    category: string;
+    statement: string;
+  },
+  scope?: GoalIntentAnalysis["scope"] | null,
+): string {
+  return (
+    `${item.category}|${canonicalScopeKey(scope)}|` +
+    canonicalIssueStatement(item.statement)
+  );
 }
 
 /** An approved issue identity — the reviewable unit a resolution
@@ -657,12 +674,15 @@ export interface ApprovedIssue {
 }
 
 /** Coverage check: a material item was reviewed iff an approved issue
- *  carries the SAME category AND identical issue key. */
+ *  carries the SAME category AND identical issue key — including the
+ *  scope lineage the issue was reviewed under (`scope` is the CURRENT
+ *  revision's analysis scope; cross-scope reviews never cover). */
 function issueCoveredBy(
   item: IntentItem,
   approved: ReadonlyArray<ApprovedIssue | null | undefined>,
+  scope?: GoalIntentAnalysis["scope"] | null,
 ): boolean {
-  const key = issueKeyFor(item);
+  const key = issueKeyFor(item, scope);
   return approved.some(
     (a) =>
       a != null &&
@@ -850,7 +870,7 @@ export function approveGoalIntentItems(
       resolutions.push({
         item_id: id,
         statement: item.statement,
-        issue_key: issueKeyFor(item),
+        issue_key: issueKeyFor(item, analysis.scope),
         decision,
         supplied: supplied ?? null,
       });
@@ -1032,7 +1052,7 @@ export function verifyGoalIntentApproval(
   }
   const derivedIssues: ApprovedIssue[] = approval.item_ids.map((id) => {
     const it = byId.get(id)!;
-    return { category: it.category, issue_key: issueKeyFor(it) };
+    return { category: it.category, issue_key: issueKeyFor(it, analysis.scope) };
   });
   // `resolutions` is the decision evidence the endpoint echoes — same
   // tamper surface as item_statements: every entry must re-derive from
@@ -1236,7 +1256,9 @@ export function assertGuardedIntentConfirmed(
       "GUARDED: MATERIAL class without enumerable material items — malformed evidence",
     );
   }
-  const uncovered = material.filter((i) => !issueCoveredBy(i, approved));
+  const uncovered = material.filter(
+    (i) => !issueCoveredBy(i, approved, analysis?.scope),
+  );
   if (uncovered.length) {
     throw new IntegrityError(
       "FAIL_CLOSED_GOAL_INTENT_AMBIGUITY",

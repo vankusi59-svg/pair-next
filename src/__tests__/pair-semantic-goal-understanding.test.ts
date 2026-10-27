@@ -423,7 +423,7 @@ describe("P18.6 — GUARDED confirm gate", () => {
     ) as unknown as Record<string, unknown>;
   const kpiIssue = {
     category: "missing_information",
-    issue_key: issueKeyFor({ category: "missing_information", statement: "no KPI specified" }),
+    issue_key: issueKeyFor({ category: "missing_information", statement: "no KPI specified" }, SCOPE),
   };
   it("guarded MATERIAL/AUTHORITY_CRITICAL → fail closed; covered approval → pass", () => {
     expect(() => assertGuardedIntentConfirmed(run({ ambiguity_class: "MATERIAL" }), null)).toThrow(
@@ -449,7 +449,7 @@ describe("P18.6 — GUARDED confirm gate", () => {
         {
           approved_issues: [{
             category: "missing_information",
-            issue_key: issueKeyFor({ category: "missing_information", statement: "deadline extension approved" }),
+            issue_key: issueKeyFor({ category: "missing_information", statement: "deadline extension approved" }, SCOPE),
           }],
         },
       ),
@@ -813,6 +813,7 @@ describe("P18.6 — confirm-gate integration (real MissionControl seam)", () => 
       [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
       approval.amended_goal,
     );
+    a2.scope = { ...a2.scope, project_id: String(project.project_id) };
     const run2 = intentRunRow(store, approval.amended_goal, {
       analysis_digest: a2.analysis_digest,
       ambiguity_class: a2.ambiguity.class,
@@ -1101,6 +1102,7 @@ describe("P18.6-FINAL F2 — approval only resolves the ambiguity it reviewed", 
       ],
       approval.amended_goal,
     );
+    a2.scope = { ...a2.scope, project_id: String(project.project_id) };
     expect(a2.ambiguity.class).toBe("MATERIAL");
     const run2 = beginPlannerRun(store, {
       routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
@@ -1136,6 +1138,7 @@ describe("P18.6-FINAL F2 — approval only resolves the ambiguity it reviewed", 
       [item({ id: "i1", category: "missing_information", statement: "no KPI specified", confidence: "high" })],
       approval.amended_goal,
     );
+    a3.scope = { ...a3.scope, project_id: String(project.project_id) };
     const run3 = beginPlannerRun(store, {
       routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
       goal_intent: {
@@ -1269,6 +1272,7 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
         [item({ id: "i1", category: "missing_information", statement: v, confidence: "high" })],
         approval.amended_goal,
       );
+      a2.scope = { ...a2.scope, project_id: String(project.project_id) };
       const run2 = beginPlannerRun(store, {
         routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
         goal_intent: {
@@ -1299,13 +1303,14 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
         control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: String(pv2.plan_digest) }),
       ).toThrow(/FAIL_CLOSED_GOAL_INTENT_AMBIGUITY/);
     }
-    // SAME issue, canonical-identical (case/punct surface variant) →
-    // still covered (genuine reuse). A paraphrase is NOT provable
-    // identity and would now require fresh owner review.
+    // SAME issue, canonical-identical (whitespace-only surface
+    // variant, same scope) → still covered (genuine reuse). Case,
+    // punctuation, paraphrase are all provable differences now.
     const a3 = fakeAnalysis(
-      [item({ id: "i1", category: "missing_information", statement: "No telegram subscriber target, specified!", confidence: "high" })],
+      [item({ id: "i1", category: "missing_information", statement: "no telegram  subscriber   target specified", confidence: "high" })],
       approval.amended_goal,
     );
+    a3.scope = { ...a3.scope, project_id: String(project.project_id) };
     const run3 = beginPlannerRun(store, {
       routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
       goal_intent: {
@@ -1502,7 +1507,10 @@ describe("P18.6-IDENTITY — issue-identity binding", () => {
       const res = ok.json.resolutions as Array<Record<string, unknown>>;
       expect(res[0].decision).toBe("supplied_value");
       expect(String(res[0].issue_key)).toBe(
-        issueKeyFor({ category: "missing_information", statement: "no KPI specified" }),
+        issueKeyFor(
+          { category: "missing_information", statement: "no KPI specified" },
+          { ...SCOPE, project_id: String(project.project_id) },
+        ),
       );
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
@@ -1538,9 +1546,13 @@ describe("P18.6-IDENTITY-R3 — tokenizer + key-edge residuals", () => {
     expect(k("target of 5 launches unclear")).not.toBe(
       k("target of 9 launches unclear"),
     );
-    // Sanity: canonical surface variants of the same issue collapse;
-    // a paraphrase does NOT (no longer provable identity).
-    expect(k("No Telegram Subscriber Target Specified!")).toBe(
+    // Sanity: whitespace-only surface variants of the same issue
+    // collapse; case, punctuation and paraphrase do NOT (lossless
+    // identity — provable differences require fresh review).
+    expect(k("no  telegram   subscriber target specified")).toBe(
+      k("no telegram subscriber target specified"),
+    );
+    expect(k("No Telegram Subscriber Target Specified!")).not.toBe(
       k("no telegram subscriber target specified"),
     );
     expect(k("no telegram subscriber target specified")).not.toBe(
@@ -1737,16 +1749,18 @@ describe("P18.6-IDENTITY-R4 — canonical statement identity", () => {
     );
   });
 
-  it("genuinely identical statements still reuse (canonical surface variants)", () => {
-    // Case, punctuation, spacing, diacritic spelling — the SAME issue.
-    expect(k("No Telegram Subscriber Target!", "missing_information")).toBe(
+  it("genuinely identical statements still reuse (NFC + whitespace only)", () => {
+    // Whitespace runs collapse and edges trim — byte-identical text.
+    expect(k("no telegram  subscriber   target", "missing_information")).toBe(
       k("no telegram subscriber target", "missing_information"),
     );
-    expect(k("không có KPI rõ ràng", "missing_information")).toBe(
-      k("khong co kpi ro rang", "missing_information"),
+    // NFC unifies precomposed vs combining diacritic sequences — the
+    // marks themselves are preserved (không ≠ khong, tested in R5).
+    expect(k("café target unclear", "missing_information")).toBe(
+      k("café target unclear", "missing_information"),
     );
     expect(k("  KPI   target: 500? ", "missing_information")).toBe(
-      k("kpi target 500", "missing_information"),
+      k("KPI target: 500?", "missing_information"),
     );
     // Category remains part of the identity.
     expect(k("same wording", "ambiguity")).not.toBe(
@@ -1814,5 +1828,133 @@ describe("P18.6-IDENTITY-R4b — goal-line integrity", () => {
     expect(ok.resolutions[0].supplied).toBe(
       "500 Operator-approved: no KPI specified",
     );
+  });
+});
+
+/* ==================================================================
+ * P18.6-IDENTITY-R5 — LOSSLESS approval identity: only NFC + safe
+ * whitespace normalization. Diacritics, punctuation, symbols and
+ * case-sensitive identifiers are identity-bearing — no folding.
+ * ================================================================== */
+describe("P18.6-IDENTITY-R5 — lossless canonical fingerprint", () => {
+  const k = (s: string, category = "ambiguity") =>
+    issueKeyFor({ category, statement: s });
+
+  it("Vietnamese diacritics are semantic — bán ≠ bàn", () => {
+    expect(k("số bán unclear", "missing_information")).not.toBe(
+      k("số bàn unclear", "missing_information"),
+    );
+    expect(k("không có KPI rõ ràng", "missing_information")).not.toBe(
+      k("khong co kpi ro rang", "missing_information"),
+    );
+  });
+
+  it("currency symbols are semantic — $500 ≠ €500", () => {
+    expect(k("budget $500 unclear")).not.toBe(k("budget €500 unclear"));
+    expect(k("cost £1000 unclear")).not.toBe(k("cost $1000 unclear"));
+  });
+
+  it("dimension/unit symbols are semantic — 5% ≠ 5", () => {
+    expect(k("margin 5% unclear")).not.toBe(k("margin 5 unclear"));
+    expect(k("rate 10°C unclear")).not.toBe(k("rate 10C unclear"));
+  });
+
+  it("identifier symbols are semantic — C++ ≠ C#", () => {
+    expect(k("port to C++ unclear")).not.toBe(k("port to C# unclear"));
+    expect(k("node.js version unclear")).not.toBe(
+      k("node js version unclear"),
+    );
+  });
+
+  it("case-sensitive identifiers are semantic — US ≠ us", () => {
+    expect(k("region US unclear")).not.toBe(k("region us unclear"));
+    expect(k("API key unclear")).not.toBe(k("api key unclear"));
+  });
+
+  it("scope is part of the fingerprint", () => {
+    const scopeA = { business_id: "B1", objective_id: "O1", work_item_id: "W1", project_id: "P1" };
+    const scopeB = { ...scopeA, project_id: "P2" };
+    const stmt = "no KPI specified";
+    expect(issueKeyFor({ category: "missing_information", statement: stmt }, scopeA)).not.toBe(
+      issueKeyFor({ category: "missing_information", statement: stmt }, scopeB),
+    );
+    expect(issueKeyFor({ category: "missing_information", statement: stmt }, scopeA)).toBe(
+      issueKeyFor({ category: "missing_information", statement: stmt }, scopeA),
+    );
+  });
+
+  it("genuinely identical statements still reuse (NFC + whitespace only)", () => {
+    // Whitespace variants — runs collapse, edges trim.
+    expect(k("no telegram  subscriber   target specified")).toBe(
+      k("no telegram subscriber target specified"),
+    );
+    expect(k("  padded   statement  ")).toBe(k("padded statement"));
+    // NFC unifies precomposed vs combining sequences.
+    expect(k("café target unclear")).toBe(k("café target unclear"));
+    // Byte-identical = identical.
+    expect(k("same wording")).toBe(k("same wording"));
+  });
+});
+
+describe("P18.6-IDENTITY-R5b — stored-format fail-closed", () => {
+  it("approvals with the previous lossy key format fail re-proof (no silent migration)", () => {
+    const { store, control, project } = makeControlCtx();
+    const itm = item({
+      id: "i1", category: "missing_information",
+      statement: "no KPI specified", confidence: "high",
+    });
+    const a = fakeAnalysis([itm], "grow subs");
+    a.scope = { ...a.scope, project_id: String(project.project_id) };
+    const run = beginPlannerRun(store, {
+      routes: ["codex-cli:m"], actor: "t", semantic_mode: "guarded",
+      goal_intent: {
+        analysis_digest: a.analysis_digest, block: "b",
+        ambiguity_class: a.ambiguity.class, status: "analyzed",
+        unavailable_reason: null, model: "m", provider_id: "codex-cli",
+        provider_requests: 1, analysis_ms: 1, from_cache: false,
+        source_goal_sha: digest({ operator_goal: "grow subs" }),
+        context_digest: null, mode: "guarded",
+        analysis: a as unknown as Record<string, unknown>,
+      },
+    });
+    const pv = control.createPlanPreview(
+      {
+        project_id: project.project_id, goal: "grow subs", operator_id: "op1",
+        granted_permissions: [], authorized_workspaces: [], risk_ceiling: "LOW",
+      },
+      { planner_run_id: String(run.planner_run_id), attempts: [], winner: null, warnings: [] },
+    );
+    const approval = approveGoalIntentItems(store, {
+      preview_id: String(pv.preview_id), base_goal: "grow subs",
+      item_ids: ["i1"], operator_id: "op1",
+    });
+    const mi = {
+      operator_goal: approval.amended_goal,
+      project_id: project.project_id, operator_id: "op1",
+      metadata: {
+        goal_intent_approval: {
+          approval_id: approval.approval_id,
+          revision_digest: approval.revision_digest,
+        },
+      },
+    };
+    // Genuine row verifies.
+    expect(verifyGoalIntentApproval(store, { mission_input: mi }).approval_id)
+      .toBe(approval.approval_id);
+    // Downgrade the stored key to the PREVIOUS format (no scope segment,
+    // folded text) — simulating a row minted before lossless identity.
+    const row = store.get("goal_intent_approval", approval.approval_id) as Record<string, unknown>;
+    const res = (row.resolutions as Array<Record<string, unknown>>).map((r) => ({
+      ...r,
+      issue_key: "missing_information|no kpi specified",
+    }));
+    store.put(
+      "goal_intent_approval", approval.approval_id,
+      { ...row, resolutions: res },
+      (row as { version: number }).version,
+    );
+    // Re-derivation under the current scheme disagrees → fail closed.
+    expect(() => verifyGoalIntentApproval(store, { mission_input: mi }))
+      .toThrow(/FAIL_CLOSED_GOAL_INTENT_APPROVAL/);
   });
 });
