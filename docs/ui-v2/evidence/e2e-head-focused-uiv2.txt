@@ -1,0 +1,17 @@
+
+Running 12 tests using 1 worker
+
+  ok  1 e2e\ui-v2.spec.ts:47:1 › v2: home renders hero, stats, VN nav — hero hands off to intake (567ms)
+  ok  2 e2e\ui-v2.spec.ts:63:1 › v2 intake: VN goal → honest manual draft (semantic OFF) → mission confirm (407ms)
+  ok  3 e2e\ui-v2.spec.ts:85:1 › v2 intake: draft → edit → explicit confirm → canonical objective created (510ms)
+  ok  4 e2e\ui-v2.spec.ts:114:1 › v2 intake: objective path fails closed when no business selected (361ms)
+  ok  5 e2e\ui-v2.spec.ts:127:1 › v2 intake: negative budget blocked — invalid values never silently dropped (487ms)
+  ok  6 e2e\ui-v2.spec.ts:166:1 › v2 intake: analyze failure shows error, creates nothing (309ms)
+  ok  7 e2e\ui-v2.spec.ts:179:1 › v2: objective detail owner tabs + deep link to Nâng cao (562ms)
+  ok  8 e2e\ui-v2.spec.ts:209:1 › v2: mobile 390×844 — rail hidden, bottom tabs, drawer reaches advanced (433ms)
+  ok  9 e2e\ui-v2.spec.ts:223:1 › v2: dark + light themes render the owner cockpit (381ms)
+  ok 10 e2e\ui-v2.spec.ts:232:1 › v2: keyboard — skip link + VN nav focusable (386ms)
+  ok 11 e2e\ui-v2.spec.ts:243:1 › v2 intake: analyzing a goal issues ZERO canonical creates — suggestion never writes (452ms)
+  ok 12 e2e\ui-v2.spec.ts:263:1 › v2 intake: workstream suggestions are honest — nothing persisted without owner confirm (658ms)
+
+  12 passed (7.8s)

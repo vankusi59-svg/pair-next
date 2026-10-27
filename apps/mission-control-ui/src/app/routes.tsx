@@ -1,5 +1,7 @@
 import { Navigate } from "react-router-dom";
 import { AppShell } from "./AppShell";
+import { Home } from "./pages/Home";
+import { Intake } from "./pages/Intake";
 import { Company } from "./pages/Company";
 import { ObjectiveDetail } from "./pages/ObjectiveDetail";
 import { ObjectiveList } from "./pages/ObjectiveList";
@@ -30,9 +32,17 @@ export const appRoute = {
   children: [
     {
       index: true,
-      // B6: the tree is complete — /app lands on the owner home instead of
-      // a stale "lands in B2" placeholder.
-      element: <Navigate to="/app/company" replace />,
+      // UI-V2: /app lands on the owner home (Tổng quan). /app/company
+      // stays as the advanced cockpit — every old deep link resolves.
+      element: <Navigate to="/app/home" replace />,
+    },
+    {
+      path: "home",
+      element: <Home />,
+    },
+    {
+      path: "new",
+      element: <Intake />,
     },
     {
       path: "company",

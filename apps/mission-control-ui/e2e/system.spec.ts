@@ -309,6 +309,7 @@ test("settings: masked token editor, save → new requests use it, no token in D
   await page.getByRole("button", { name: "Save token" }).click();
   await expect(page.getByText(/Token saved/i)).toBeVisible();
   // subsequent requests carry the new token
+  await page.locator(".anav .advtoggle").click(); // V2: Schedules lives under Nâng cao
   await page.getByRole("link", { name: "Schedules" }).click();
   await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
   expect(seen.some((a) => a === "Bearer fresh-token-xyz")).toBeTruthy();
@@ -323,6 +324,7 @@ test("settings: invalid token → honest Unauthorized state, never a prompt", as
   page.on("dialog", (d) => { promptSeen = true; void d.dismiss(); });
   await page.getByLabel(/New token/i).fill("bad-token");
   await page.getByRole("button", { name: "Save token" }).click();
+  await page.locator(".anav .advtoggle").click(); // V2: Schedules lives under Nâng cao
   await page.getByRole("link", { name: "Schedules" }).click();
   await expect(page.getByText("UNAUTHORIZED_MC_TOKEN", { exact: true }).first()).toBeVisible({ timeout: 10000 });
   await page.waitForTimeout(300);
@@ -347,7 +349,8 @@ test("settings: operator id propagates to header + shell chip; theme stays synce
   await page.getByRole("button", { name: "toggle theme in settings" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   // subsequent requests carry the new operator id
-  await page.getByRole("link", { name: "Cost" }).click();
+  await page.locator(".anav .advtoggle").click(); // V2: Chi phí lives under Nâng cao
+  await page.getByRole("link", { name: "Chi phí" }).click();
   await expect(page.getByText("Remote dispatches today", { exact: true })).toBeVisible({ timeout: 10000 });
   expect(ops.some((o) => o === "op:settings-test")).toBeTruthy();
 });
@@ -485,6 +488,7 @@ test("settings R1-F3: operator change invalidates inbox counts — A's count nev
   await page.goto("/app/company");
   await expect(page.locator(".ibadge", { hasText: "2" }).first()).toBeVisible({ timeout: 10000 });
   // SPA navigation only — page.goto would full-reload and re-seed credentials
+  await page.locator(".anav .advtoggle").click(); // V2: Settings/Cockpit live under Nâng cao
   await page.getByRole("link", { name: "Settings" }).click();
   await page.getByLabel(/x-operator-id sent with API requests/).fill("op:other");
   await page.getByRole("button", { name: "Save operator id" }).click();
@@ -511,6 +515,7 @@ test("settings R1-F3: delayed old-operator inbox read never repaints after ident
   await seedSession(page);
   await page.goto("/app/company"); // badge read under op:e2e is held in-flight
   // SPA navigation only — page.goto would full-reload and re-seed credentials
+  await page.locator(".anav .advtoggle").click(); // V2: Settings/Cockpit live under Nâng cao
   await page.getByRole("link", { name: "Settings" }).click();
   await page.getByLabel(/x-operator-id sent with API requests/).fill("op:other");
   await page.getByRole("button", { name: "Save operator id" }).click();
@@ -550,6 +555,7 @@ test("observability R1-F3: stream status is a shared subscription — consumers 
   const stream = page.locator("section[aria-label='global event stream']");
   await expect(stream.getByText("live")).toBeVisible({ timeout: 15000 });
   // unmount → remount: a fresh subscriber converges to the same status
+  await page.locator(".anav .advtoggle").click(); // V2: Schedules lives under Nâng cao
   await page.getByRole("link", { name: "Schedules" }).click();
   await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
   await page.getByRole("link", { name: "Observability" }).click();

@@ -32,57 +32,56 @@ export function useSelectedBusiness() {
   return useContext(BizContext);
 }
 
-const NAV: Array<{ group: string; items: Array<{ to: string; icon: string; label: string }> }> = [
-  {
-    group: "Overview",
-    items: [
-      { to: "/app/company", icon: "◆", label: "Company Cockpit" },
-      { to: "/app/inbox", icon: "◉", label: "Owner Inbox" },
-    ],
-  },
-  {
-    group: "Business",
-    items: [
-      { to: "/app/objectives", icon: "◎", label: "Objectives" },
-      { to: "/app/ceo", icon: "◈", label: "CEO Workspace" },
-      { to: "/app/workforce", icon: "◍", label: "Workforce" },
-      { to: "/app/workforce/admin", icon: "◍", label: "Workforce Admin" },
-    ],
-  },
-  {
-    group: "Operations",
-    items: [
-      { to: "/app/missions", icon: "▶", label: "Missions" },
-      { to: "/app/chat", icon: "◌", label: "Chat" },
-    ],
-  },
-  {
-    group: "System",
-    items: [
-      { to: "/app/system/business-admin", icon: "▣", label: "Business Admin" },
-      { to: "/app/system/providers", icon: "▦", label: "Providers & Models" },
-      { to: "/app/system/observability", icon: "◔", label: "Observability" },
-      { to: "/app/system/schedules", icon: "◷", label: "Schedules" },
-      { to: "/app/system/cost", icon: "◠", label: "Cost" },
-      { to: "/app/system/settings", icon: "⚙", label: "Settings" },
-    ],
-  },
+/* UI-V2 — owner-first nav (mission fixed decision):
+   Tổng quan / Mục tiêu / Công việc / Phê duyệt / Nhân sự AI +
+   "Nâng cao" collapsed group. Owner vs Advanced is a PRESENTATION
+   toggle only — same routes, same authority, same data. */
+const NAV_OWNER: Array<{ to: string; icon: string; label: string }> = [
+  { to: "/app/home", icon: "⌂", label: "Tổng quan" },
+  { to: "/app/objectives", icon: "◎", label: "Mục tiêu" },
+  { to: "/app/missions", icon: "▶", label: "Công việc" },
+  { to: "/app/inbox", icon: "◉", label: "Phê duyệt" },
+  { to: "/app/workforce", icon: "◍", label: "Nhân sự AI" },
+];
+const NAV_ADVANCED: Array<{ to: string; icon: string; label: string }> = [
+  { to: "/app/new", icon: "✦", label: "Tạo bằng ngôn ngữ" },
+  { to: "/app/company", icon: "◆", label: "Company Cockpit" },
+  { to: "/app/ceo", icon: "◈", label: "CEO Workspace" },
+  { to: "/app/workforce/admin", icon: "◐", label: "Workforce Admin" },
+  { to: "/app/chat", icon: "◌", label: "Chat" },
+  { to: "/app/system/business-admin", icon: "▣", label: "Business Admin" },
+  { to: "/app/system/providers", icon: "▦", label: "Providers & Models" },
+  { to: "/app/system/observability", icon: "◔", label: "Observability" },
+  { to: "/app/system/schedules", icon: "◷", label: "Schedules" },
+  { to: "/app/system/cost", icon: "◠", label: "Chi phí" },
+  { to: "/app/system/settings", icon: "⚙", label: "Settings" },
 ];
 
+const MODE_KEY = "pair.owner_mode";
+export type ShellMode = "owner" | "advanced";
+export function getShellMode(): ShellMode {
+  return localStorage.getItem(MODE_KEY) === "advanced" ? "advanced" : "owner";
+}
+function setShellMode(m: ShellMode) {
+  localStorage.setItem(MODE_KEY, m);
+}
+
 const CRUMB: Array<[string, string]> = [
+  ["/app/home", "Tổng quan"],
+  ["/app/new", "Tạo bằng ngôn ngữ"],
   ["/app/company", "Company Cockpit"],
-  ["/app/inbox", "Owner Inbox"],
-  ["/app/objectives", "Objectives"],
+  ["/app/inbox", "Phê duyệt"],
+  ["/app/objectives", "Mục tiêu"],
   ["/app/ceo", "CEO Workspace"],
   ["/app/workforce/admin", "Workforce Admin"],
   ["/app/system/business-admin", "Business Admin"],
-  ["/app/workforce", "AI Workforce"],
-  ["/app/missions", "Mission Operations"],
+  ["/app/workforce", "Nhân sự AI"],
+  ["/app/missions", "Công việc"],
   ["/app/chat", "Chat"],
   ["/app/system/providers", "Providers & Models"],
   ["/app/system/observability", "Observability"],
   ["/app/system/schedules", "Schedules"],
-  ["/app/system/cost", "Cost & Usage"],
+  ["/app/system/cost", "Chi phí"],
   ["/app/system/settings", "Settings"],
 ];
 
@@ -281,28 +280,57 @@ function InboxBadge() {
   );
 }
 
+function NavItem({ it, onNavigate }: { it: { to: string; icon: string; label: string }; onNavigate?: () => void }) {
+  return (
+    <NavLink
+      to={it.to}
+      end={it.to === "/app/home"}
+      onClick={onNavigate}
+      aria-label={it.label}
+      title={it.label}
+    >
+      <span className="ico" aria-hidden>{it.icon}</span>
+      <span className="lbl">{it.label}</span>
+      {it.to === "/app/inbox" ? <InboxBadge /> : null}
+    </NavLink>
+  );
+}
+
 function NavLinks(props: { onNavigate?: () => void }) {
+  /* Advanced group is collapsible in Owner mode and always reachable —
+     Advanced mode just defaults it open. Presentation only. */
+  const [mode] = useState<ShellMode>(getShellMode);
+  const [advOpen, setAdvOpen] = useState(mode === "advanced");
+  useEffect(() => {
+    const sync = () => {
+      if (getShellMode() === "advanced") setAdvOpen(true);
+    };
+    window.addEventListener("pair.shell-mode-changed", sync);
+    return () => window.removeEventListener("pair.shell-mode-changed", sync);
+  }, []);
   return (
     <>
-      {NAV.map((g) => (
-        <div key={g.group}>
-          <div className="group">{g.group}</div>
-          {g.items.map((it) => (
-            <NavLink
-              key={it.to}
-              to={it.to}
-              end={it.to === "/app/company"}
-              onClick={props.onNavigate}
-              aria-label={it.label}
-              title={it.label}
-            >
-              <span className="ico" aria-hidden>{it.icon}</span>
-              <span className="lbl">{it.label}</span>
-              {it.to === "/app/inbox" ? <InboxBadge /> : null}
-            </NavLink>
-          ))}
-        </div>
+      {NAV_OWNER.map((it) => (
+        <NavItem key={it.to} it={it} onNavigate={props.onNavigate} />
       ))}
+      <div className="group">
+        <button
+          type="button"
+          className="advtoggle"
+          aria-expanded={advOpen}
+          onClick={() => setAdvOpen((o) => !o)}
+        >
+          Nâng cao <span aria-hidden>{advOpen ? "▾" : "▸"}</span>
+        </button>
+      </div>
+      {/* Always in the DOM — CSS collapses it in Owner mode on wide
+         screens; the icon rail and the mobile drawer force it open so
+         no destination is ever unreachable (audit-grade rule). */}
+      <div className={`advitems${advOpen ? " open" : ""}`}>
+        {NAV_ADVANCED.map((it) => (
+          <NavItem key={it.to} it={it} onNavigate={props.onNavigate} />
+        ))}
+      </div>
     </>
   );
 }
@@ -312,6 +340,12 @@ export function AppShell() {
   const loc = useLocation();
   const [drawer, setDrawer] = useState(false);
   const [biz, setBiz] = useState(getBusinessId);
+  const [shellMode, setShellModeState] = useState<ShellMode>(getShellMode);
+  const switchMode = (m: ShellMode) => {
+    setShellMode(m);
+    setShellModeState(m);
+    window.dispatchEvent(new Event("pair.shell-mode-changed"));
+  };
   const select = (id: string) => {
     setBusinessId(id);
     setBiz(getBusinessId());
@@ -369,7 +403,7 @@ export function AppShell() {
         <a className="skip" href="#app-main">Skip to content</a>
         <div className="brand">
           <span className="dot">▮</span>
-          <span className="lbl">PAIR · Company OS</span>
+          <span className="lbl">PAIRNEXT</span>
         </div>
         <BusinessSwitcher />
         <nav className="anav" aria-label="primary">
@@ -385,12 +419,24 @@ export function AppShell() {
       <div className="acontent">
         <header className="atopbar">
           <span className="crumb">
-            PAIR / <b>{crumbFor(loc.pathname)}</b>
+            PAIRNEXT / <b>{crumbFor(loc.pathname)}</b>
           </span>
           {/* Tablet only (768–1199): rail hides the sidebar switcher,
               so the same manual-entry switcher lives here (F1). */}
           <div className="atobiz">
             <BusinessSwitcher />
+          </div>
+          <div className="atopright">
+            <NavLink className="v2btn small" to="/app/new">+ Tạo mới</NavLink>
+            <button
+              type="button"
+              className="tbtn modechip"
+              title="Owner/Nâng cao — chỉ đổi mức hiển thị, quyền hạn giữ nguyên"
+              aria-label="chuyển chế độ hiển thị"
+              onClick={() => switchMode(shellMode === "owner" ? "advanced" : "owner")}
+            >
+              {shellMode === "owner" ? "Chế độ Owner" : "Nâng cao"}
+            </button>
           </div>
         </header>
         <main className="amain" id="app-main">
@@ -398,12 +444,12 @@ export function AppShell() {
         </main>
       </div>
       <nav className="atabbar" aria-label="primary mobile">
-        <NavLink to="/app/company"><span className="ico">◆</span>Cockpit</NavLink>
-        <NavLink to="/app/inbox"><span className="ico">◉</span>Inbox<InboxBadge /></NavLink>
-        <NavLink to="/app/objectives"><span className="ico">◎</span>Objs</NavLink>
-        <NavLink to="/app/missions"><span className="ico">▶</span>Miss</NavLink>
+        <NavLink to="/app/home"><span className="ico">⌂</span>Tổng quan</NavLink>
+        <NavLink to="/app/inbox"><span className="ico">◉</span>Phê duyệt<InboxBadge /></NavLink>
+        <NavLink to="/app/objectives"><span className="ico">◎</span>Mục tiêu</NavLink>
+        <NavLink to="/app/missions"><span className="ico">▶</span>Công việc</NavLink>
         <button type="button" ref={moreRef} onClick={() => setDrawer(true)} aria-label="more navigation" aria-haspopup="dialog">
-          <span className="ico">☰</span>More
+          <span className="ico">☰</span>Thêm
         </button>
       </nav>
       {drawer ? (

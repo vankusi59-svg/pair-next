@@ -1204,11 +1204,16 @@ const semanticAnalyzeForRun = async ({
     mode,
     analysis: analyzed ?? null,
   };
-  pinPlannerRunGoalIntent(store, {
-    planner_run_id: plannerRunId,
-    goal_intent: pinned,
-    actor: actor ?? "PAIR_PLANNER",
-  });
+  /* plannerRunId === null → intake-draft seam: the SAME bounded analysis
+     is computed and returned as advisory evidence, but NOTHING is pinned
+     (there is no run to pin to; the draft is non-authoritative). */
+  if (plannerRunId != null) {
+    pinPlannerRunGoalIntent(store, {
+      planner_run_id: plannerRunId,
+      goal_intent: pinned,
+      actor: actor ?? "PAIR_PLANNER",
+    });
+  }
   return pinned;
 };
 const invokePlannerPool = ({
@@ -1908,6 +1913,26 @@ const server = createMissionControlServer({
   // P15.9-A1 — canonical artifact authority for cockpit artifact
   // verification (producer binding + retained CAS bytes re-proved NOW).
   artifacts: service.artifacts,
+  // UI-V2 — bounded advisory interpretation for /api/v1/intake/draft.
+  // Same codex-cli lane + ONE-request bound as the run-pinned analysis;
+  // plannerRunId:null → the draft evidence is returned but NEVER pinned
+  // to a run (intake drafts are non-authoritative by design).
+  intakeAnalyze: async (input) =>
+    semanticAnalyzeForRun({
+      authorityGoal: input.goal,
+      contextDigest: null,
+      contextBlock: null,
+      scope: {
+        business_id: input.business_id,
+        objective_id: null,
+        work_item_id: null,
+        project_id: input.project_id,
+      },
+      candidates: dedupePlannerCandidates(plannerCandidates),
+      plannerRunId: null,
+      deadlineAt: Date.now() + cfgCodexPlannerTimeoutMs,
+      actor: input.operator_id,
+    }),
   // P15.8-D — conversation layer (chat turns + governed mission drafts).
   conversation: {
     sessions: conversationSessions,

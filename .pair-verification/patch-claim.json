@@ -1,30 +1,25 @@
 {
-  "claim_id": "P18_6_SEMANTIC_FIRST_GOAL_UNDERSTANDING",
-  "title": "P18.6 — Semantic-First Goal Understanding + closures: guarded evidence binding, strict snapshot scope, LOSSLESS approval identity (category + canonical text + scope fingerprint; NFC/whitespace only; no folding, sorting or symbol stripping)",
+  "claim_id": "UI_V2_OWNER_EXPERIENCE",
+  "title": "UI-V2 owner-first experience + audit fixes: VN shell, governed NL intake, owner cockpit, ObjectiveDetail tabs, stale-scope guards, manual:true, typed failure reasons",
   "affected_surfaces": [
-    "PLANNER",
+    "MISSION_CONTROL",
     "MISSION_DRAFT",
+    "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-objective-intake.test.ts",
+    "src/__tests__/pair-intake-draft-endpoint.test.ts",
     "src/__tests__/pair-semantic-goal-understanding.test.ts",
     "src/__tests__/pair-goal-intent-benchmark.test.ts",
-    "src/__tests__/pair-semantic-coverage.test.ts",
-    "src/__tests__/pair-goal-contract-produce-binding.test.ts",
-    "src/__tests__/pair-goal-context-authority.test.ts",
-    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
-    "src/__tests__/pair-planner-contract-simplify.test.ts",
-    "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-tmpdir-lifecycle.test.ts",
+    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
+    "src/__tests__/tools-security.test.ts",
     "src/__tests__/dev-verification.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
-    "INV_SECRETS_001",
-    "INV_EXEC_001",
-    "INV_REPLAY_001"
+    "INV_SECRETS_001"
   ],
-  "description": "P18.6 LOSSLESS-IDENTITY closure on base cabd25d - final approval-identity correction. Even canonical-statement keys still lost semantics: Vietnamese diacritic stripping merged DISTINCT words (bán vs bàn), punctuation/symbol removal merged currencies ($500 vs €500), dimensions (5% vs 5) and identifiers (C++ vs C#), case folding merged case-sensitive identifiers (US vs us). Replaced with a LOSSLESS fingerprint: issueKeyFor = category + canonical scope lineage (b/o/w/p, ''-normalized, unknown never silently matches) + canonical issue text where canonicalization is ONLY Unicode NFC + whitespace collapse/trim - no lowercase, no diacritic folding, no punctuation/symbol stripping, no token sorting, no stopword removal, no fuzzy matching. Identical issues under identical scope reuse approval (idempotent retries intact); anything not byte-identical requires fresh owner review - paraphrase similarity is never approval evidence. Coverage threads the confirmed revision's analysis scope into issueCoveredBy so cross-scope reviews never cover. Stored approvals with previous key formats fail re-proof closed (no silent migration; resolutions verify re-derives keys against pinned analysis). Adversarial probes: diacritic (bán/bàn, không/khong), currency ($/€/£), dimension (5%/5, 10°C/10C), identifier (C++/C#, node.js), case (US/us, API/api), scope lineage - plus approve->amend->re-preview->confirm positive (whitespace-variant reuse) and negative E2E over the real seam. Prior closures unchanged. Baseline: interpretation ADVISORY only; OFF default; no auto-merge.",
+  "description": "Owner-first V2 UX on base ab0fccf. Governed NL intake: POST /api/v1/intake/draft returns a bounded deterministic draft + advisory semantic evidence (plannerRunId:null → never pinned to a run; provider failure/malformed payload → typed unavailable + manual draft; internals never echoed; only NotFoundError → 404). Commits ONLY via canonical seams — objective → POST /api/vnext/objectives (dedup_key); mission → /app/missions/new?goal= preview/confirm. Provenance per field, explicit confirm, business required, analyze→confirm business drift blocks commit, manual:true skips analyzer, malformed numerics blocked. draft.workstreams is suggestion-only — never persisted, never auto-creates work; copy + confirm dialog + mission handoff state this; e2e proves analyze issues zero canonical writes. Negative/invalid/overflow budget now blocks confirm (finite-but-uncommittable values — incl. usd*1e6 overflow → Infinity → JSON null → ceiling 0 — were silently dropped); only safe-integer microusd reach the canonical body; e2e asserts confirm disabled for -5/1e308/1e13/above-bound and 0/25 arrive exactly. Shell: VN owner nav + Nâng cao disclosure, all legacy routes preserved, dark/light, mobile rail/drawer. Home: canonical aggregates only, scoped reads reset+abort-guarded per business switch, honest —/…/N+ states. ObjectiveDetail: all sections under owner tabs via ?tab= deep links. Audit findings fixed: Home stale-scope race, Intake scope drift + manual honesty + noAuthPrompt + busy + stale banner + malformed analysis + param loss. Evidence: BASE-vs-HEAD Playwright comparison (22 fail-both identical signatures, 0 regression) + real screenshots under docs/ui-v2/evidence/. E2E: ui-v2 12/12; objectives+company+inbox-ceo 68/68. Known env baseline: no qualified planner route → preview/mkMission 409 FAIL_CLOSED_PLANNER_NO_ELIGIBLE (identical at BASE).",
   "risk_override": "HIGH"
 }

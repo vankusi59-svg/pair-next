@@ -76,10 +76,14 @@ test("company with real objectives: header, exact stats, unverified chips", asyn
   // HALT lane: unavailable explanation, never a count
   await expect(page.getByText(/no HALT enumeration exists/)).toBeVisible();
   // no owner-scoped enumeration, no mutations from the page.
-  // company endpoint is read twice: the page itself + the B4 Inbox
-  // badge (proven pending count) — still no unscoped enumeration.
   expect(calls.filter((u) => u.includes("/api/businesses") && !u.includes("/company"))).toEqual([]);
-  expect(calls.filter((u) => u.includes("/api/vnext/businesses/"))).toHaveLength(2);
+  /* Business-scoped vnext reads: page company + B4 Inbox badge +
+     P18.1 ops/relations/duties sections. The invariant is that EVERY
+     vnext call stays bound to the selected business — the exact count
+     evolves with sections, the scope binding does not. */
+  const vnextCalls = calls.filter((u) => u.includes("/api/vnext/businesses/"));
+  expect(vnextCalls.length).toBeGreaterThanOrEqual(2);
+  for (const u of vnextCalls) expect(u).toContain(`/vnext/businesses/${biz.id}`);
 });
 
 test("non-owner business -> DeniedState (FAIL_CLOSED_COMPANY_SCOPE)", async ({ page }) => {

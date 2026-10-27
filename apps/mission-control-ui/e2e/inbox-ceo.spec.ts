@@ -107,9 +107,10 @@ test("inbox: fresh pending reviews render with exact count; terminal stale pins 
   // filter tabs truthful counts: review=7 exact, approval=0 loaded, halt=—
   await expect(page.getByRole("tab", { name: /^review/ })).toContainText("7");
   await expect(page.getByRole("tab", { name: /^approval/ })).toContainText("0");
-  // A2 actions disabled with explicit API_MISSING explanation
-  await expect(page.getByRole("button", { name: "Accept ACHIEVED (A2)" }).first()).toBeDisabled();
-  await expect(page.getByTitle(/API_MISSING — A2/).first()).toBeVisible();
+  // A2: "Accept" is live when a canonical review is pinned (opens the
+  // sign-off dialog); the owner-feedback seam stays honestly disabled.
+  await expect(page.getByRole("button", { name: "Request changes (A2)" }).first()).toBeDisabled();
+  await expect(page.getByTitle(/API_MISSING — owner feedback seam/).first()).toBeVisible();
 });
 
 test("inbox: adversarial terminal+flag row never renders as pending", async ({ page }) => {

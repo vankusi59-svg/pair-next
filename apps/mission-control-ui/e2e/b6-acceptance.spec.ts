@@ -41,11 +41,11 @@ test("b6: every /app deep link loads a real page (no placeholder, no crash)", as
   }
 });
 
-test("b6: /app index lands on Company Cockpit", async ({ page }) => {
+test("b6: /app index lands on the owner home (Tổng quan)", async ({ page }) => {
   await seedSession(page);
   await page.goto("/app");
-  await page.waitForURL("**/app/company");
-  await expect(page.getByRole("heading", { name: /Company Cockpit/i }).first()).toBeVisible();
+  await page.waitForURL("**/app/home");
+  await expect(page.getByRole("heading", { name: /Bạn muốn PairNext thực hiện điều gì/i }).first()).toBeVisible();
 });
 
 test("b6: legacy deep links still work + back/forward across the two trees", async ({ page }) => {
@@ -65,8 +65,9 @@ test("b6: legacy deep links still work + back/forward across the two trees", asy
 test("b6: production default — absent preference redirects mapped legacy routes to /app", async ({ page }) => {
   await seedSession(page);
   // flag absent → production build default applies (import.meta.env.PROD)
+  // UI-V2: / lands on the owner home (Tổng quan), not the company cockpit.
   const pairs: Array<[string, RegExp]> = [
-    ["/", /\/app\/company$/],
+    ["/", /\/app\/home$/],
     ["/missions/new", /\/app\/missions\/new$/],
     ["/approvals", /\/app\/inbox$/],
     ["/schedules", /\/app\/system\/schedules$/],
@@ -86,7 +87,7 @@ test("b6: opt-in redirect ON maps each legacy route to its /app destination (iso
   await seedSession(page);
   await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "app"));
   const pairs: Array<[string, RegExp]> = [
-    ["/", /\/app\/company/],
+    ["/", /\/app\/home/],
     ["/missions/new", /\/app\/missions\/new/],
     ["/approvals", /\/app\/inbox/],
     ["/schedules", /\/app\/system\/schedules/],
@@ -130,7 +131,7 @@ test("b6: flag removal restores production default (no sticky state)", async ({ 
   await seedSession(page);
   await page.goto("/");
   // production build: absent flag already redirects
-  await page.waitForURL(/\/app\/company$/);
+  await page.waitForURL(/\/app\/home$/);
   // explicit rollback, then cleared — next navigation follows the build default
   await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/approvals");
@@ -142,9 +143,9 @@ test("b6: flag removal restores production default (no sticky state)", async ({ 
 
 test("a2: explicit legacy override keeps classic routes accessible after cutover", async ({ page }) => {
   await seedSession(page);
-  // absent flag → production default lands on Company Cockpit
+  // absent flag → production default lands on the owner home
   await page.goto("/");
-  await page.waitForURL(/\/app\/company$/);
+  await page.waitForURL(/\/app\/home$/);
   // owner opts out — flag set via evaluate persists per-origin (an
   // addInitScript would re-seed and defeat mid-session switching)
   await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
@@ -155,7 +156,7 @@ test("a2: explicit legacy override keeps classic routes accessible after cutover
   // Owner can switch forward and roll back again without wiping tokens.
   await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "app"));
   await page.goto("/");
-  await page.waitForURL(/\/app\/company$/);
+  await page.waitForURL(/\/app\/home$/);
   await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/providers");
   await expect(page.getByRole("heading", { name: "Providers & models" })).toBeVisible();

@@ -613,3 +613,72 @@ export interface OperationsOverview {
   };
   [k: string]: unknown;
 }
+
+/* ---- UI-V2 — NL intake draft (advisory, pair.intake-draft.v1) ---- */
+export type IntakeProvenance = "explicit" | "suggested" | "unresolved";
+
+export interface IntakeField<T> {
+  value: T | null;
+  provenance: IntakeProvenance;
+  evidence_item_id: string | null;
+}
+
+export interface IntakeKpi {
+  name: string;
+  direction: "AT_LEAST";
+  target: number | null;
+  unit: string | null;
+  provenance: IntakeProvenance;
+  evidence_item_id: string | null;
+}
+
+export interface IntakeStatement {
+  statement: string;
+  provenance: IntakeProvenance;
+  evidence_item_id: string | null;
+}
+
+export interface IntakeQuestion {
+  item_id: string;
+  statement: string;
+  alternatives: string[];
+}
+
+export interface IntakeDraft {
+  schema_version: "pair.intake-draft.v1";
+  suggested_kind: "objective" | "mission";
+  title: IntakeField<string>;
+  statement: IntakeField<string>;
+  kpis: IntakeKpi[];
+  deadline: IntakeField<string>;
+  budget_hint: IntakeField<string>;
+  budget_ceiling_microusd: IntakeField<number>;
+  currency: IntakeField<string>;
+  hard_constraints: IntakeStatement[];
+  success_conditions: IntakeStatement[];
+  workstreams: IntakeStatement[];
+  questions: IntakeQuestion[];
+}
+
+export interface IntakeItem {
+  id: string;
+  category: string;
+  statement: string;
+  authority: string;
+  confidence: string;
+  source_span: string | null;
+  alternatives?: string[];
+}
+
+export interface IntakeDraftResponse {
+  schema_version: "pair.intake-draft.v1";
+  mode: "off" | "shadow" | "guarded" | string;
+  status: "analyzed" | "unavailable" | "off" | string;
+  unavailable_reason: string | null;
+  analysis_digest: string | null;
+  source_goal_sha: string | null;
+  provider_requests: number;
+  ambiguity_class: string | null;
+  items: IntakeItem[];
+  draft: IntakeDraft;
+}

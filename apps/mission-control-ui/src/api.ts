@@ -67,7 +67,8 @@ export const api = {
   health: () => req<Record<string, unknown>>("/health"),
   metrics: () => req<Record<string, unknown>>("/metrics"),
   projects: () => req<Array<Record<string, unknown>>>("/projects"),
-  missions: () => req<{ missions: import("./types").Mission[] }>("/missions"),
+  missions: (opts?: { noAuthPrompt?: boolean }) =>
+    req<{ missions: import("./types").Mission[] }>("/missions", undefined, opts),
   missionDetail: (id: string) => req<import("./types").MissionDetail>(`/missions/${id}`),
   missionDag: (id: string) => req<import("./types").Dag>(`/missions/${id}/dag`),
   timeline: (id: string) => req<import("./types").TimelineEntry[]>(`/missions/${id}/timeline`),
@@ -136,9 +137,11 @@ export const api = {
     }),
   businesses: () => req<{ businesses: Array<Record<string, unknown>> }>("/businesses"),
   // P15.7 — canonical vnext objectives (P15.1 authority)
-  vnextObjectives: (businessId?: string) =>
+  vnextObjectives: (businessId?: string, opts?: { noAuthPrompt?: boolean }) =>
     req<{ objectives: import("./types").CanonicalObjective[] }>(
       `/vnext/objectives${businessId ? `?business_id=${encodeURIComponent(businessId)}` : ""}`,
+      undefined,
+      opts,
     ),
   vnextObjective: (id: string) => req<import("./types").CanonicalObjective>(`/vnext/objectives/${id}`),
   createVnextObjective: (input: import("./types").VnextObjectiveInput) =>
@@ -146,6 +149,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  /* UI-V2 — governed NL intake draft (advisory). Returns the bounded
+     interpretation evidence + deterministic non-authoritative draft;
+     nothing canonical is created server-side. */
+  intakeDraft: (input: { goal: string; business_id?: string | null; project_id?: string | null; manual?: boolean }) =>
+    req<import("./app/types").IntakeDraftResponse>("/v1/intake/draft", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, { noAuthPrompt: true }),
   runCeoCycle: (id: string) =>
     req<import("./types").OperatingPassResult>(`/vnext/objectives/${id}/ceo-cycle`, {
       method: "POST",

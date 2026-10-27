@@ -12,12 +12,16 @@ test("/app/company renders new shell + honest no-business state", async ({ page 
   await expect(page.getByRole("heading", { name: "Company Cockpit" })).toBeVisible();
   await expect(page.locator(".pstate .t")).toHaveText("No business selected");
   // sidebar groups + links per B.3
-  for (const g of ["Overview", "Business", "Operations", "System"]) {
-    await expect(page.locator(".anav .group", { hasText: g })).toBeVisible();
+  /* UI-V2 owner-first nav: the five owner destinations are always
+     visible (VN labels); advanced routes sit behind the "Nâng cao"
+     disclosure and stay reachable once expanded. */
+  for (const l of ["Tổng quan", "Mục tiêu", "Công việc", "Phê duyệt", "Nhân sự AI"]) {
+    await expect(page.locator(".anav").getByRole("link", { name: l, exact: true })).toBeVisible();
   }
+  await page.locator(".anav .advtoggle").click();
   for (const l of [
-    "Company Cockpit", "Owner Inbox", "Objectives", "CEO Workspace",
-    "Workforce", "Workforce Admin", "Missions", "Chat", "Business Admin",
+    "Company Cockpit", "CEO Workspace", "Workforce Admin",
+    "Chat", "Business Admin",
   ]) {
     await expect(page.locator(".anav").getByRole("link", { name: l, exact: true })).toBeVisible();
   }
@@ -90,8 +94,8 @@ test("tablet: icon rail links have accessible names + topbar switcher", async ({
   await expect(page.locator(".aside")).toBeVisible();
   await expect(page.locator(".aside .bizswitch")).toBeHidden();
   // icon-rail links keep accessible names even with .lbl hidden
-  const obj = page.locator(".aside .anav a", { hasText: "Objectives" });
-  await expect(page.getByRole("link", { name: "Objectives" }).first()).toHaveAttribute("title", "Objectives");
+  const obj = page.locator(".aside .anav a", { hasText: "Mục tiêu" });
+  await expect(page.getByRole("link", { name: "Mục tiêu" }).first()).toHaveAttribute("title", "Mục tiêu");
   await obj.first().click();
   await expect(page).toHaveURL(/\/app\/objectives$/);
   // topbar switcher works on tablet
@@ -204,7 +208,7 @@ test("keyboard: skip link + nav landmarks focusable", async ({ page }) => {
   await page.goto("/app/company");
   await page.keyboard.press("Tab");
   await expect(page.getByRole("link", { name: "Skip to content" })).toBeFocused();
-  await page.getByRole("link", { name: "Objectives" }).first().focus();
+  await page.getByRole("link", { name: "Mục tiêu" }).first().focus();
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/app\/objectives/);
 });
