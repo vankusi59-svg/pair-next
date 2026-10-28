@@ -13,7 +13,7 @@ const src = readFileSync(SCRIPT, "utf8");
 
 /** The server env block feeding serve-mission-control.mjs. */
 const serveBlock = src.match(
-  /PAIR_MC_DIR[\s\S]*?nohup node scripts\/serve-mission-control\.mjs/,
+  /PAIR_MC_DIR="\$MC_DIR"[\s\S]*?nohup node scripts\/serve-mission-control\.mjs/,
 );
 
 describe("start-pair-live.sh — governed runtime flag pins", () => {
