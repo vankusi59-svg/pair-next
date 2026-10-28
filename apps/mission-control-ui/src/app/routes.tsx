@@ -1,5 +1,6 @@
 import { Navigate } from "react-router-dom";
 import { AppShell } from "./AppShell";
+import { SessionGate } from "./SessionGate";
 import { Home } from "./pages/Home";
 import { Intake } from "./pages/Intake";
 import { Company } from "./pages/Company";
@@ -28,7 +29,7 @@ import { SystemSettings } from "./pages/SystemSettings";
 
 export const appRoute = {
   path: "/app",
-  element: <AppShell />,
+  element: <SessionGate><AppShell /></SessionGate>,
   children: [
     {
       index: true,

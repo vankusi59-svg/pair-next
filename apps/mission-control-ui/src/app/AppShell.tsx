@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { getOperatorId } from "../api";
+import { eligibleBusinesses, hasPersonalSession, personalSessionInfo, setSessionBusiness } from "../session";
 import { useTheme } from "../lib/useTheme";
 import { api } from "../api";
 import { Toasts } from "../components/Toast";
@@ -94,6 +95,17 @@ function BusinessSwitcher() {
   const { biz, select } = useSelectedBusiness();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(biz);
+  /* Personal Mode — the server-verified eligible list (owner owns ≥1
+     objective) renders as one-click options; manual entry stays as the
+     fallback for anything the scoped read can't enumerate. */
+  const eligible = hasPersonalSession() ? eligibleBusinesses() : [];
+  const commit = (id: string) => {
+    select(id);
+    if (hasPersonalSession() && id !== biz) {
+      void setSessionBusiness(id).catch(() => undefined);
+    }
+    setOpen(false);
+  };
   return (
     <div className="bizswitch">
       <button
@@ -110,24 +122,42 @@ function BusinessSwitcher() {
         <span aria-hidden>▾</span>
       </button>
       {open ? (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            select(draft);
-            setOpen(false);
-          }}
-        >
-          <input
-            aria-label="business id"
-            placeholder="business_id"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-          />
-          <button className="tbtn" type="submit">Use</button>
-        </form>
+        <div>
+          {eligible.length ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 6 }}>
+              {eligible.map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  className="tbtn"
+                  style={{ textAlign: "left", fontWeight: id === biz ? 600 : 400 }}
+                  onClick={() => commit(id)}
+                >
+                  {id}{id === biz ? " ✓" : ""}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              commit(draft);
+            }}
+          >
+            <input
+              aria-label="business id"
+              placeholder="business_id"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+            />
+            <button className="tbtn" type="submit">Use</button>
+          </form>
+        </div>
       ) : null}
       <div className="hint">
-        Enter a business_id manually — access is proven on read (403 = denied).
+        {eligible.length
+          ? "Business đã xác minh theo quyền sở hữu — chọn hoặc nhập business_id."
+          : "Enter a business_id manually — access is proven on read (403 = denied)."}
       </div>
     </div>
   );
@@ -135,17 +165,19 @@ function BusinessSwitcher() {
 
 function OperatorChip() {
   /* B5.5 Settings E2 — the chip reflects a saved operator id immediately,
-     not just on next mount. */
-  const [op, setOp] = useState(getOperatorId);
+     not just on next mount. Personal Mode: the server-pinned session
+     owner is the display source — a friendly name, never raw header text. */
+  const [op, setOp] = useState(() => personalSessionInfo()?.operator ?? getOperatorId());
   useEffect(() => {
-    const sync = () => setOp(getOperatorId());
+    const sync = () => setOp(personalSessionInfo()?.operator ?? getOperatorId());
     window.addEventListener("pair.operator-changed", sync);
     return () => window.removeEventListener("pair.operator-changed", sync);
   }, []);
-  const label = op || "no operator";
-  const initials = (op.replace(/^operator:/, "").slice(0, 2) || "?").toUpperCase();
+  const bare = op.replace(/^operator:/, "");
+  const label = bare || "no operator";
+  const initials = (bare.slice(0, 2) || "?").toUpperCase();
   return (
-    <span className="opchip" title={`operator: ${label}`}>
+    <span className="opchip" title={`operator: ${op || "none"}${hasPersonalSession() ? " (personal mode)" : ""}`}>
       <span className="av" aria-hidden>{initials}</span>
       <span className="name">{label}</span>
     </span>

@@ -133,6 +133,8 @@ import {
   digest,
   utcnow,
   resolveMcAdminToken,
+  PersonalSessionService,
+  personalMode,
   PlanningContextService,
   BrainContextService,
   renderPlanningContextBlock,
@@ -1860,7 +1862,42 @@ const driveReplanGenerations = () => {
   );
 };
 const uiDir = process.env.PAIR_MC_UI_DIR ?? path.join(root, "apps/mission-control-ui/dist");
-const server = createMissionControlServer({
+// Personal Mode (opt-in PAIR_PERSONAL_MODE=local): a server-managed
+// same-origin session for the trusted local dashboard. The session lane
+// exists ONLY on the loopback listener (PAIR_MC_PORT) — remote/tunnel
+// ingress runs on the separate PAIR_MC_REMOTE_PORT listener, which can
+// never mint or consume a personal session. Ownership binds to the
+// canonical owner_authority_id set read through strictEnumerate —
+// ambiguous deployments get one explicit owner selection, never a
+// silent merge. PAIR_PERSONAL_MODE unset/off → byte-identical legacy
+// single-listener behavior (rollback needs no data migration).
+const personalModeOn = personalMode() === "local";
+const port = Number(process.env.PAIR_MC_PORT ?? 8788);
+const personalRemotePort = Number(process.env.PAIR_MC_REMOTE_PORT ?? 8790);
+if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+  throw new IntegrityError("FAIL_CLOSED_PORT", `PAIR_MC_PORT=${process.env.PAIR_MC_PORT}`);
+}
+if (personalModeOn && (!Number.isSafeInteger(personalRemotePort) || personalRemotePort < 1 || personalRemotePort > 65535 || personalRemotePort === port)) {
+  throw new IntegrityError("FAIL_CLOSED_PORT", `PAIR_MC_REMOTE_PORT=${process.env.PAIR_MC_REMOTE_PORT} must differ from PAIR_MC_PORT`);
+}
+const personalSessionSvc = personalModeOn
+  ? new PersonalSessionService({
+      store,
+      listOwnerIds: () =>
+        business.objectives.strictEnumerate().map((o) => String(o.owner_authority_id)),
+      eligibleBusinesses: (operator) =>
+        [...new Set(
+          business.objectives
+            .strictEnumerate()
+            .filter((o) => String(o.owner_authority_id) === operator)
+            .map((o) => String(o.business_id)),
+        )].sort(),
+    })
+  : null;
+if (personalModeOn) {
+  console.log(`PERSONAL_MODE: local — session lane on loopback :${port} only; remote ingress on :${personalRemotePort}`);
+}
+const serverDeps = {
   control,
   staticDir: fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : undefined,
   planExpander,
@@ -1898,6 +1935,9 @@ const server = createMissionControlServer({
   // always on; entities live in the canonical store alongside missions.
   business,
   workforce,
+  // Personal Mode — absent when PAIR_PERSONAL_MODE is unset/off, so the
+  // /api/personal/* lane never exists in legacy deployments.
+  personal: personalSessionSvc ? { service: personalSessionSvc, localPort: port } : undefined,
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
@@ -1943,11 +1983,27 @@ const server = createMissionControlServer({
     // P16-D — verified read-grant management (mint/control/status).
     readGrants: conversationReadGrants,
   },
-});
-const port = Number(process.env.PAIR_MC_PORT ?? 8788);
-server.listen(port, () => {
-  console.log(`PAIR Mission Control on http://localhost:${port} (ui=${fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : "legacy"})`);
-});
+};
+// Personal Mode ON → the privileged loopback listener serves
+// session-capable local ingress only; a SECOND server (same factory,
+// same deps — req.socket.localPort is the classification truth) takes
+// remote/tunnel/LAN traffic on PAIR_MC_REMOTE_PORT with the unchanged
+// bearer gate. Mode OFF → exactly the legacy single all-interfaces
+// listener.
+const server = createMissionControlServer(serverDeps);
+if (personalModeOn) {
+  const remoteServer = createMissionControlServer(serverDeps);
+  server.listen(port, "127.0.0.1", () => {
+    console.log(`PAIR Mission Control LOCAL on http://localhost:${port} (personal-mode session lane)`);
+  });
+  remoteServer.listen(personalRemotePort, () => {
+    console.log(`PAIR Mission Control REMOTE on :${personalRemotePort} (bearer-only ingress)`);
+  });
+} else {
+  server.listen(port, () => {
+    console.log(`PAIR Mission Control on http://localhost:${port} (ui=${fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : "legacy"})`);
+  });
+}
 setInterval(() => {
   sup.tick();
   // fire due cron schedules through canonical submit, expanding each goal

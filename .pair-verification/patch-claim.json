@@ -1,21 +1,18 @@
 {
-  "claim_id": "PROHIBITION_PHRASE_BINDING_RETRY_EPOCH",
-  "title": "Prohibitions enforce connector-delimited object phrases (VI fix); scheduler retry budget scoped to policy generation",
+  "claim_id": "PERSONAL_MODE_SESSION_LANE_SPLIT_INGRESS",
+  "title": "Opt-in Personal Mode: server-managed session cookie on a loopback-only lane; remote/tunnel ingress on a separate bearer-only listener",
   "affected_surfaces": [
-    "PLANNER",
-    "BUSINESS_OBJECTIVE"
+    "MISSION_CONTROL",
+    "UI",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-prohibition-phrase-binding.test.ts",
-    "src/__tests__/pair-prv2b-prohibition-narrowing.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts",
-    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
-    "src/__tests__/pair-semantic-adversarial.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts"
+    "src/__tests__/pair-personal-session.test.ts",
+    "src/__tests__/pair-live-stack-flags.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001"
+    "INV_SECRETS_001"
   ],
-  "description": "Production failure: term-only prohibition enforcement OR-matched every extracted token, so Vietnamese bans (e.g. 'không được hứa lợi nhuận hoặc tư vấn tài chính' -> hứa/lợi/nhuận/vấn/tài/chính) poisoned every plan via common words (tài liệu, vấn đề, quá trình), exhausting planner retries and wedging the objective in BLOCKED_RETRY_EXHAUSTED. Fix A: GoalRequirement gains `phrases` — object groups split on OBJECT_LIST_JOINERS (và/hoặc/and/or plus hay/với/cùng/cũng/kèm/như/nor/with/plus/along — independent audit caught that narrower splitting merged banned objects into unmatchable mega-phrases, failing open); plan-coverage enforces phrase-granular matching (phraseMatchSpans with bounded function-word gaps) in both the action-gated and term-only branches, with bounded NEGATION_WINDOW suppression extended to term-only and exemption words miễn/ngoài removed from the marker set (they suppress real acts: 'miễn phí tư vấn tài chính' is still consulting). `terms` minting, the TELEGRAM capability gate, and all scope/segment semantics are unchanged. Fix B: the scheduler retry budget is scoped to the policy generation — accountWake/observe reset retry_count only when binding a NEW policy_version, so the existing owner disable→configure→enable recovery restarts the budget; unchanged bindings never reset it (B09/C16/R4 semantics preserved). No new actions, routes, or schema migrations (the additive `phrases` field lands in contractDigest deterministically). Deterministic, append-only, no model calls.",
+  "description": "Personal Mode (opt-in PAIR_PERSONAL_MODE=local) delivers zero-friction local dashboard access without weakening authority. (1) personal-session.ts mints durable digest-persisted sessions bound to the canonical owner: auto-bind with one owner, explicit one-time selection across multiple owners, fresh operator:personal:<id> only when zero exist — never a silent merge; business eligibility is owner-scoped, stale preferences drop. (2) mission-control-server.ts adds the /api/personal/* lane (status/bootstrap/select-owner/business/logout) exempt from the MC gate but self-guarded by ingress classification + Origin proof on every mutation; a session cookie satisfies operator-class auth for other /api/* routes only on local ingress, pins the operator (conflicting x-operator-id fails closed 403), never satisfies admin/broker/outbox/artifact lanes. (3) classifyPersonalIngress requires the declared local listener port + loopback peer + loopback Host + zero proxy marks — Host spoof, DNS rebinding and proxied traffic classify remote. (4) serve-mission-control.mjs runs dual listeners when enabled (loopback session lane on PAIR_MC_PORT; bearer-only remote ingress on PAIR_MC_REMOTE_PORT); mode OFF keeps the legacy single listener byte-identical. (5) start-pair-live.sh routes cloudflared to the REMOTE port when enabled — the privileged lane is never tunneled. (6) UI-V2: SessionGate bootstraps before /app/* renders (zero prompts), session.ts owns personal calls, cookie-authed SSE (no ?token= under a session), eligible-business picker + auto-restore, connected-state Settings (token behind Advanced), operator chip bound to canonical owner. Live evidence: bootstrap bound operator:op:admin with eligible BIZ_01M5XNM908B9A18ZJ5MB7ZVCY7; cookie read 6 objectives; operator conflict 403; remote rejected cookie 401 + bootstrap 403; Host spoof 403; logout revoked; re-bootstrap auto-restored business; tunnel targeted :8790. Rollback: unset/off yields identical legacy bearer behavior.",
   "risk_override": "HIGH"
 }

@@ -26,6 +26,15 @@ import type { ConversationReadGrantService } from "./conversation-read-grant.js"
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
 import { classifyRequestCredential } from "./operational-query.js";
 import {
+  PersonalSessionService,
+  classifyPersonalIngress,
+  assertPersonalOrigin,
+  parsePersonalCookie,
+  mintSessionCookie,
+  clearSessionCookie,
+  type PersonalSessionInfo,
+} from "./personal-session.js";
+import {
   approveGoalIntentItems,
   GOAL_INTENT_APPROVAL_ENTITY,
   semanticMode,
@@ -187,6 +196,18 @@ export interface MissionControlServerDeps {
      *  surface. Absent → /api/conversations/read-grants* 404s and every
      *  non-admin principal stays UNVERIFIED_IDENTITY (default-deny). */
     readGrants?: ConversationReadGrantService;
+  };
+  /** Personal Mode (opt-in PAIR_PERSONAL_MODE=local): a server-managed
+   *  same-origin session bound to the canonical owner. Present only
+   *  when the deployment opted in AND the caller's socket arrived on
+   *  the designated loopback listener — a valid session cookie then
+   *  satisfies the GENERAL operator gate only: never the admin, broker,
+   *  outbox or artifact lanes, never a remote-class request. */
+  personal?: {
+    service: PersonalSessionService;
+    /** The loopback listener port — session authority exists only for
+     *  sockets classified `local` against it. */
+    localPort: number;
   };
 }
 
@@ -566,6 +587,21 @@ export function createMissionControlServer(
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
     const isBrokerFetch = method === "POST" && p === "/api/broker/fetch";
     const isArtifactFetch = method === "POST" && p === "/api/artifacts/fetch";
+    // Personal Mode — the /api/personal/* lane is exempt from the MC
+    // gate below (its own ingress/origin checks are the authority) and
+    // a VALID session cookie on the local ingress satisfies the general
+    // operator class for every other /api/* route. Session authority is
+    // evaluated BEFORE the gate so an absent bearer + valid local
+    // session never reaches the 401 path; remote-class requests always
+    // get null regardless of any cookie they present.
+    const isPersonalRoute = p.startsWith("/api/personal/");
+    const personalIngress = deps.personal
+      ? classifyPersonalIngress(req, deps.personal.localPort)
+      : "remote";
+    const personalSession: PersonalSessionInfo | null =
+      deps.personal && personalIngress === "local"
+        ? deps.personal.service.authenticate(parsePersonalCookie(req))
+        : null;
     const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     const queryToken = url.searchParams.get("token") ?? "";
     // Phase 1 R1 — credential classification. The admin credential is
@@ -597,22 +633,130 @@ export function createMissionControlServer(
           // P16-D — by-id grant status is operational-status authority too;
           // without it the admin credential 401s on a route it mints into.
           /^\/api\/conversations\/read-grants(\/|$)/.test(p)));
-    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch) {
+    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch && !isPersonalRoute) {
       // The MC token remains the general API credential. The admin
       // token unlocks ONLY the operational-status boundary — every
       // other route (credentials, missions, budgets, config, drafts,
-      // confirms) still requires the MC token.
-      if (!mcAuthenticated && !(adminBearer && adminBoundary)) {
+      // confirms) still requires the MC token. A valid personal
+      // session on the LOCAL ingress is an operator-class credential —
+      // it can never satisfy admin-only, broker, outbox or artifact
+      // lanes (those authenticate their own tokens independently of
+      // this gate).
+      if (!mcAuthenticated && !(adminBearer && adminBoundary) && !personalSession) {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "UNAUTHORIZED_MC_TOKEN" }));
         return;
       }
     }
-    const operator =
+    let operator =
       String(req.headers["x-operator-id"] ?? "") ||
       String(body.operator_id ?? "") ||
       undefined;
+    // Personal Mode — the pinned session operator is the ONLY identity
+    // authority on a session-authenticated request. A conflicting
+    // client-declared identity (header or body) fails closed rather
+    // than silently overriding the binding.
+    if (personalSession) {
+      if (
+        operator &&
+        canonicalOperatorActor(operator, p) !== personalSession.operator
+      ) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          error: "FAIL_CLOSED_PERSONAL_OPERATOR_CONFLICT",
+          detail: "client operator id conflicts with the pinned personal-session owner",
+        }));
+        return;
+      }
+      operator = personalSession.operator;
+    }
     try {
+      // ---- Personal Mode session lane ------------------------------------
+      // Exempted from the MC gate above; every route here self-guards
+      // with ingress classification + origin proof. These routes exist
+      // only when the deployment opted in (deps.personal set).
+      if (isPersonalRoute) {
+        if (!deps.personal) {
+          return void json(res, 404, { error: "PERSONAL_MODE_DISABLED" });
+        }
+        const svc = deps.personal.service;
+        const cookieSession = parsePersonalCookie(req);
+        const isSecure = Boolean((req.socket as { encrypted?: boolean }).encrypted);
+        if (method === "GET" && p === "/api/personal/session") {
+          return void json(res, 200, svc.status(personalIngress, cookieSession));
+        }
+        // Every personal POST proves browser-origin intent before any
+        // state change — a cross-site browser send can never mint,
+        // select, rebind or revoke.
+        if (method === "POST") {
+          assertPersonalOrigin(req);
+        }
+        if (method === "POST" && p === "/api/personal/session/bootstrap") {
+          if (personalIngress !== "local") {
+            return void json(res, 403, {
+              error: "FAIL_CLOSED_PERSONAL_INGRESS",
+              detail: "personal session minting requires the loopback listener",
+            });
+          }
+          const r = svc.bootstrap();
+          if (r.needs_owner_selection) {
+            return void json(res, 409, {
+              error: "PERSONAL_OWNER_SELECTION_REQUIRED",
+              needs_owner_selection: true,
+              owner_candidates: r.candidates,
+            });
+          }
+          res.setHeader("set-cookie", mintSessionCookie(r.sessionId!, isSecure));
+          return void json(res, 200, {
+            personal_mode: true,
+            ingress: "local",
+            session: r.info,
+            eligible_businesses: svc.status("local", r.sessionId).eligible_businesses,
+          });
+        }
+        if (method === "POST" && p === "/api/personal/session/select-owner") {
+          if (personalIngress !== "local") {
+            return void json(res, 403, { error: "FAIL_CLOSED_PERSONAL_INGRESS" });
+          }
+          const owner = typeof body.owner === "string" ? body.owner.trim() : "";
+          if (!owner) {
+            return void json(res, 400, { error: "FAIL_CLOSED_PERSONAL_OWNER" });
+          }
+          const r = svc.selectOwner(owner);
+          res.setHeader("set-cookie", mintSessionCookie(r.sessionId, isSecure));
+          return void json(res, 200, {
+            personal_mode: true,
+            ingress: "local",
+            session: r.info,
+          });
+        }
+        if (method === "POST" && p === "/api/personal/session/business") {
+          if (!svc.authenticate(cookieSession)) {
+            return void json(res, 401, { error: "FAIL_CLOSED_PERSONAL_SESSION" });
+          }
+          const businessId = typeof body.business_id === "string" ? body.business_id : "";
+          const sess = svc.setBusiness(cookieSession, businessId);
+          return void json(res, 200, { session: sess });
+        }
+        if (method === "POST" && p === "/api/personal/session/logout") {
+          svc.revoke(cookieSession);
+          res.setHeader("set-cookie", clearSessionCookie());
+          return void json(res, 200, { revoked: true });
+        }
+        return void json(res, 404, { error: "NOT_FOUND" });
+      }
+      // Session-authenticated mutations: SameSite=Strict already blocks
+      // cross-site cookie sends; Origin/Sec-Fetch-Site proof adds the
+      // explicit CSRF boundary the mission requires. Bearer-authenticated
+      // requests are exempt — bearer is not an ambient credential.
+      if (
+        personalSession &&
+        method !== "GET" &&
+        method !== "HEAD" &&
+        method !== "OPTIONS"
+      ) {
+        assertPersonalOrigin(req);
+      }
       // ---- read models ----------------------------------------------------
       if (method === "GET" && (p === "/" || p === "/ui")) {
         if (tryStatic(deps.staticDir, p, res)) return;
@@ -2947,7 +3091,12 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_RELATION_AUTHORITY" ||
         e.code === "FAIL_CLOSED_RELATION_BUSINESS" ||
         e.code === "FAIL_CLOSED_DUTY_AUTHORITY" ||
-        e.code === "FAIL_CLOSED_DUTY_BUSINESS" ? 403
+        e.code === "FAIL_CLOSED_DUTY_BUSINESS" ||
+        e.code === "FAIL_CLOSED_PERSONAL_INGRESS" ||
+        e.code === "FAIL_CLOSED_PERSONAL_ORIGIN" ||
+        e.code === "FAIL_CLOSED_PERSONAL_OPERATOR_CONFLICT" ||
+        e.code === "FAIL_CLOSED_PERSONAL_BUSINESS" ? 403
+        : e.code === "FAIL_CLOSED_PERSONAL_SESSION" ? 401
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;

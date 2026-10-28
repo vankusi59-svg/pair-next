@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { apiAdmin, getAuthToken, setAuthToken, getOperatorId, setOperatorId } from "../../api";
+import { hasPersonalSession, personalSessionInfo, logoutPersonal } from "../../session";
 import { reconnectStream, useLiveRefresh } from "../../hooks/eventBus";
 import { useApi } from "../../hooks/useApi";
 import { useTheme } from "../../lib/useTheme";
@@ -21,6 +22,10 @@ export function SystemSettings() {
   const [theme, toggleTheme] = useTheme();
   const [confirmClear, setConfirmClear] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  /* Personal Mode — a server-managed session owns the credential; the
+     manual token/operator fields move behind an explicit advanced
+     disclosure (rollback/remote flows keep working there). */
+  const personal = hasPersonalSession() ? personalSessionInfo() : null;
 
   const saveToken = () => {
     if (!tok.trim()) return;
@@ -72,6 +77,45 @@ export function SystemSettings() {
 
       {note ? <div className="state" role="status" style={{ padding: 8, border: "1px solid var(--line)", borderRadius: 8 }}>{note}</div> : null}
 
+      {personal ? (
+        <section className="need" aria-label="system connection">
+          <h2>Kết nối hệ thống</h2>
+          <div className="nrow">
+            <span className="tt">Trạng thái</span>
+            <StatusBadge tone="ok" label="Đã kết nối" />
+          </div>
+          <div className="nrow">
+            <span className="tt">Người vận hành</span>
+            <code>{personal.operator}</code>
+          </div>
+          <div className="nrow">
+            <span className="tt">Chế độ</span>
+            <StatusBadge tone="info" label="Máy cá nhân (local)" />
+          </div>
+          <p className="sub srcnote">
+            Phiên đăng nhập do server quản lý trên listener loopback — không cần token hay Operator ID.
+            Phiên hết hạn lúc <code>{personal.expires_at}</code>; tự gia hạn khi mở lại PairNext.
+          </p>
+          <div className="row" style={{ gap: 8 }}>
+            <button
+              className="danger"
+              onClick={() => {
+                void logoutPersonal().then(() => {
+                  setNote("Đã đăng xuất phiên cá nhân — tải lại trang sẽ tạo phiên mới.");
+                });
+              }}
+            >
+              Đăng xuất phiên…
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      <details className="need" aria-label="advanced credentials" {...(personal ? {} : { open: true })}>
+        <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+          {personal ? "Nâng cao — token thủ công (truy cập từ xa / khôi phục)" : "Session token"}
+        </summary>
+
       <section className="need" aria-label="session token">
         <h2>Session token</h2>
         <div className="nrow">
@@ -115,6 +159,7 @@ export function SystemSettings() {
           the shell operator chip. Not proof of authorization: the backend decides per request.
         </p>
       </section>
+      </details>
 
       <section className="need" aria-label="theme">
         <h2>Theme</h2>
