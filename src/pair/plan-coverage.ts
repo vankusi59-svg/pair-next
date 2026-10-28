@@ -417,16 +417,6 @@ const FILE_COUNT_UNITS = new Set([
 /* prohibition enforcement — action-gated, object-scoped                */
 /* ------------------------------------------------------------------ */
 
-/** A prohibited term matches only as a whole token — "cap" inside
- *  "capacity" or "cat" inside "concatenate" is never evidence. */
-function termHit(instr: string, term: string): boolean {
-  const re = new RegExp(
-    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
-    "iu",
-  );
-  return re.test(instr);
-}
-
 /** Negation markers bounded to ≤2 word tokens before the verb —
  *  "avoid using" / "không sử dụng" declares compliance, never performs
  *  the act. R1 — scope is strict: only whitespace separates tokens, so
@@ -435,7 +425,7 @@ function termHit(instr: string, term: string): boolean {
  *  then use martingale" never suppresses the real `use`. On ambiguity
  *  the match stays live — suppression can never fail-open. */
 const NEGATION_WINDOW_RE =
-  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|miễn|cấm|ngoài)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
+  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|cấm)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
 
 /* ------------------------------------------------------------------ */
 /* R2 — segment-local action↔object association                         */
@@ -479,6 +469,54 @@ function termMatchSpans(
   return out;
 }
 
+/** Function words allowed between phrase tokens — a prohibited
+ *  multi-word object stays matched when only grammatical glue
+ *  separates its terms ("tư vấn và tài chính" hits the
+ *  `tư vấn tài chính` ban; "vấn đề tài liệu" never does). CONTENT
+ *  WORDS MUST NEVER ENTER THIS SET — a verb/noun gap would bridge
+ *  unrelated terms back into the ban (`lợi dụng nhuận` must not
+ *  satisfy `lợi nhuận`). */
+const PHRASE_GAP_WORDS = new Set([
+  "the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "any",
+  "all", "some", "my", "your", "its",
+  "và", "vào", "của", "về", "cho", "một", "các", "những", "bất", "kỳ",
+  "mỗi", "ở", "tại", "theo", "như", "là", "được", "trong", "từ",
+  "bằng", "để",
+  "and", "or", "hoặc",
+]);
+
+/** Every boundary match of a prohibited OBJECT PHRASE with position.
+ *  Single-token phrases degenerate to termMatchSpans (bit-identical
+ *  with the old term-only check). Multi-token phrases require the
+ *  tokens in order, joined only by separators and PHRASE_GAP_WORDS —
+ *  "hứa lợi nhuận" hits; "nhuận cao" or a lone "tài" never does. */
+function phraseMatchSpans(
+  instr: string,
+  phrase: string,
+): Array<[number, number]> {
+  const tokens = phrase
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return [];
+  if (tokens.length === 1) return termMatchSpans(instr, tokens[0]);
+  const gap = "[\\s,;:—–]+";
+  const gapWord = `(?:${[...PHRASE_GAP_WORDS]
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")})`;
+  const joiner = `${gap}(?:(?:${gapWord})${gap})*`;
+  const pattern =
+    `(?<![\\p{L}\\p{N}])${tokens
+      .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join(joiner)}(?![\\p{L}\\p{N}])`;
+  const re = new RegExp(pattern, "giu");
+  const out: Array<[number, number]> = [];
+  for (const m of instr.matchAll(re)) {
+    out.push([m.index, m.index + m[0].length]);
+  }
+  return out;
+}
+
 /** Passive auxiliaries before the action flip the object to the
  *  LEFT of the verb: "report.md was deleted" / "report.md sẽ bị xóa".
  *  Bounded — aux + at most one intervening token, whitespace-only. */
@@ -497,7 +535,7 @@ const PASSIVE_AUX_RE =
 function taskShowsProhibitedAct(
   instr: string,
   classes: Set<string>,
-  terms: string[],
+  objects: string[],
 ): { cls: string; term: string | null } | null {
   const hits: Array<{ cls: string; start: number; end: number; negated: boolean }> = [];
   for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
@@ -516,14 +554,14 @@ function taskShowsProhibitedAct(
   hits.sort((a, b) => a.start - b.start || b.end - a.end);
   const acts0 = hits.filter((h) => classes.has(h.cls) && !h.negated);
   if (!acts0.length) return null;
-  if (!terms.length) return { cls: acts0[0].cls, term: null };
+  if (!objects.length) return { cls: acts0[0].cls, term: null };
   // An action-looking token inside a prohibited filename ("write.txt"
   // under a delete ban on write.txt) is the OBJECT, not an action and
   // not a scope boundary: drop hits overlapping term spans that sit in
   // a dotted filename context (`term.ext`).
   const objectSpans: Array<[number, number]> = [];
-  for (const term of terms) {
-    for (const [ts, te] of termMatchSpans(instr, term)) {
+  for (const term of objects) {
+    for (const [ts, te] of phraseMatchSpans(instr, term)) {
       if (instr[te] === "." && /[\p{L}\p{N}]/u.test(instr[te + 1] ?? "")) {
         objectSpans.push([ts, te]);
       }
@@ -551,8 +589,8 @@ function taskShowsProhibitedAct(
     const [os, oe] = passive
       ? [prev ? prev.end : seg[0], a.start]
       : [a.end, next ? next.start : seg[1]];
-    for (const term of terms) {
-      for (const [ts, te] of termMatchSpans(instr, term)) {
+    for (const term of objects) {
+      for (const [ts, te] of phraseMatchSpans(instr, term)) {
         if (ts >= os && te <= oe) return { cls: a.cls, term };
       }
     }
@@ -876,6 +914,12 @@ export function assertPlanCoverage(
   }
   for (const req of contract.prohibitions) {
     const terms = req.terms ?? [];
+    // Phrase-granular enforcement: `phrases` (connector-delimited
+    // object groups) is the semantic matching unit — a single token
+    // inside it is never enough. Single-token phrases degenerate to
+    // the old term-only check. Older contracts without `phrases`
+    // keep enforcing `terms` unchanged.
+    const objects = req.phrases?.length ? req.phrases : terms;
     const classes = new Set(req.actionClass ?? []);
     for (const t of work) {
       const instr = String(t.task_instruction ?? "");
@@ -893,7 +937,7 @@ export function assertPlanCoverage(
         // instruction segment — mentioning the object elsewhere or
         // performing the action on a different object is not the act.
         // A ban with no object terms forbids the action class outright.
-        const act = taskShowsProhibitedAct(instr, classes, terms);
+        const act = taskShowsProhibitedAct(instr, classes, objects);
         if (act) {
           violated(
             req,
@@ -903,11 +947,17 @@ export function assertPlanCoverage(
           );
         }
       } else {
-        // No identifiable action — term-only enforcement (boundary
-        // match, fail-closed for unparseable prohibition shapes).
-        for (const term of terms) {
-          if (termHit(instr, term)) {
-            violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+        // No identifiable action — phrase-granular enforcement: the
+        // prohibited object must be invoked as its minted phrase
+        // (boundary match, fail-closed for unparseable shapes). A
+        // negated mention ("đảm bảo không hứa lợi nhuận") declares
+        // compliance, never performs the act — same bounded
+        // suppression as the action path.
+        for (const ph of objects) {
+          for (const [ps] of phraseMatchSpans(instr, ph)) {
+            const before = instr.slice(Math.max(0, ps - 48), ps);
+            if (NEGATION_WINDOW_RE.test(before)) continue;
+            violated(req, `task ${String(t.task_key)} invokes prohibited phrase "${ph}"`);
           }
         }
       }

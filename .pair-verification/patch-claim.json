@@ -1,16 +1,21 @@
 {
-  "claim_id": "OPS_LIVE_STACK_DEFAULT_FLAGS",
-  "title": "start-pair-live.sh: pin governed runtime defaults — PAIR_SEMANTIC_MODE=guarded + PAIR_OBJECTIVE_AUTO_DRIVER=1 (env-overridable)",
+  "claim_id": "PROHIBITION_PHRASE_BINDING_RETRY_EPOCH",
+  "title": "Prohibitions enforce connector-delimited object phrases (VI fix); scheduler retry budget scoped to policy generation",
   "affected_surfaces": [
-    "DEV_INFRA"
+    "PLANNER",
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-live-stack-flags.test.ts",
-    "src/__tests__/dev-verification.test.ts"
+    "src/__tests__/pair-prohibition-phrase-binding.test.ts",
+    "src/__tests__/pair-prv2b-prohibition-narrowing.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
+    "src/__tests__/pair-semantic-adversarial.test.ts",
+    "src/__tests__/pair-p15-10c.test.ts"
   ],
   "invariants": [
-    "INV_SECRETS_001"
+    "INV_PLAN_001"
   ],
-  "description": "Operator-launcher posture defaults on base 9bbaac1. The verified live stack (guarded semantic gating + P15.10-C governed objective auto-driver) previously depended on undocumented operator env — a fresh clone running scripts/start-pair-live.sh booted semantic=off / driver absent and silently lost the verified behaviour. The launcher now exports both flags in the serve-mission-control env block using ${VAR:-default} form: PAIR_SEMANTIC_MODE=guarded, PAIR_OBJECTIVE_AUTO_DRIVER=1. Both remain env-overridable — a caller exporting a different value wins; nothing is hard-pinned. Governance posture is unchanged: the driver existing ≠ autonomous work enabled — each objective still requires the owner's own auto_policy configure+enable with finite caps and expiry before any autonomous pass can be admitted; the driver continues to fail closed without it. Guarded remains the most fail-closed semantic mode (advisory analysis pinned; MATERIAL ambiguity blocks until owner resolution; AUTHORITY_CRITICAL always blocks). No secrets, tokens, or machine-local paths are added. Proof: src/__tests__/pair-live-stack-flags.test.ts asserts both ${VAR:-default} exports exist inside the serve env block and appear exactly once in the script.",
-  "risk_override": "MEDIUM"
+  "description": "Production failure: term-only prohibition enforcement OR-matched every extracted token, so Vietnamese bans (e.g. 'không được hứa lợi nhuận hoặc tư vấn tài chính' -> hứa/lợi/nhuận/vấn/tài/chính) poisoned every plan via common words (tài liệu, vấn đề, quá trình), exhausting planner retries and wedging the objective in BLOCKED_RETRY_EXHAUSTED. Fix A: GoalRequirement gains `phrases` — object groups split on OBJECT_LIST_JOINERS (và/hoặc/and/or plus hay/với/cùng/cũng/kèm/như/nor/with/plus/along — independent audit caught that narrower splitting merged banned objects into unmatchable mega-phrases, failing open); plan-coverage enforces phrase-granular matching (phraseMatchSpans with bounded function-word gaps) in both the action-gated and term-only branches, with bounded NEGATION_WINDOW suppression extended to term-only and exemption words miễn/ngoài removed from the marker set (they suppress real acts: 'miễn phí tư vấn tài chính' is still consulting). `terms` minting, the TELEGRAM capability gate, and all scope/segment semantics are unchanged. Fix B: the scheduler retry budget is scoped to the policy generation — accountWake/observe reset retry_count only when binding a NEW policy_version, so the existing owner disable→configure→enable recovery restarts the budget; unchanged bindings never reset it (B09/C16/R4 semantics preserved). No new actions, routes, or schema migrations (the additive `phrases` field lands in contractDigest deterministically). Deterministic, append-only, no model calls.",
+  "risk_override": "HIGH"
 }

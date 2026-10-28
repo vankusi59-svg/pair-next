@@ -706,6 +706,14 @@ export class ObjectiveAutoScheduler {
       const current = this.requireRebind(q, a);
       return writeSchedulerRow<Queue>(this.store, WAKE_STATE, input.objective_id, {
         ...fields(current), policy_version: a.status.policy_version,
+        // The retry budget is scoped to the policy generation — an
+        // owner-authorized policy transition (disable→configure→enable,
+        // pause→resume, …) mints a new policy_version and restarts the
+        // budget; an unchanged binding NEVER resets it (a plain wake
+        // must not defeat max_retries).
+        retry_count: current.policy_version !== a.status.policy_version
+          ? 0
+          : current.retry_count,
         terms_digest: a.status.terms_digest_binding,
         objective_version: a.row.version,
         owner_authority_id: a.status.owner_authority_id, business_id: a.status.business_id,
@@ -906,6 +914,13 @@ export class ObjectiveAutoScheduler {
       }, "OBSERVATION", key);
       return writeSchedulerRow<Queue>(this.store, WAKE_STATE, objectiveId, {
         ...fields(current), policy_version: a.status.policy_version,
+        // The retry budget is scoped to the policy generation — an
+        // owner-authorized policy transition mints a new
+        // policy_version and restarts the budget; an unchanged
+        // binding NEVER resets it.
+        retry_count: current.policy_version !== a.status.policy_version
+          ? 0
+          : current.retry_count,
         terms_digest: a.status.terms_digest_binding, objective_version: a.row.version,
         owner_authority_id: a.status.owner_authority_id, business_id: a.status.business_id,
         pending_generation: current.pending_generation + 1,

@@ -290,4 +290,83 @@ describe("P15.10-B — durable RECONCILE_ONLY scheduler", () => {
     expect(src.includes("Codex")).toBe(false);
     expect(src.includes("Telegram")).toBe(false);
   });
+
+  it("B16 retry budget is scoped to the policy generation — owner re-bind un-wedges via observe()", () => {
+    const s = fresh("b16");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o), { max_retries: 1 });
+    s.scheduler.observe(oid(o));
+    // B09 wedge: two released attempts exhaust the bounded retry budget.
+    const h1 = s.scheduler.claim(oid(o), "w1", "b1", "op1");
+    s.scheduler.release(h1, "r1");
+    s.setNow(s.now() + 31_000);
+    const h2 = s.scheduler.claim(oid(o), "w2", "b2", "op2");
+    s.scheduler.release(h2, "r2");
+    s.setNow(s.now() + 121_000);
+    expectFail(() => s.scheduler.claim(oid(o), "w3", "b3", "op3"),
+      "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
+    expect(s.scheduler.status(oid(o), OWNER).queue_state).toBe("BLOCKED_RETRY_EXHAUSTED");
+    const wedgedRetries = Number(s.scheduler.status(oid(o), OWNER).retry_count);
+    expect(wedgedRetries).toBeGreaterThan(1);
+    // An unchanged binding NEVER resets — a plain observation must not
+    // defeat max_retries (B09 semantics preserved).
+    s.scheduler.observe(oid(o));
+    expect(s.scheduler.status(oid(o), OWNER).queue_state).toBe("BLOCKED_RETRY_EXHAUSTED");
+    expectFail(() => s.scheduler.claim(oid(o), "w4", "b4", "op4"),
+      "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
+    // Owner-authorized policy transition mints a new policy_version —
+    // the existing disable→configure→enable recovery restarts the
+    // retry budget at the next rebind.
+    const v1 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "disable",
+      policy_version: v1, idempotency_key: "d-b16-" + counter });
+    const v2 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: LIMITS({ max_retries: 1 }), policy_version: v2,
+      idempotency_key: "cfg-b16-" + counter });
+    const v3 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "enable",
+      policy_version: v3, idempotency_key: "en-b16-" + counter });
+    s.scheduler.observe(oid(o));
+    const st = s.scheduler.status(oid(o), OWNER);
+    expect(st.retry_count).toBe(0);
+    expect(st.queue_state).toBe("WAITING_CONSUMER");
+    // A fresh claim on the new policy generation succeeds.
+    const h3 = s.scheduler.claim(oid(o), "w5", "b5", "op5");
+    expect(h3).toBeTruthy();
+  });
+
+  it("B17 retry epoch reset also flows through the canonical wake intake", () => {
+    const s = fresh("b17");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o), { max_retries: 1 });
+    s.scheduler.observe(oid(o));
+    const h1 = s.scheduler.claim(oid(o), "w1", "b1", "op1");
+    s.scheduler.release(h1, "r1");
+    s.setNow(s.now() + 31_000);
+    const h2 = s.scheduler.claim(oid(o), "w2", "b2", "op2");
+    s.scheduler.release(h2, "r2");
+    s.setNow(s.now() + 121_000);
+    expectFail(() => s.scheduler.claim(oid(o), "w3", "b3", "op3"),
+      "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF");
+    expect(s.scheduler.status(oid(o), OWNER).queue_state).toBe("BLOCKED_RETRY_EXHAUSTED");
+    // Same owner recovery, driven through wakeup.tick() — the intake
+    // accounts the policy-transition wake and the rebind resets the
+    // retry budget scoped to the new policy generation.
+    const v1 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "disable",
+      policy_version: v1, idempotency_key: "d-b17-" + counter });
+    const v2 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: LIMITS({ max_retries: 1 }), policy_version: v2,
+      idempotency_key: "cfg-b17-" + counter });
+    const v3 = Number(s.policy.status(oid(o), OWNER).policy_version);
+    s.policy.control({ objective_id: oid(o), actor: OWNER, action: "enable",
+      policy_version: v3, idempotency_key: "en-b17-" + counter });
+    s.wakeup.tick();
+    const st = s.scheduler.status(oid(o), OWNER);
+    expect(st.retry_count).toBe(0);
+    expect(st.queue_state).toBe("WAITING_CONSUMER");
+    expect(s.scheduler.claim(oid(o), "w4", "b4", "op4")).toBeTruthy();
+  });
 });
