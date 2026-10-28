@@ -1,3 +1,5 @@
+import { ensurePersonalSession, hasPersonalSession } from "./session";
+
 const BASE = "/api";
 
 export function getOperatorId(): string {
@@ -17,6 +19,9 @@ export function setAuthToken(tok: string) {
 }
 
 export function withTokenQuery(url: string): string {
+  // Personal Mode — the session cookie IS the credential; the raw MC
+  // token never enters URLs on a personal session (SSE included).
+  if (hasPersonalSession()) return url;
   const tok = getAuthToken();
   if (!tok) return url;
   return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(tok);
@@ -26,8 +31,10 @@ let lastTokenPromptAt = 0;
 
 /* New /app/* surfaces may suppress the legacy 401 window.prompt + reload
    (audit R1-F2): they render their own Unauthorized state instead. The
-   prompt behavior is unchanged for every other caller. */
-async function req<T>(path: string, init?: RequestInit, opts?: { noAuthPrompt?: boolean }): Promise<T> {
+   prompt behavior is unchanged for every other caller. Personal Mode:
+   a 401 first tries ONE silent session bootstrap/retry — the prompt
+   only ever appears when no personal session could authenticate. */
+async function req<T>(path: string, init?: RequestInit, opts?: { noAuthPrompt?: boolean; retried?: boolean }): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const op = getOperatorId();
   if (op) headers["x-operator-id"] = op;
@@ -43,7 +50,15 @@ async function req<T>(path: string, init?: RequestInit, opts?: { noAuthPrompt?: 
   }
   if (!r.ok) {
     const e = body as { error?: string; detail?: string };
-    if (r.status === 401 && !opts?.noAuthPrompt && Date.now() - lastTokenPromptAt > 5000) {
+    if (r.status === 401 && !opts?.retried && await ensurePersonalSession()) {
+      return req(path, init, { ...opts, retried: true });
+    }
+    if (
+      r.status === 401 &&
+      !opts?.noAuthPrompt &&
+      !hasPersonalSession() &&
+      Date.now() - lastTokenPromptAt > 5000
+    ) {
       lastTokenPromptAt = Date.now();
       const t = window.prompt("Mission Control access token:");
       if (t !== null) { setAuthToken(t); window.location.reload(); }

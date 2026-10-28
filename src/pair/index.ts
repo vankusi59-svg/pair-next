@@ -48,6 +48,7 @@ export * from "./model-routable.js";
 export * from "./model-role.js";
 export * from "./env-config.js";
 export * from "./mc-token.js";
+export * from "./personal-session.js";
 export * from "./planner-pool.js";
 export * from "./planner-adaptive-retry.js";
 export * from "./plan-preview.js";

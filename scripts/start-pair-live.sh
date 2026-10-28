@@ -15,6 +15,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAIR_HOME="${PAIR_HOME:-$HOME}"
 MC_DIR="${PAIR_MC_DIR:-$PAIR_HOME/pair-mc-live}"
 PORT="${PAIR_MC_PORT:-8788}"
+# Personal Mode (opt-in): the canonical owner launcher defaults it ON —
+# provably safe because the privileged loopback listener (PORT) is
+# bound 127.0.0.1 only AND the tunnel is retargeted to the separate
+# remote listener (REMOTE_PORT), which can never mint a personal
+# session. PAIR_PERSONAL_MODE=off restores the legacy single-listener
+# bearer flow unchanged.
+PERSONAL_MODE="${PAIR_PERSONAL_MODE:-local}"
+REMOTE_PORT="${PAIR_MC_REMOTE_PORT:-8790}"
 LOG_DIR="${PAIR_LOG_DIR:-$PAIR_HOME/pair-logs}"
 CF_BIN="${CLOUDFLARED_BIN:-$PAIR_HOME/cloudflared}"
 
@@ -32,6 +40,8 @@ fi
 pkill -f "telegram-bridge.mjs" 2>/dev/null || true
 OLD_PID=$(ss -tlnp 2>/dev/null | grep ":$PORT" | grep -oP 'pid=\K[0-9]+' | head -1 || true)
 [ -n "${OLD_PID:-}" ] && kill -9 "$OLD_PID" 2>/dev/null || true
+OLD_PID_R=$(ss -tlnp 2>/dev/null | grep ":$REMOTE_PORT" | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+[ -n "${OLD_PID_R:-}" ] && kill -9 "$OLD_PID_R" 2>/dev/null || true
 pkill -f "cloudflared tunnel" 2>/dev/null || true
 sleep 1
 
@@ -44,8 +54,14 @@ if [ ! -x "$CF_BIN" ]; then
 fi
 
 # --- 3. tunnel ----------------------------------------------------------------
+# Personal Mode ON → the tunnel targets the REMOTE listener only; the
+# loopback session lane stays unreachable from any tunneled path (the
+# remote listener can never mint a personal session — structural
+# separation, not header trust). Mode OFF → legacy target unchanged.
+TUNNEL_TARGET="http://localhost:$PORT"
+if [ "$PERSONAL_MODE" = "local" ]; then TUNNEL_TARGET="http://localhost:$REMOTE_PORT"; fi
 CF_LOG="$LOG_DIR/cloudflared.log"
-nohup "$CF_BIN" tunnel --url "http://localhost:$PORT" > "$CF_LOG" 2>&1 &
+nohup "$CF_BIN" tunnel --url "$TUNNEL_TARGET" > "$CF_LOG" 2>&1 &
 echo "==> tunnel starting (log $CF_LOG)"
 OUTBOX_URL=""
 for _ in $(seq 1 30); do
@@ -97,6 +113,8 @@ DSH_SETTINGS="$HOME/.pair-dsh-home/settings.yaml"
   PAIR_CODEX_NETWORK="${PAIR_CODEX_NETWORK:-on}" \
   PAIR_SEMANTIC_MODE="${PAIR_SEMANTIC_MODE:-guarded}" \
   PAIR_OBJECTIVE_AUTO_DRIVER="${PAIR_OBJECTIVE_AUTO_DRIVER:-1}" \
+  PAIR_PERSONAL_MODE="$PERSONAL_MODE" \
+  PAIR_MC_REMOTE_PORT="$REMOTE_PORT" \
   nohup node scripts/serve-mission-control.mjs > "$MC_LOG" 2>&1 &
 )
 echo "==> server starting (log $MC_LOG)"
