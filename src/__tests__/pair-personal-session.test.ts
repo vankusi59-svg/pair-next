@@ -458,3 +458,161 @@ describe("F HTTP personal lane", () => {
     expect(JSON.stringify(rows[0])).not.toContain(r.sessionId);
   });
 });
+
+/* ---- G — audit P1: remote session isolation -------------------------- */
+
+describe("G remote session isolation (audit P1)", () => {
+  function ctx(name: string) {
+    const store = makeStore(name);
+    return { store, service: new PairControlPlane(store) };
+  }
+  // A proxy marker is what classifies a loopback-socket request as
+  // remote — same mechanism a tunnel/forwarded connection triggers.
+  const PROXY = { "x-forwarded-for": "1.2.3.4" };
+
+  it("remote GET status never echoes a bound session back", async () => {
+    const c = ctx("g1");
+    const svc = makeSvc(c.store);
+    await withPersonalServer(c, svc, async (port) => {
+      const boot = await reqJson(port, "/api/personal/session/bootstrap", {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      const cookie = boot.setCookie!.split(";")[0]!;
+      const st = await reqJson(port, "/api/personal/session", {
+        headers: { cookie, ...PROXY },
+      });
+      expect(st.status).toBe(200);
+      expect(st.body.personal_mode).toBe(true);
+      expect(st.body.ingress).toBe("remote");
+      expect(st.body.session).toBeNull();
+      expect(st.body.owner_candidates).toEqual([]);
+      expect(st.body.eligible_businesses).toEqual([]);
+      // The bound owner never leaves the server on a remote read.
+      expect(JSON.stringify(st.body)).not.toContain("op:admin");
+      expect(JSON.stringify(st.body)).not.toContain("BIZ_1");
+    });
+  });
+
+  it("remote POST business cannot rebind — local binding unchanged", async () => {
+    const c = ctx("g2");
+    const svc = makeSvc(c.store);
+    await withPersonalServer(c, svc, async (port) => {
+      const boot = await reqJson(port, "/api/personal/session/bootstrap", {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      const cookie = boot.setCookie!.split(";")[0]!;
+      // Establish a valid local business first.
+      const set = await reqJson(port, "/api/personal/session/business", {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ business_id: "BIZ_1" }),
+      });
+      expect(set.status).toBe(200);
+      // The SAME request over remote-class ingress is refused before
+      // reaching the service — 403, and the binding stays BIZ_1.
+      const remote = await reqJson(port, "/api/personal/session/business", {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json", ...PROXY },
+        body: JSON.stringify({ business_id: "" }),
+      });
+      expect(remote.status).toBe(403);
+      expect(String(remote.body.error)).toContain("FAIL_CLOSED_PERSONAL_INGRESS");
+      const after = svc.status("local", cookie.split("=")[1]!.trim());
+      expect(after.session?.business_id).toBe("BIZ_1");
+    });
+  });
+
+  it("remote POST logout cannot revoke — the session keeps working", async () => {
+    const c = ctx("g3");
+    const svc = makeSvc(c.store);
+    await withPersonalServer(c, svc, async (port) => {
+      const boot = await reqJson(port, "/api/personal/session/bootstrap", {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      const cookie = boot.setCookie!.split(";")[0]!;
+      const remote = await reqJson(port, "/api/personal/session/logout", {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json", ...PROXY },
+        body: "{}",
+      });
+      expect(remote.status).toBe(403);
+      // The session was NOT revoked — it still satisfies the gate.
+      const authed = await reqJson(port, "/api/missions", { headers: { cookie } });
+      expect(authed.status).toBe(200);
+    });
+  });
+
+  it("remote POST select-owner / bootstrap rejected (single gate)", async () => {
+    const c = ctx("g4");
+    const svc = makeSvc(c.store, ["operator:a", "operator:b"], {});
+    await withPersonalServer(c, svc, async (port) => {
+      const sel = await reqJson(port, "/api/personal/session/select-owner", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...PROXY },
+        body: JSON.stringify({ owner: "operator:a" }),
+      });
+      expect(sel.status).toBe(403);
+      const boot = await reqJson(port, "/api/personal/session/bootstrap", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...PROXY },
+        body: "{}",
+      });
+      expect(boot.status).toBe(403);
+    });
+  });
+});
+
+/* ---- H — audit P2: business state consistency ------------------------ */
+
+describe("H business consistency (audit P2)", () => {
+  function ctx(name: string) {
+    const store = makeStore(name);
+    return { store, service: new PairControlPlane(store) };
+  }
+
+  it("ineligible business rejected — binding keeps the previous valid value", async () => {
+    const c = ctx("h1");
+    const svc = makeSvc(c.store);
+    await withPersonalServer(c, svc, async (port) => {
+      const boot = await reqJson(port, "/api/personal/session/bootstrap", {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      const cookie = boot.setCookie!.split(";")[0]!;
+      const set = await reqJson(port, "/api/personal/session/business", {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ business_id: "BIZ_1" }),
+      });
+      expect(set.status).toBe(200);
+      // A failed switch MUST NOT clear or overwrite the valid binding.
+      const bad = await reqJson(port, "/api/personal/session/business", {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ business_id: "BIZ_FOREIGN" }),
+      });
+      expect(bad.status).toBe(403);
+      expect(String(bad.body.error)).toContain("FAIL_CLOSED_PERSONAL_BUSINESS");
+      const after = svc.status("local", cookie.split("=")[1]!.trim());
+      expect(after.session?.business_id).toBe("BIZ_1");
+    });
+  });
+
+  it("stale bound business drops on status; replacement is explicit", async () => {
+    const c = ctx("h2");
+    const store = c.store;
+    // Owner loses access to BIZ_1 mid-session (objective revoked).
+    let eligible: string[] = ["BIZ_1"];
+    const svc = new PersonalSessionService({
+      store,
+      listOwnerIds: () => ["operator:op:admin"],
+      eligibleBusinesses: () => eligible,
+    });
+    const r = svc.bootstrap();
+    svc.setBusiness(r.sessionId, "BIZ_1");
+    eligible = [];
+    const st = svc.status("local", r.sessionId);
+    // Stale preference dropped — the session never keeps an
+    // inaccessible business; the UI mirrors this to empty.
+    expect(st.session?.business_id).toBeNull();
+  });
+});

@@ -95,15 +95,32 @@ function BusinessSwitcher() {
   const { biz, select } = useSelectedBusiness();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(biz);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   /* Personal Mode — the server-verified eligible list (owner owns ≥1
      objective) renders as one-click options; manual entry stays as the
      fallback for anything the scoped read can't enumerate. */
   const eligible = hasPersonalSession() ? eligibleBusinesses() : [];
-  const commit = (id: string) => {
-    select(id);
+  /* Business consistency (audit P2): under a personal session the
+     server is the authority — the local selection only commits AFTER
+     the binding update is accepted; on failure the previous valid
+     state stays and the error is shown, never silently swallowed. */
+  const commit = async (id: string) => {
+    setErr(null);
     if (hasPersonalSession() && id !== biz) {
-      void setSessionBusiness(id).catch(() => undefined);
+      setBusy(true);
+      try {
+        await setSessionBusiness(id);
+      } catch (e) {
+        const code =
+          e instanceof Error && e.message ? e.message : "BUSINESS_UPDATE_FAILED";
+        setErr(`Server từ chối business: ${code}`);
+        setBusy(false);
+        return;
+      }
+      setBusy(false);
     }
+    select(id);
     setOpen(false);
   };
   return (
@@ -130,8 +147,9 @@ function BusinessSwitcher() {
                   key={id}
                   type="button"
                   className="tbtn"
+                  disabled={busy}
                   style={{ textAlign: "left", fontWeight: id === biz ? 600 : 400 }}
-                  onClick={() => commit(id)}
+                  onClick={() => void commit(id)}
                 >
                   {id}{id === biz ? " ✓" : ""}
                 </button>
@@ -141,17 +159,23 @@ function BusinessSwitcher() {
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              commit(draft);
+              void commit(draft);
             }}
           >
             <input
               aria-label="business id"
               placeholder="business_id"
               value={draft}
+              disabled={busy}
               onChange={(e) => setDraft(e.target.value)}
             />
-            <button className="tbtn" type="submit">Use</button>
+            <button className="tbtn" type="submit" disabled={busy}>Use</button>
           </form>
+          {err ? (
+            <div className="hint" role="alert" style={{ color: "var(--danger, #e06060)" }}>
+              {err}
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className="hint">

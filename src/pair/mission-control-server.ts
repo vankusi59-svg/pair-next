@@ -681,23 +681,31 @@ export function createMissionControlServer(
         }
         const svc = deps.personal.service;
         const cookieSession = parsePersonalCookie(req);
+        // Remote-session isolation (audit P1): the session cookie is only
+        // EVER evaluated on the local ingress class. On remote it is
+        // treated as absent — status can never echo back a bound owner,
+        // and no mutation can run against it.
+        const laneSession = personalIngress === "local" ? cookieSession : null;
         const isSecure = Boolean((req.socket as { encrypted?: boolean }).encrypted);
         if (method === "GET" && p === "/api/personal/session") {
-          return void json(res, 200, svc.status(personalIngress, cookieSession));
+          return void json(res, 200, svc.status(personalIngress, laneSession));
         }
         // Every personal POST proves browser-origin intent before any
         // state change — a cross-site browser send can never mint,
         // select, rebind or revoke.
         if (method === "POST") {
           assertPersonalOrigin(req);
-        }
-        if (method === "POST" && p === "/api/personal/session/bootstrap") {
+          // Audit P1 — every personal mutation requires local-class
+          // ingress. A valid session cookie arriving on the remote
+          // listener can never select, rebind or revoke.
           if (personalIngress !== "local") {
             return void json(res, 403, {
               error: "FAIL_CLOSED_PERSONAL_INGRESS",
-              detail: "personal session minting requires the loopback listener",
+              detail: "personal session mutations require the loopback listener",
             });
           }
+        }
+        if (method === "POST" && p === "/api/personal/session/bootstrap") {
           const r = svc.bootstrap();
           if (r.needs_owner_selection) {
             return void json(res, 409, {
@@ -715,9 +723,6 @@ export function createMissionControlServer(
           });
         }
         if (method === "POST" && p === "/api/personal/session/select-owner") {
-          if (personalIngress !== "local") {
-            return void json(res, 403, { error: "FAIL_CLOSED_PERSONAL_INGRESS" });
-          }
           const owner = typeof body.owner === "string" ? body.owner.trim() : "";
           if (!owner) {
             return void json(res, 400, { error: "FAIL_CLOSED_PERSONAL_OWNER" });
@@ -731,15 +736,15 @@ export function createMissionControlServer(
           });
         }
         if (method === "POST" && p === "/api/personal/session/business") {
-          if (!svc.authenticate(cookieSession)) {
+          if (!svc.authenticate(laneSession)) {
             return void json(res, 401, { error: "FAIL_CLOSED_PERSONAL_SESSION" });
           }
           const businessId = typeof body.business_id === "string" ? body.business_id : "";
-          const sess = svc.setBusiness(cookieSession, businessId);
+          const sess = svc.setBusiness(laneSession, businessId);
           return void json(res, 200, { session: sess });
         }
         if (method === "POST" && p === "/api/personal/session/logout") {
-          svc.revoke(cookieSession);
+          svc.revoke(laneSession);
           res.setHeader("set-cookie", clearSessionCookie());
           return void json(res, 200, { revoked: true });
         }

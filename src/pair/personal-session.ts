@@ -400,7 +400,10 @@ export class PersonalSessionService {
   }
 
   status(ingress: IngressClass, sessionId: string | null): PersonalStatus {
-    const sess = this.authenticate(sessionId);
+    // Audit P1 — a session only exists on the local lane; remote-class
+    // reads never authenticate a presented id, so a valid cookie on the
+    // remote listener can never echo a bound owner back.
+    const sess = ingress === "local" ? this.authenticate(sessionId) : null;
     const bound = this.binding();
     const ownerCandidates = sess || bound ? [] : [...new Set(this.deps.listOwnerIds().map(String))].sort();
     const operator = sess?.operator ?? bound?.operator ?? null;

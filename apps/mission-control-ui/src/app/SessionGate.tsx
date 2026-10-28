@@ -26,7 +26,10 @@ function applySessionIdentity(s: PersonalStatus["session"]) {
   // fills the shell chip + owner-scoped reads with the same value.
   setOperatorId(s.operator);
   window.dispatchEvent(new Event("pair.operator-changed"));
-  if (s.business_id) setBusinessId(s.business_id);
+  // Business consistency (audit P2): localStorage mirrors the canonical
+  // binding — when the server dropped a stale preference the stale
+  // local selection is cleared too, never kept silently.
+  setBusinessId(s.business_id ?? "");
 }
 
 export function SessionGate({ children }: { children: ReactNode }) {

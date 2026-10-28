@@ -82,6 +82,26 @@ test.describe("personal mode — local session lane", () => {
     const title = await chip.getAttribute("title");
     expect(title).toMatch(/operator: (operator:personal:|op:)/);
   });
+
+  test("business switch failure keeps previous state and shows error (P2)", async ({
+    page,
+  }) => {
+    await page.goto("/app/home");
+    await expect(page.getByRole("navigation", { name: "primary" })).toBeVisible({
+      timeout: 15_000,
+    });
+    const switcher = page.locator(".bizswitch").first();
+    await switcher.locator(".cur").click();
+    // Fresh e2e store → no eligible businesses → every id is rejected.
+    // The UI must surface the refusal and keep the previous selection.
+    await switcher.locator('input[aria-label="business id"]').fill("BIZ_FOREIGN");
+    await switcher.locator('button[type="submit"]').click();
+    await expect(switcher.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+    await expect(switcher.locator(".cur")).toContainText("no business selected");
+    // localStorage must not have captured the rejected id either.
+    const stored = await page.evaluate(() => localStorage.getItem("pair.business_id"));
+    expect(stored ?? "").not.toBe("BIZ_FOREIGN");
+  });
 });
 
 test.describe("personal mode — remote ingress stays bearer-only", () => {
@@ -99,6 +119,28 @@ test.describe("personal mode — remote ingress stays bearer-only", () => {
     await remote.addCookies([{ name: cookie!.name, value: cookie!.value, url: REMOTE }]);
     const res = await remote.request.get(`${REMOTE}/api/objectives`);
     expect(res.status()).toBe(401);
+    await local.close();
+    await remote.close();
+  });
+
+  test("remote status never echoes the bound session (audit P1)", async ({ browser }) => {
+    const local = await browser.newContext();
+    const page = await local.newPage();
+    await page.goto(`${LOCAL}/app/home`);
+    await expect(page.getByRole("navigation", { name: "primary" })).toBeVisible({
+      timeout: 15_000,
+    });
+    const cookie = (await local.cookies()).find((c) => c.name === "pair_ps");
+    expect(cookie).toBeTruthy();
+    // Even presenting the genuine local cookie, a remote read returns
+    // session:null — no owner/binding data crosses the remote lane.
+    const remote = await browser.newContext();
+    await remote.addCookies([{ name: cookie!.name, value: cookie!.value, url: REMOTE }]);
+    const res = await remote.request.get(`${REMOTE}/api/personal/session`);
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.session).toBeNull();
+    expect(JSON.stringify(body)).not.toContain("operator:");
     await local.close();
     await remote.close();
   });
