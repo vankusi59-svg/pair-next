@@ -873,6 +873,18 @@ function extractOnlyTerms(clause: string): string[] | undefined {
  *  "delete or modify" mints both classes; "access download" (no
  *  connector) mints `access` only, `download` stays object identity. */
 const ACTION_CONNECTOR_WORDS = new Set(["or", "and", "và", "hoặc"]);
+/** Joiners that separate OBJECT list items inside a prohibition head —
+ *  wider than ACTION_CONNECTOR_WORDS because an object list accepts
+ *  more joiners than an action-verb bridge: "hứa lợi nhuận HAY tư vấn
+ *  tài chính" bans two objects; without `hay` here the head merges
+ *  into one unmatchable mega-phrase and the ban fails open. Words
+ *  that are also stopwords still split — the joiner check runs before
+ *  the stopword filter. */
+const OBJECT_LIST_JOINERS = new Set([
+  ...ACTION_CONNECTOR_WORDS,
+  "hay", "cùng", "cũng", "kèm", "với", "như",
+  "nor", "with", "plus", "along",
+]);
 /** Filename-shaped tokens are objects, never actions — masked before
  *  the action scan so `write.txt` cannot mint a `write` class. */
 const FILELIKE_TOKEN_RE = /[\p{L}\p{N}_-]+\.[\p{L}\p{N}]+/gu;
@@ -886,6 +898,7 @@ const FILELIKE_TOKEN_RE = /[\p{L}\p{N}_-]+\.[\p{L}\p{N}]+/gu;
  *  in `terms` and never mints a second forbidden action. */
 function prohibitionPayload(clause: string): {
   terms: string[];
+  phrases?: string[];
   actionClass?: string[];
 } {
   const head = prohibitionHead(clause).replace(PROHIBITION_RE, " ");
@@ -942,7 +955,7 @@ function prohibitionPayload(clause: string): {
   const groups: string[][] = [[]];
   for (const m of stripped.matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0].toLowerCase();
-    if (ACTION_CONNECTOR_WORDS.has(w)) {
+    if (OBJECT_LIST_JOINERS.has(w)) {
       groups.push([]);
       continue;
     }

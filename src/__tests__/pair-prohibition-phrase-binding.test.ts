@@ -107,6 +107,31 @@ describe("phrase-binding A — extraction", () => {
     const c = extractGoalContract("không được tự bịa dữ liệu");
     expect(c.prohibitions[0].phrases).toEqual(["dữ liệu"]);
   });
+
+  it("A5 — every object-list joiner splits, not only và/hoặc/or/and", () => {
+    // Audit MAJOR: 'hay' (the most common VI "or"), 'với', 'cũng như',
+    // EN 'nor'/'with' used to merge into one unmatchable mega-phrase —
+    // the operator's ban silently failed open.
+    for (const goal of [
+      "không được hứa lợi nhuận hay tư vấn tài chính",
+      "không được hứa lợi nhuận với tư vấn tài chính",
+      "không được hứa lợi nhuận cũng như tư vấn tài chính",
+      "không được hứa lợi nhuận kèm tư vấn tài chính",
+    ]) {
+      expect(extractGoalContract(goal).prohibitions[0].phrases).toEqual([
+        "hứa lợi nhuận",
+        "tư vấn tài chính",
+      ]);
+    }
+    expect(
+      extractGoalContract("do not use leverage nor martingale")
+        .prohibitions[0].phrases,
+    ).toEqual(["leverage", "martingale"]);
+    expect(
+      extractGoalContract("do not use leverage with martingale")
+        .prohibitions[0].phrases,
+    ).toEqual(["leverage", "martingale"]);
+  });
 });
 
 /* ---------------- enforcement: the production poison case ----------- */
@@ -141,6 +166,21 @@ describe("phrase-binding B — enforcement", () => {
     }
   });
 
+  it("B2b — joiner forms still catch the real act", () => {
+    // 'hay' — the exact joiner that previously failed open.
+    const goal =
+      "viết báo cáo phân tích vào report.md, không được hứa lợi nhuận hay tư vấn tài chính";
+    for (const instr of [
+      "viết báo cáo phân tích vào report.md rồi hứa lợi nhuận cho người xem",
+      "viết báo cáo phân tích vào report.md và tư vấn tài chính cho khán giả",
+    ]) {
+      const bad = [
+        work("T1", instr, ["REASONING"], [], undefined, ["OBL_001", "DEL_001"]),
+      ];
+      expectCode(() => canon(bad, goal), VIOLATION);
+    }
+  });
+
   it("B3 — negated mention declares compliance, never performs the act", () => {
     const plan = [
       work(
@@ -153,6 +193,20 @@ describe("phrase-binding B — enforcement", () => {
       ),
     ];
     expect(canon(plan, GOAL_VI).length).toBe(2);
+  });
+
+  it("B3b — exemption words are NOT negations: 'miễn phí'/'ngoài' still violate", () => {
+    // 'miễn phí tư vấn tài chính' = free consulting — still consulting;
+    // 'ngoài X' = besides X — still doing X. Neither suppresses.
+    for (const instr of [
+      "viết báo cáo phân tích vào report.md và miễn phí tư vấn tài chính",
+      "viết báo cáo phân tích vào report.md, ngoài tư vấn tài chính còn hỗ trợ khách",
+    ]) {
+      const bad = [
+        work("T1", instr, ["REASONING"], [], undefined, ["OBL_001", "DEL_001"]),
+      ];
+      expectCode(() => canon(bad, GOAL_VI), VIOLATION);
+    }
   });
 
   it("B4 — partial phrase fragments do not satisfy the ban", () => {

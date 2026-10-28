@@ -417,16 +417,6 @@ const FILE_COUNT_UNITS = new Set([
 /* prohibition enforcement — action-gated, object-scoped                */
 /* ------------------------------------------------------------------ */
 
-/** A prohibited term matches only as a whole token — "cap" inside
- *  "capacity" or "cat" inside "concatenate" is never evidence. */
-function termHit(instr: string, term: string): boolean {
-  const re = new RegExp(
-    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
-    "iu",
-  );
-  return re.test(instr);
-}
-
 /** Negation markers bounded to ≤2 word tokens before the verb —
  *  "avoid using" / "không sử dụng" declares compliance, never performs
  *  the act. R1 — scope is strict: only whitespace separates tokens, so
@@ -435,7 +425,7 @@ function termHit(instr: string, term: string): boolean {
  *  then use martingale" never suppresses the real `use`. On ambiguity
  *  the match stays live — suppression can never fail-open. */
 const NEGATION_WINDOW_RE =
-  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|miễn|cấm|ngoài)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
+  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|cấm)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
 
 /* ------------------------------------------------------------------ */
 /* R2 — segment-local action↔object association                         */
@@ -511,11 +501,9 @@ function phraseMatchSpans(
   if (tokens.length === 0) return [];
   if (tokens.length === 1) return termMatchSpans(instr, tokens[0]);
   const gap = "[\\s,;:—–]+";
-  const gapWord = PHRASE_GAP_WORDS
-    ? `(?:${[...PHRASE_GAP_WORDS]
-        .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("|")})`
-    : "";
+  const gapWord = `(?:${[...PHRASE_GAP_WORDS]
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")})`;
   const joiner = `${gap}(?:(?:${gapWord})${gap})*`;
   const pattern =
     `(?<![\\p{L}\\p{N}])${tokens
