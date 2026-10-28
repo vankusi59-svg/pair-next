@@ -37,6 +37,11 @@ export interface GoalRequirement {
   target?: string;
   /** For prohibitions: the distilled content terms the plan must avoid. */
   terms?: string[];
+  /** For prohibitions: the connector-delimited object phrases the plan
+   *  must avoid (e.g. "hứa lợi nhuận", "tư vấn tài chính"). This is the
+   *  semantic matching unit for enforcement — a plan violates when it
+   *  invokes the phrase, not when it merely contains a single term. */
+  phrases?: string[];
   /** For prohibitions: the bounded forbidden-action class(es) the clause
    *  bans (e.g. delete/use/send). A task violates only when it performs
    *  a compatible action ON a prohibited object — mentioning the object
@@ -779,7 +784,7 @@ const PROHIBITION_STOPWORDS = new Set([
   "trong",
   "các", "những", "một", "mỗi", "vào", "ra", "lên", "xuống", "lại",
   "hết", "còn", "sau", "trước", "giữa", "dưới", "ở", "tại", "về",
-  "theo", "như",
+  "theo", "như", "tự",
   // file extensions — identity lives in the stem, never the suffix
   "txt", "md", "json", "csv", "pdf", "html", "png", "jpg", "jpeg",
   "webp", "svg", "ts", "tsx", "js", "mjs", "py", "ipynb", "doc",
@@ -931,13 +936,31 @@ function prohibitionPayload(clause: string): {
   }
   stripped += head.slice(cursor);
   const terms: string[] = [];
+  // Phrase groups split on raw connectors BEFORE stopword filtering —
+  // `hoặc/or/and/và` are stopwords too, so filtering first would erase
+  // the boundary between "hứa lợi nhuận" and "tư vấn tài chính".
+  const groups: string[][] = [[]];
   for (const m of stripped.matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0].toLowerCase();
-    if (w.length < 3 || PROHIBITION_STOPWORDS.has(w)) continue;
-    if (!terms.includes(w)) terms.push(w);
+    if (ACTION_CONNECTOR_WORDS.has(w)) {
+      groups.push([]);
+      continue;
+    }
+    if (PROHIBITION_STOPWORDS.has(w)) continue;
+    if (w.length >= 3 && !terms.includes(w)) terms.push(w);
+    if (w.length < 2) continue;
+    const group = groups[groups.length - 1];
+    if (!group.includes(w)) group.push(w);
+  }
+  const phrases: string[] = [];
+  for (const g of groups) {
+    if (!g.length) continue;
+    const ph = g.join(" ");
+    if (!phrases.includes(ph)) phrases.push(ph);
   }
   return {
     terms: terms.slice(0, 8),
+    ...(phrases.length ? { phrases: phrases.slice(0, 8) } : {}),
     ...(classes.length ? { actionClass: classes.slice(0, 4) } : {}),
   };
 }
